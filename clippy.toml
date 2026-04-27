@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "std::result::Result::unwrap", reason = "use ? with thiserror error enum" },
+    { path = "std::option::Option::unwrap", reason = "use ok_or / let-else" },
+]

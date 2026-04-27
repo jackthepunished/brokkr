@@ -1,0 +1,25 @@
+[package]
+name = "brokkr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "`brokk` — the Brokkr command-line interface."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "brokk"
+path = "src/main.rs"
+
+[dependencies]
+brokkr-common.workspace = true
+brokkr-sdk.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

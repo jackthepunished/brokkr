@@ -1,0 +1,17 @@
+[package]
+name = "brokkr-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Linux-primitive sandbox runtime for Brokkr (namespaces, cgroups, seccomp). No Docker."
+
+[lints]
+workspace = true
+
+[dependencies]
+brokkr-common.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

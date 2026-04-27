@@ -1,0 +1,28 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+*.rs.bk
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Brokkr local state
+/var/
+/.brokkr/
+
+# Profiling / coverage
+*.profraw
+tarpaulin-report.html
+lcov.info
+
+# Env
+.env
+.env.local

@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/brokkr-common",
+    "crates/brokkr-proto",
+    "crates/brokkr-cas",
+    "crates/brokkr-control",
+    "crates/brokkr-worker",
+    "crates/brokkr-sandbox",
+    "crates/brokkr-sdk",
+    "crates/brokkr-cli",
+    "crates/brokkr-test-utils",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/brokkr/brokkr"
+authors = ["Berat <ytdberat@gmail.com>"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# RPC / proto
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Serialization
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Storage
+redb = "2"
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.27"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+proptest = "1"
+
+# Internal crates
+brokkr-common = { path = "crates/brokkr-common", version = "0.1.0" }
+brokkr-proto = { path = "crates/brokkr-proto", version = "0.1.0" }
+brokkr-cas = { path = "crates/brokkr-cas", version = "0.1.0" }
+brokkr-control = { path = "crates/brokkr-control", version = "0.1.0" }
+brokkr-worker = { path = "crates/brokkr-worker", version = "0.1.0" }
+brokkr-sandbox = { path = "crates/brokkr-sandbox", version = "0.1.0" }
+brokkr-sdk = { path = "crates/brokkr-sdk", version = "0.1.0" }
+brokkr-test-utils = { path = "crates/brokkr-test-utils", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

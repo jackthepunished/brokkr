@@ -1,0 +1,29 @@
+[package]
+name = "brokkr-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Brokkr worker daemon: leases jobs, executes actions, uploads outputs."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "brokkr-worker"
+path = "src/main.rs"
+
+[dependencies]
+brokkr-common.workspace = true
+brokkr-proto.workspace = true
+brokkr-sandbox.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

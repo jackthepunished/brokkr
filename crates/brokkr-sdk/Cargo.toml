@@ -1,0 +1,21 @@
+[package]
+name = "brokkr-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Client library for the Brokkr remote execution grid."
+
+[lints]
+workspace = true
+
+[dependencies]
+brokkr-common.workspace = true
+brokkr-proto.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true

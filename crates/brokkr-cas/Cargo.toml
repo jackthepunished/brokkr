@@ -1,0 +1,23 @@
+[package]
+name = "brokkr-cas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Content-Addressable Storage server and client for Brokkr."
+
+[lints]
+workspace = true
+
+[dependencies]
+brokkr-common.workspace = true
+brokkr-proto.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true

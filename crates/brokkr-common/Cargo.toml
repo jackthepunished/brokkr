@@ -1,0 +1,20 @@
+[package]
+name = "brokkr-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared types, errors, and utilities for Brokkr."
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
