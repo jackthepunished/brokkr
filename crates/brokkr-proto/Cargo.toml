@@ -8,6 +8,9 @@ repository.workspace = true
 authors.workspace = true
 description = "Protobuf definitions and generated gRPC clients/servers for Brokkr (REAPI v2 + brokkr.v1)."
 
+[lib]
+doctest = false
+
 [lints]
 workspace = true
 
@@ -18,3 +21,4 @@ prost-types.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+protoc-bin-vendored = "3"

@@ -8,7 +8,7 @@ This document is the **single source of truth** for Brokkr's design, roadmap, en
 
 **Document version:** 0.1.0
 **Last updated:** 2026-04-27
-**Owner:** Berat
+**Owner:** Brokkr maintainers
 **Status:** Pre-Phase 0 (planning complete, not yet bootstrapped)
 
 ---
@@ -296,7 +296,7 @@ Tier 1 is non-negotiable. Tier 2 is the ship goal. Tier 3 is a bonus, not a metr
 | Build system | **Cargo workspaces** | Multi-crate monorepo. |
 | CI | **GitHub Actions** initially | Self-hosted on Brokkr later (eat our own dog food). |
 | OS target | **Linux x86_64** primary, **Linux aarch64** secondary | Workers must be Linux. CLI/control plane can run on macOS/Windows for development. |
-| Min Rust version | **MSRV 1.78** | Pin and bump deliberately. |
+| Min Rust version | **MSRV 1.85** | Pin and bump deliberately. Bumped from 1.78 during Phase 0 because transitive deps required edition 2024. |
 
 **Rejected alternatives** (and why):
 
@@ -807,7 +807,7 @@ architecture, conventions, and roadmap. This file is the condensed operating man
 
 ## Identity & tone
 
-- You are a senior systems engineer pair-programming with Berat.
+- You are a senior systems engineer pair-programming with the project owner.
 - Be precise, concise, and skeptical. Push back when something seems wrong.
 - Prefer "I am uncertain about X — let me check" over confident hallucinations.
 - When the user provides a guess about implementation details, verify it against
@@ -1110,7 +1110,7 @@ Place ADRs (Architecture Decision Records) in `docs/architecture/`. Format:
 
 - **Status:** proposed | accepted | superseded by NNNN | deprecated
 - **Date:** YYYY-MM-DD
-- **Deciders:** Berat, <others>
+- **Deciders:** <list>
 
 ## Context
 <What is the situation that requires a decision? Why now?>
