@@ -1,58 +1,74 @@
 //! `brokkr-control` daemon entrypoint.
 
-use anyhow::Result;
-use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use brokkr_cas::{RedbActionCache, RedbCas};
+use brokkr_control::{
+    ActionCacheService, CapabilitiesService, CasService, ExecutionService, Scheduler,
+    WorkerServiceImpl,
+};
+use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
+use brokkr_proto::reapi_v2::{
+    action_cache_server::ActionCacheServer, capabilities_server::CapabilitiesServer,
+    content_addressable_storage_server::ContentAddressableStorageServer,
+    execution_server::ExecutionServer,
+};
+use clap::Parser;
+use tonic::transport::Server;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "brokkr-control",
-    about = "Brokkr control plane daemon",
-    long_about = None,
+    version,
+    about = "Brokkr control plane daemon"
 )]
-struct Opts {
-    /// Listen address for the gRPC server.
-    #[arg(long, default_value = "127.0.0.1:50051")]
-    addr: SocketAddr,
+struct Args {
+    /// Address to bind the gRPC server on.
+    #[arg(long, default_value = "127.0.0.1:7878")]
+    listen: SocketAddr,
 
-    /// Path to CAS storage directory.
-    #[arg(long)]
-    cas_path: Option<std::path::PathBuf>,
+    /// Directory holding the control plane's persistent state (CAS + action cache).
+    #[arg(long, default_value = "./brokkr-data")]
+    data_dir: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let opts = Opts::parse();
-    tracing_subscriber::fmt::init();
-    tracing::info!("brokkr-control: phase 0 stub");
-    tracing::info!("listen addr: {}", opts.addr);
-    if let Some(path) = &opts.cas_path {
-        tracing::info!("cas path: {}", path.display());
-    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+    std::fs::create_dir_all(&args.data_dir)
+        .with_context(|| format!("creating data dir {:?}", args.data_dir))?;
+    let cas =
+        Arc::new(RedbCas::open(args.data_dir.join("cas.redb")).context("opening CAS database")?);
+    let action_cache = Arc::new(
+        RedbActionCache::open(args.data_dir.join("action_cache.redb"))
+            .context("opening action cache database")?,
+    );
+    let scheduler = Scheduler::new(cas.clone(), action_cache.clone());
+
+    tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, "brokkr-control starting");
+
+    Server::builder()
+        .add_service(ContentAddressableStorageServer::new(CasService::new(cas)))
+        .add_service(ActionCacheServer::new(ActionCacheService::new(
+            action_cache,
+        )))
+        .add_service(CapabilitiesServer::new(CapabilitiesService))
+        .add_service(ExecutionServer::new(ExecutionService::new(
+            scheduler.clone(),
+        )))
+        .add_service(WorkerServiceServer::new(WorkerServiceImpl::new(scheduler)))
+        .serve(args.listen)
+        .await
+        .context("control plane server exited")?;
     Ok(())
-}
-
-#[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_addr_default() {
-        let opts = Opts::try_parse_from(["brokkr-control"]).unwrap();
-        assert_eq!(opts.addr, "127.0.0.1:50051".parse().unwrap());
-        assert!(opts.cas_path.is_none());
-    }
-
-    #[test]
-    fn parses_custom_addr() {
-        let opts = Opts::try_parse_from(["brokkr-control", "--addr", "0.0.0.0:9000"]).unwrap();
-        assert_eq!(opts.addr, "0.0.0.0:9000".parse().unwrap());
-    }
-
-    #[test]
-    fn parses_cas_path() {
-        let opts = Opts::try_parse_from(["brokkr-control", "--cas-path", "/tmp/brokkr"]).unwrap();
-        assert_eq!(opts.cas_path.as_ref().unwrap().as_os_str(), "/tmp/brokkr");
-    }
 }

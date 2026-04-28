@@ -18,11 +18,23 @@ path = "src/main.rs"
 [dependencies]
 brokkr-common.workspace = true
 brokkr-proto.workspace = true
+brokkr-cas.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
+prost.workspace = true
+prost-types.workspace = true
 redb.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+brokkr-sdk.workspace = true
+brokkr-worker.workspace = true
+tempfile.workspace = true

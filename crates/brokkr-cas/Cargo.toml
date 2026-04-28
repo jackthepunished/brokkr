@@ -14,11 +14,16 @@ workspace = true
 [dependencies]
 brokkr-common.workspace = true
 brokkr-proto.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
+prost.workspace = true
+redb.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
-parking_lot.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

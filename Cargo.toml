@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/brokkr/brokkr"
+repository = "https://github.com/jackthepunished/brokkr"
 authors = ["Brokkr contributors"]
 
 [workspace.dependencies]
@@ -25,6 +25,7 @@ authors = ["Brokkr contributors"]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
+async-trait = "0.1"
 
 # RPC / proto
 tonic = "0.12"
@@ -49,8 +50,8 @@ hex = "0.4"
 thiserror = "1"
 anyhow = "1"
 
-# Concurrency
-parking_lot = "0.12"
+# IDs
+uuid = { version = "1", features = ["v4"] }
 
 # Observability
 tracing = "0.1"
@@ -62,6 +63,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Testing
 proptest = "1"
+tempfile = "3"
 
 # Internal crates
 brokkr-common = { path = "crates/brokkr-common", version = "0.1.0" }

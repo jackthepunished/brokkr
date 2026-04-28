@@ -1,12 +1,11 @@
 //! `brokk` — the Brokkr command-line interface.
 //!
-//! Phase 0 ships only `version`. Real subcommands
-//! (`run`, `init`, `build`, `cache`, `worker`, `cluster`, `admin`) land in Phase 1+.
+//! Phase 1: `version`, stub `init`, and `run --command "..."` for the
+//! end-to-end happy path.
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
+use brokkr_sdk::{run_command, BrokkrClient};
 use clap::{Parser, Subcommand};
-
-mod commands;
 
 /// Top-level CLI entrypoint.
 #[derive(Debug, Parser)]
@@ -26,11 +25,26 @@ struct Cli {
 enum Command {
     /// Print the brokk version, target triple, and embedded git revision.
     Version,
-    /// Run a shell command locally.
+    /// Initialize a Brokkr project in the current directory.
+    Init {
+        /// Overwrite existing config files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run a shell command on the cluster.
     Run {
-        /// The shell command to execute.
-        #[arg(long, short = 'c')]
-        command: String,
+        /// Control plane endpoint (e.g. `http://127.0.0.1:7878`).
+        #[arg(long, default_value = "http://127.0.0.1:7878")]
+        control: String,
+
+        /// Skip the action cache lookup and force re-execution.
+        #[arg(long)]
+        no_cache: bool,
+
+        /// The command to run, including arguments. Pass via repeated
+        /// positional args: `brokk run -- echo hello world`.
+        #[arg(trailing_var_arg = true, required = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -45,7 +59,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Version => print_version(),
-        Command::Run { command } => commands::run::execute(&command),
+        Command::Init { force } => init_project(force),
+        Command::Run {
+            control,
+            no_cache,
+            argv,
+        } => run_subcmd(control, no_cache, argv),
     }
 }
 
@@ -58,4 +77,31 @@ fn print_version() -> Result<()> {
         env!("BROKKR_TARGET_TRIPLE"),
     );
     Ok(())
+}
+
+fn init_project(_force: bool) -> Result<()> {
+    // TODO(brokkr-cli-init): scaffold a brokk.toml + .brokkrignore + sample
+    // workflows. Tracked under Phase 1 task list.
+    println!("brokk init: not yet implemented (Phase 0 stub)");
+    Ok(())
+}
+
+fn run_subcmd(control: String, no_cache: bool, argv: Vec<String>) -> Result<()> {
+    if argv.is_empty() {
+        return Err(anyhow!("`brokk run` requires a command"));
+    }
+    let rt = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
+    rt.block_on(async {
+        let mut client = BrokkrClient::connect(control).await?;
+        let outcome = run_command(&mut client, &argv, no_cache).await?;
+        // Forward stdout/stderr verbatim to the user's terminal.
+        use std::io::Write as _;
+        std::io::stdout().write_all(&outcome.stdout)?;
+        std::io::stderr().write_all(&outcome.stderr)?;
+        eprintln!(
+            "[brokk] exit={} cache_hit={}",
+            outcome.exit_code, outcome.cache_hit
+        );
+        std::process::exit(outcome.exit_code);
+    })
 }

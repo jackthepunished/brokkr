@@ -4,5 +4,16 @@
 //! the REAPI `ContentAddressableStorage` and `ByteStream` services.
 //! Phase 3 adds hash-prefix sharding, replication, and tiered storage.
 
-pub mod memory;
-pub use memory::InMemoryCas;
+#![deny(missing_docs)]
+
+pub mod action_cache;
+pub mod error;
+pub mod in_memory;
+pub mod redb_backend;
+pub mod traits;
+
+pub use action_cache::{ActionCache, RedbActionCache};
+pub use error::CasError;
+pub use in_memory::InMemoryCas;
+pub use redb_backend::RedbCas;
+pub use traits::Cas;

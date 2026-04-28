@@ -5,3 +5,11 @@
 //! embedded `redb` store with a custom Raft KV.
 
 #![deny(missing_docs)]
+
+pub mod scheduler;
+pub mod services;
+pub mod worker_service;
+
+pub use scheduler::Scheduler;
+pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
+pub use worker_service::WorkerServiceImpl;
