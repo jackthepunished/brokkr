@@ -8,18 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,
-  rustfmt/clippy/deny configuration, root README, CONTRIBUTING, LICENSE
-  (Apache-2.0), CHANGELOG, CODE_OF_CONDUCT, justfile.
-- `CLAUDE.md` operating manual at the repo root.
-- `docs/plan.md` — project source of truth.
-- Vendored REAPI v2 + supporting googleapis protos in `brokkr-proto`,
-  compiled via `tonic-build` with a vendored `protoc` (no system dependency).
-- `brokk version` and `brokk init` (stub) subcommands, with git SHA + rustc
-  + target triple embedded at build time.
-- GitHub Actions CI (`fmt`, `clippy -D warnings`, `test`, `build --release`)
-  on Linux x86_64 and aarch64.
-- ADR 0001 — Rust everywhere.
+- `brokk run -c '<command>'` subcommand — spawns a local shell process,
+  captures and prints stdout/stderr, propagates exit code.
+- `brokk version` subcommand, with git SHA + rustc + target triple embedded
+  at build time.
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require

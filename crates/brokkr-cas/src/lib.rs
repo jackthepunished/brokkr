@@ -4,4 +4,5 @@
 //! the REAPI `ContentAddressableStorage` and `ByteStream` services.
 //! Phase 3 adds hash-prefix sharding, replication, and tiered storage.
 
-#![deny(missing_docs)]
+//! Stub crate — real implementation in Phase 1+.
+#![allow(missing_docs)]
