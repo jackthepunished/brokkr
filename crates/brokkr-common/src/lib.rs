@@ -35,7 +35,7 @@ impl Digest {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::disallowed_methods, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

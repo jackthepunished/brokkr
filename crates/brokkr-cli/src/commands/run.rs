@@ -21,6 +21,7 @@ pub fn execute(cmd: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::unwrap_used)]
 mod tests {
     #[test]
     fn smoke_echo() {
