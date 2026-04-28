@@ -21,14 +21,21 @@ impl InMemoryCas {
     }
 
     /// Insert blobs into the store.
+    ///
+    /// Returns `Vec<(Digest, i64)>` where the i64 is the **already stored** size
+    /// in bytes (0 if the blob is new). Matches REAPI `BatchUpdateBlobs` semantics.
     pub fn batch_update(&self, blobs: Vec<(Digest, Bytes)>) -> Vec<(Digest, i64)> {
         let mut store = self.blobs.write();
         blobs
             .into_iter()
             .map(|(digest, data)| {
-                let size = data.len() as i64;
+                let stored_size = if store.contains_key(&digest) {
+                    store.get(&digest).map(|b| b.len() as i64).unwrap_or(0)
+                } else {
+                    0
+                };
                 store.insert(digest.clone(), data);
-                (digest, size)
+                (digest, stored_size)
             })
             .collect()
     }
@@ -72,12 +79,10 @@ impl Default for InMemoryCas {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::sync::Arc;
 
     fn make_digest(hash: &str, size: i64) -> Digest {
-        Digest {
-            hash: hash.to_string(),
-            size_bytes: size,
-        }
+        Digest::new(hash.to_string(), size).unwrap()
     }
 
     #[test]
@@ -90,6 +95,20 @@ mod tests {
 
         let results = cas.batch_read(vec![d1]);
         assert_eq!(results, vec![Some(blob)]);
+    }
+
+    #[test]
+    fn batch_update_returns_stored_size() {
+        let cas = InMemoryCas::new();
+        let d1 = make_digest("abc123", 5);
+        let blob = Bytes::from(&b"hello"[..]);
+
+        let result = cas.batch_update(vec![(d1.clone(), blob.clone())]);
+        assert_eq!(result, vec![(d1.clone(), 0)]); // 0 = new blob
+
+        // Insert same digest again — should return old stored size
+        let result2 = cas.batch_update(vec![(d1.clone(), Bytes::from(&b"world"[..]))]);
+        assert_eq!(result2, vec![(d1.clone(), 5)]); // 5 = previously stored size
     }
 
     #[test]
@@ -109,5 +128,38 @@ mod tests {
         let cas = InMemoryCas::new();
         let missing = cas.find_missing(vec![make_digest("nonexistent", 0)]);
         assert!(missing.len() == 1);
+    }
+
+    #[test]
+    fn concurrent_read_write() {
+        let cas = Arc::new(InMemoryCas::new());
+
+        let writer = std::thread::spawn({
+            let cas = cas.clone();
+            move || {
+                for i in 0..100 {
+                    let d = Digest::new(format!("hash{:03}", i), i as i64).unwrap();
+                    cas.batch_update(vec![(d, Bytes::from(format!("data{}", i)))]);
+                }
+            }
+        });
+
+        let reader = std::thread::spawn({
+            let cas = cas.clone();
+            move || {
+                let d = Digest::new("hash050".to_string(), 50).unwrap();
+                loop {
+                    let results = cas.batch_read(vec![d.clone()]);
+                    if results[0].is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(cas.len(), 100);
     }
 }
