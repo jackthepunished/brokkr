@@ -2,4 +2,5 @@
 //!
 //! Not published to crates.io.
 
-#![deny(missing_docs)]
+//! Stub crate — real implementation in Phase 1+.
+#![allow(missing_docs)]

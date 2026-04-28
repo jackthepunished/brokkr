@@ -20,7 +20,7 @@ jobs — builds, tests, ML training, transcoding. It speaks the
 
 ## Quick start (developer)
 
-Requires Rust 1.78 (pinned via `rust-toolchain.toml`).
+Requires Rust 1.85 (pinned via `rust-toolchain.toml`).
 
 ```sh
 cargo build --workspace
