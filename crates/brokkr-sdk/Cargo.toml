@@ -14,8 +14,13 @@ workspace = true
 [dependencies]
 brokkr-common.workspace = true
 brokkr-proto.workspace = true
+anyhow.workspace = true
 bytes.workspace = true
+prost.workspace = true
+sha2.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true

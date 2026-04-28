@@ -4,3 +4,7 @@
 //! `brokkr-cli` and embeddable in any Rust application.
 
 #![deny(missing_docs)]
+
+pub mod client;
+
+pub use client::{run_command, BrokkrClient, RunOutcome};

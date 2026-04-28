@@ -4,3 +4,7 @@
 //! Keep it small and dependency-light.
 
 #![deny(missing_docs)]
+
+pub mod digest;
+
+pub use digest::{Digest, DigestError};

@@ -34,6 +34,14 @@ pub mod google {
     }
 }
 
+pub mod brokkr {
+    pub mod v1 {
+        tonic::include_proto!("brokkr.v1");
+    }
+}
+
+/// Brokkr-internal v1 protocols (worker dispatch, etc.).
+pub use brokkr::v1 as brokkr_v1;
 /// Bazel Remote Execution API v2 — convenience alias.
 pub use build::bazel::remote::execution::v2 as reapi_v2;
 /// Bazel SemVer types.

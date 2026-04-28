@@ -25,3 +25,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
   edition 2024).
+
+## Phase 1 (in progress)
+
+### Added
+- `brokkr_common::Digest` — sha256 newtype with strict shape validation,
+  content verification, `Display`/`FromStr` round-trip, and unit tests.
+- `brokkr-cas`: async `Cas` trait + `InMemoryCas` backend implementing
+  `find_missing_blobs` / `batch_update_blobs` / `batch_read_blobs` with
+  per-entry digest verification.
+- `brokkr-cas`: `RedbCas` on-disk backend (single-file `redb` database,
+  `spawn_blocking` around sync redb txns) with persistence-across-reopen and
+  digest-mismatch tests.
+- `brokkr-cas`: `ActionCache` trait + `RedbActionCache` backend storing
+  prost-encoded REAPI `ActionResult` keyed on action digest hash; tests for
+  miss, roundtrip, overwrite, and persistence-across-reopen.
+- `brokkr-control`: REAPI `ContentAddressableStorage`, `ActionCache`, and
+  `Capabilities` services bound to the redb backends; `Execution` service
+  stub returning `Unimplemented` until the worker dispatch path lands.
+  `brokkr-control` binary now boots a tonic gRPC server on a configurable
+  `--listen` and `--data-dir`.
+- `brokkr-control` integration tests: in-process server + tonic clients
+  exercising capabilities, CAS roundtrip, and action-cache miss-then-hit.
+- `brokkr.v1.worker.proto` — internal worker dispatch protocol
+  (`WorkerService.Register` + bidi `Stream`).
+- `brokkr-control` `Scheduler`: single-queue, single-worker job dispatcher
+  bridging REAPI `Execute` to the internal worker stream; consults and
+  writes the action cache; only caches `exit_code == 0`.
+- `brokkr-control` `WorkerServiceImpl`: claims the job receiver and pumps
+  jobs out / results in over the bidi stream.
+- `brokkr-control` `ExecutionService`: streams `google.longrunning.Operation`
+  results carrying an `ExecuteResponse` payload.
+- `brokkr-worker`: `runner` (plain-process spawn capturing stdout/stderr)
+  and `worker` control loop that registers, opens the bidi stream, runs each
+  job, uploads stdout/stderr blobs to CAS, and reports `JobResult`.
+- `brokkr-sdk`: `BrokkrClient::connect` + `run_command` that builds an
+  Action, uploads it to CAS, calls Execute, and decodes the streamed result.
+- `brokk run [-- argv...]` subcommand: connects to the control plane, runs
+  the command, forwards stdout/stderr, and exits with the action's exit code.
+- `brokkr-control` `tests/end_to_end.rs`: full in-process cluster (server +
+  worker) running `/bin/echo "hello world"` end-to-end and verifying that the
+  second invocation hits the action cache.

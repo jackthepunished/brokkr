@@ -1,0 +1,86 @@
+// Brokkr internal worker-control-plane protocol.
+//
+// The worker registers with the control plane, then opens a long-lived
+// streaming RPC that delivers jobs one at a time and accepts a result for
+// each before the next is sent. This is intentionally simpler than REAPI's
+// Execute / Operation flow: REAPI is the *client-facing* surface, brokkr.v1
+// is the *internal* surface.
+syntax = "proto3";
+
+package brokkr.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+
+// Identifies a worker process.
+message WorkerId {
+  string id = 1;
+}
+
+// One-shot worker→control-plane handshake.
+message RegisterWorkerRequest {
+  // Hostname or human label. Optional.
+  string hostname = 1;
+  // Free-form labels (e.g. {"os": "linux", "arch": "x86_64"}).
+  map<string, string> labels = 2;
+}
+
+message RegisterWorkerResponse {
+  WorkerId worker_id = 1;
+  // Server-suggested heartbeat interval in seconds.
+  uint32 heartbeat_seconds = 2;
+}
+
+// A unit of work dispatched to a worker.
+message Job {
+  // Server-assigned unique job identifier (separate from action digest so
+  // that retries of the same action carry distinct IDs).
+  string job_id = 1;
+  // REAPI Action digest the client requested.
+  build.bazel.remote.execution.v2.Digest action_digest = 2;
+  // The Action and Command, inlined so the worker doesn't need a CAS round-trip
+  // for the basic Phase 1 flow. Phase 3+ will inline only the digest and let
+  // the worker fetch from CAS.
+  build.bazel.remote.execution.v2.Action action = 3;
+  build.bazel.remote.execution.v2.Command command = 4;
+}
+
+// Worker→control: streaming bidi. The worker sends one Hello per stream,
+// then alternates Result / wait-for-next-Job with the server.
+message WorkerStreamMessage {
+  oneof payload {
+    // First message on the stream — claims a worker_id from the registration
+    // step.
+    WorkerHello hello = 1;
+    // Result for the previously dispatched job.
+    JobResult result = 2;
+  }
+}
+
+message WorkerHello {
+  WorkerId worker_id = 1;
+}
+
+message JobResult {
+  string job_id = 1;
+  build.bazel.remote.execution.v2.ActionResult result = 2;
+  // True if the worker hit a local cache and skipped execution.
+  bool cache_hit = 3;
+  // Populated on hard failure (process spawn error, internal error, etc).
+  // An ActionResult with non-zero exit_code is a *successful* dispatch with a
+  // failing action and uses `result` instead.
+  string error_message = 4;
+}
+
+// Control→worker: streaming. The server only sends Jobs; "no work" is just
+// silence.
+message JobAssignment {
+  Job job = 1;
+}
+
+service WorkerService {
+  rpc Register(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Long-lived bidi stream. Worker sends Hello first, then alternates
+  // JobResult after each JobAssignment received from the server.
+  rpc Stream(stream WorkerStreamMessage) returns (stream JobAssignment);
+}
