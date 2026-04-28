@@ -1,10 +1,12 @@
 //! `brokk` — the Brokkr command-line interface.
 //!
-//! Phase 0 ships only `version` and a stub `init`. Real subcommands
-//! (`run`, `build`, `cache`, `worker`, `cluster`, `admin`) land in Phase 1+.
+//! Phase 0 ships only `version`. Real subcommands
+//! (`run`, `init`, `build`, `cache`, `worker`, `cluster`, `admin`) land in Phase 1+.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+mod commands;
 
 /// Top-level CLI entrypoint.
 #[derive(Debug, Parser)]
@@ -24,11 +26,11 @@ struct Cli {
 enum Command {
     /// Print the brokk version, target triple, and embedded git revision.
     Version,
-    /// Initialize a Brokkr project in the current directory.
-    Init {
-        /// Overwrite existing config files.
-        #[arg(long)]
-        force: bool,
+    /// Run a shell command locally.
+    Run {
+        /// The shell command to execute.
+        #[arg(long, short = 'c')]
+        command: String,
     },
 }
 
@@ -43,7 +45,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Version => print_version(),
-        Command::Init { force } => init_project(force),
+        Command::Run { command } => commands::run::execute(&command),
     }
 }
 
@@ -55,12 +57,5 @@ fn print_version() -> Result<()> {
         env!("BROKKR_RUSTC_VERSION"),
         env!("BROKKR_TARGET_TRIPLE"),
     );
-    Ok(())
-}
-
-fn init_project(_force: bool) -> Result<()> {
-    // TODO(brokkr-cli-init): scaffold a brokk.toml + .brokkrignore + sample
-    // workflows. Tracked under Phase 1 task list.
-    println!("brokk init: not yet implemented (Phase 0 stub)");
     Ok(())
 }
