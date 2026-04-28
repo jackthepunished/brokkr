@@ -32,7 +32,16 @@ mod tests {
     }
 
     #[test]
-    fn smoke_exit_code() {
+    fn smoke_stderr() {
+        let out = std::process::Command::new("sh")
+            .args(["-c", "echo error >&2"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
+    }
+
+    #[test]
+    fn smoke_nonzero_exit() {
         let out = std::process::Command::new("sh")
             .args(["-c", "exit 42"])
             .output()
