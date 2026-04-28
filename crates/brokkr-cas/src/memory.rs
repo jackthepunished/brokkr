@@ -76,6 +76,7 @@ impl Default for InMemoryCas {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use bytes::Bytes;
