@@ -31,3 +31,27 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_addr_default() {
+        let opts = Opts::try_parse_from(["brokkr-control"]).unwrap();
+        assert_eq!(opts.addr, "127.0.0.1:50051".parse().unwrap());
+        assert!(opts.cas_path.is_none());
+    }
+
+    #[test]
+    fn parses_custom_addr() {
+        let opts = Opts::try_parse_from(["brokkr-control", "--addr", "0.0.0.0:9000"]).unwrap();
+        assert_eq!(opts.addr, "0.0.0.0:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn parses_cas_path() {
+        let opts = Opts::try_parse_from(["brokkr-control", "--cas-path", "/tmp/brokkr"]).unwrap();
+        assert_eq!(opts.cas_path.as_ref().unwrap().as_os_str(), "/tmp/brokkr");
+    }
+}
