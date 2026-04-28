@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI (`fmt`, `clippy -D warnings`, `test`, `build --release`)
   on Linux x86_64 and aarch64.
 - ADR 0001 — Rust everywhere.
+- `docs/journal/phase-0.md` — Phase 0 retrospective.
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
