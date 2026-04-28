@@ -3,4 +3,5 @@
 //! `brokkr-common` is the only crate every other Brokkr crate may depend on.
 //! Keep it small and dependency-light.
 
-#![deny(missing_docs)]
+//! Stub crate — real implementation in Phase 1+.
+#![allow(missing_docs)]
