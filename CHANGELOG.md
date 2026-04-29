@@ -116,3 +116,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passthrough, workdir, timings populated).
 - `nix` workspace dep (`features = ["fs", "process", "user"]`) for the
   raw Linux primitives the sandbox needs.
+- M3: user namespace + mount namespace + `pivot_root` in the runner.
+  `runner/userns.rs` does the unprivileged `0 <host_uid> 1` mapping
+  (with the `setgroups`-deny gotcha); `runner/mount.rs` makes `/`
+  recursively private, builds a tmpfs rootfs, applies
+  `RootfsSpec.{ro_binds, tmpfs, symlinks}`, and pivots into it.
+  `RootfsSpec` gained a `symlinks` field plus an `is_empty()` helper
+  (`Default` is treated as "skip the namespace path" so M2 smoke
+  tests are unaffected).
+- `brokkr-sandbox/tests/mount_ns.rs` — three M3 evil-action tests:
+  EV-01 (`cat /etc/shadow` fails inside the sandbox), `ls /` shows
+  only the entries we put there, and EV-15 (host's
+  `/proc/self/mountinfo` is byte-identical before and after the
+  sandbox runs an explicit `mount -t tmpfs`).
+- `nix` features extended to include `mount` and `sched`.

@@ -1,14 +1,19 @@
-//! Linux runner main + the final `execvpe` into the action.
+//! Linux runner main: read config, set up namespaces / rootfs, exec.
 //!
-//! M2 keeps this minimal: read config, chdir, exec. M3+ insert namespace
-//! setup, mount work, cgroup attach, seccomp, etc. between the read and
-//! the exec.
+//! M2 ran the action with no isolation. M3 inserts user-namespace setup
+//! and mount-namespace + `pivot_root` work between the config read and
+//! the final `execvpe`, gated on whether the caller asked for a rootfs:
+//! a default-empty [`RootfsSpec`] keeps the M2 path so existing smoke
+//! tests don't break.
 
 use std::ffi::CString;
 use std::io::Read as _;
 use std::os::fd::{FromRawFd, RawFd};
 
 use crate::config::SandboxConfig;
+
+use super::mount::setup_rootfs;
+use super::userns::{setup_user_and_mount_namespaces, UidGidMap};
 
 /// File descriptor on which the host writes the JSON-encoded
 /// `SandboxConfig`. Hard-coded by convention on both sides; see
@@ -20,6 +25,19 @@ pub(super) fn runner_main() -> ! {
         Ok(c) => c,
         Err(e) => die("failed to read config", &e.to_string()),
     };
+
+    if !cfg.rootfs.is_empty() {
+        let map = UidGidMap {
+            host_uid: nix::unistd::getuid().as_raw(),
+            host_gid: nix::unistd::getgid().as_raw(),
+        };
+        if let Err(e) = setup_user_and_mount_namespaces(map) {
+            die("setup user/mount namespaces", &e.to_string());
+        }
+        if let Err(e) = setup_rootfs(&cfg.rootfs) {
+            die("setup rootfs", &e.to_string());
+        }
+    }
 
     if let Some(workdir) = &cfg.workdir {
         if let Err(e) = std::env::set_current_dir(workdir) {
