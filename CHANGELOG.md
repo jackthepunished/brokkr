@@ -66,3 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `brokkr-control` `tests/end_to_end.rs`: full in-process cluster (server +
   worker) running `/bin/echo "hello world"` end-to-end and verifying that the
   second invocation hits the action cache.
+- Tracing spans on the Phase 1 hot path: `client::execute` (SDK),
+  `control::dispatch` (scheduler), and `worker::run_action` (worker), each
+  recording action digest / job id / cache hit / exit code as the action
+  flows through the layers (plan §13.9).

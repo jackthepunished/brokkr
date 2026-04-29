@@ -92,16 +92,29 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(
+    name = "worker::run_action",
+    skip(cas, job),
+    fields(
+        job_id = %job.job_id,
+        argv0 = tracing::field::Empty,
+        exit_code = tracing::field::Empty,
+    ),
+)]
 async fn handle_job(
     cas: &mut ContentAddressableStorageClient<Channel>,
     job: bv1::Job,
 ) -> Result<rapi::ActionResult> {
     let command = job.command.ok_or_else(|| anyhow!("Job missing Command"))?;
+    if let Some(argv0) = command.arguments.first() {
+        tracing::Span::current().record("argv0", argv0.as_str());
+    }
     let RunOutcome {
         exit_code,
         stdout,
         stderr,
     } = run_command(&command).await?;
+    tracing::Span::current().record("exit_code", exit_code);
 
     // Phase 1 stdout/stderr policy: upload to CAS and reference by digest;
     // also keep a bounded inline copy on the ActionResult for quick CLI

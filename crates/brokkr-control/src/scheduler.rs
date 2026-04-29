@@ -53,6 +53,17 @@ impl Scheduler {
 
     /// Execute an action: look up the action cache, otherwise enqueue a job
     /// and await the worker's report.
+    #[tracing::instrument(
+        name = "control::dispatch",
+        skip(self),
+        fields(
+            action_digest = %action_digest,
+            skip_cache_lookup,
+            cache_hit = tracing::field::Empty,
+            exit_code = tracing::field::Empty,
+            job_id = tracing::field::Empty,
+        ),
+    )]
     pub async fn execute(
         self: &Arc<Self>,
         action_digest: Digest,
@@ -65,6 +76,9 @@ impl Scheduler {
                 .await
                 .map_err(|e| anyhow!("action cache get: {e}"))?
             {
+                tracing::Span::current()
+                    .record("cache_hit", true)
+                    .record("exit_code", cached.exit_code);
                 return Ok(ExecutionOutcome {
                     result: cached,
                     cache_hit: true,
@@ -91,6 +105,7 @@ impl Scheduler {
             .with_context(|| "fetching Command from CAS")?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
+        tracing::Span::current().record("job_id", job_id.as_str());
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.insert(job_id.clone(), tx);
 
@@ -123,6 +138,9 @@ impl Scheduler {
                 .await
                 .map_err(|e| anyhow!("action cache update: {e}"))?;
         }
+        tracing::Span::current()
+            .record("cache_hit", false)
+            .record("exit_code", result.exit_code);
         Ok(ExecutionOutcome {
             result,
             cache_hit: false,
