@@ -99,31 +99,47 @@ pub async fn run_command(
         )),
     );
 
-    // Upload Action, Command, and the empty Directory to CAS.
-    client
+    // FindMissingBlobs precheck so cache-hit calls (where Action/Command are
+    // already present) skip the BatchUpdateBlobs RPC entirely. Plan §13.7
+    // calls for "uploads any missing input blobs".
+    let candidates: [(rapi::Digest, Vec<u8>); 3] = [
+        (action_digest.clone(), action_bytes),
+        (command_digest, command_bytes),
+        (input_root_digest, input_root_bytes),
+    ];
+    let missing_resp = client
         .cas
-        .batch_update_blobs(rapi::BatchUpdateBlobsRequest {
+        .find_missing_blobs(rapi::FindMissingBlobsRequest {
             instance_name: String::new(),
-            requests: vec![
-                bur::Request {
-                    digest: Some(action_digest.clone()),
-                    data: action_bytes,
-                    compressor: 0,
-                },
-                bur::Request {
-                    digest: Some(command_digest),
-                    data: command_bytes,
-                    compressor: 0,
-                },
-                bur::Request {
-                    digest: Some(input_root_digest),
-                    data: input_root_bytes,
-                    compressor: 0,
-                },
-            ],
+            blob_digests: candidates.iter().map(|(d, _)| d.clone()).collect(),
             digest_function: 0,
         })
-        .await?;
+        .await?
+        .into_inner();
+    let missing: std::collections::HashSet<(String, i64)> = missing_resp
+        .missing_blob_digests
+        .into_iter()
+        .map(|d| (d.hash, d.size_bytes))
+        .collect();
+    let requests: Vec<bur::Request> = candidates
+        .into_iter()
+        .filter(|(d, _)| missing.contains(&(d.hash.clone(), d.size_bytes)))
+        .map(|(d, data)| bur::Request {
+            digest: Some(d),
+            data,
+            compressor: 0,
+        })
+        .collect();
+    if !requests.is_empty() {
+        client
+            .cas
+            .batch_update_blobs(rapi::BatchUpdateBlobsRequest {
+                instance_name: String::new(),
+                requests,
+                digest_function: 0,
+            })
+            .await?;
+    }
 
     let mut stream = client
         .exec
