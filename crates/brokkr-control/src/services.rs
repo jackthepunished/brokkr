@@ -15,7 +15,7 @@ use prost::Message;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-/// REAPI [`ContentAddressableStorage`] service backed by a [`Cas`].
+/// REAPI `ContentAddressableStorage` service backed by a [`Cas`].
 pub struct CasService<C: Cas> {
     backend: Arc<C>,
 }
@@ -231,7 +231,7 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
     }
 }
 
-/// REAPI [`Capabilities`] service. Returns a static, Phase-1-appropriate set.
+/// REAPI `Capabilities` service. Returns a static, Phase-1-appropriate set.
 #[derive(Default)]
 pub struct CapabilitiesService;
 
@@ -273,7 +273,7 @@ impl CapSvc for CapabilitiesService {
     }
 }
 
-/// REAPI [`Execution`] service. Uses the scheduler to dispatch actions to a
+/// REAPI `Execution` service. Uses the scheduler to dispatch actions to a
 /// worker and stream back `google.longrunning.Operation` updates.
 pub struct ExecutionService {
     scheduler: Arc<crate::scheduler::Scheduler>,
