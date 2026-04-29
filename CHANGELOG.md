@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `brokkr-common`: foundational types — `Digest`, `WorkerId`, `JobId`,
+  `TenantId`, typed `Error`/`CasError` enums, `sha256()` helper.
+  Phase 1 building block; all other Phase 1 crates depend on these.
 - Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,
   rustfmt/clippy/deny configuration, root README, CONTRIBUTING, LICENSE
   (Apache-2.0), CHANGELOG, CODE_OF_CONDUCT, justfile.
