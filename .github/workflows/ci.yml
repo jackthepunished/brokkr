@@ -23,7 +23,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - run: cargo fmt --all --check
 
   clippy:
@@ -32,8 +34,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   doc:
@@ -42,10 +45,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: doc
+          cache-key: doc
       - run: cargo doc --workspace --no-deps --all-features
 
   deny:
@@ -73,10 +75,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
       - run: cargo test --workspace --all-targets
       - run: cargo build --workspace --release
