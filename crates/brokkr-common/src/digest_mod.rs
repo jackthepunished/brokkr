@@ -97,20 +97,16 @@ impl Ord for Digest {
     }
 }
 
-/// Parse a digest from `hex/size` string form.
+/// Parses a digest from `hex/size` string form.
+/// REAPI format: `sha256_hex/size_bytes` e.g. `b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9/11`.
 impl FromStr for Digest {
     type Err = DigestParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (hash_part, size_part) = s
-            .strip_prefix('/')
-            .and_then(|s| s.split_once('/'))
-            .or_else(|| s.split_once('/'))
-            .ok_or(DigestParseError::Malformed)?;
+        let (hash_hex, size_str) = s.split_once('/').ok_or(DigestParseError::Malformed)?;
 
-        let hash_hex = hash_part;
         let hash = <[u8; 32]>::from_hex(hash_hex).map_err(|_| DigestParseError::BadHex)?;
-        let size_bytes = size_part.parse().map_err(|_| DigestParseError::BadSize)?;
+        let size_bytes = size_str.parse().map_err(|_| DigestParseError::BadSize)?;
 
         Ok(Self { hash, size_bytes })
     }
@@ -199,6 +195,13 @@ mod tests {
     #[test]
     fn digest_parse_error_invalid_hex() {
         let result: Result<Digest, _> = "zzzzzzzz/11".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn digest_parse_error_bad_size() {
+        let result: Result<Digest, _> =
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9/abc".parse();
         assert!(result.is_err());
     }
 
