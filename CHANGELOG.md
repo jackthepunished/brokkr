@@ -86,6 +86,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/phase-2-plan.md` — detailed Phase 2 implementation plan (threat
   model, re-exec runner architecture, public API, per-subsystem designs,
   evil-action matrix, M1–M9 milestones, CI / WSL2 notes).
+- `brokkr-sandbox::host_check` — Linux host-compatibility probes (kernel
+  version, unprivileged userns, cgroup v2, brokkr.slice writable, seccomp
+  presence, `memory.peak`, `/proc/self/setgroups`) returning a structured
+  `Report` with pass/warn/fail outcomes.
+- `brokkr-worker --check-host` — runs the host probes, prints the
+  checklist, exits 0 iff the sandbox is functional on this host
+  (warnings allowed). Plan §10.3.
+- `scripts/install-cgroup-slice.sh` — one-shot host setup that creates
+  `/sys/fs/cgroup/brokkr.slice`, chowns it to the target user, and
+  delegates the cpu/memory/pids/io controllers. Idempotent.
+- `docs/journal/phase-2.md` — Phase 2 journal, started with the M1 entry.
 - `brokkr-sandbox` public API: `Sandbox`, `SandboxConfig`, `SandboxOutcome`,
   `ExitStatus`, `ResourceAccounting`, `SandboxTimings`, `SandboxError` —
   full type surface that subsequent milestones light up incrementally.
@@ -97,7 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Namespace / cgroup / seccomp setup is added by M3–M8.
 - Host-side spawn uses `pipe2(O_CLOEXEC)` for the config pipe so the
   runner's inherited copy of the write end auto-closes on `execve`,
-  letting `read_to_end(fd 3)` see EOF.
+  letting `read_to_end(fd 3)` see EOF. `pre_exec` clears
+  `FD_CLOEXEC` on fd 3 even when `pipe2` happens to return the read
+  end already at fd 3.
 - `brokkr-sandbox/tests/sandbox_smoke.rs` — seven end-to-end smoke
   tests (echo, /bin/false, missing argv0, empty argv error, env
   passthrough, workdir, timings populated).
