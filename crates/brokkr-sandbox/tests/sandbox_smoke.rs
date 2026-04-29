@@ -74,21 +74,30 @@ async fn env_is_passed_through() {
 
 #[tokio::test]
 async fn workdir_is_honoured() {
-    let dir = tempfile::tempdir().unwrap();
+    // Use a stable absolute path that exists on every Linux host. The test
+    // crate is `cfg(target_os = "linux")`, so /tmp is /tmp (no symlink
+    // canonicalization quirks like macOS's /private/tmp).
+    let workdir = std::path::PathBuf::from("/tmp");
     let sandbox = Sandbox::new(runner_path());
     let cfg = SandboxConfig {
-        argv: vec!["/bin/pwd".to_string()],
-        workdir: Some(dir.path().to_path_buf()),
+        argv: vec!["/bin/sh".to_string(), "-c".into(), "pwd".into()],
+        workdir: Some(workdir.clone()),
         ..Default::default()
     };
-    let outcome = sandbox.run(cfg).await.unwrap();
-    assert_eq!(outcome.exit_status, ExitStatus::Exited(0));
-    let stdout = String::from_utf8_lossy(&outcome.stdout);
+    let outcome = match sandbox.run(cfg).await {
+        Ok(o) => o,
+        Err(e) => panic!("sandbox.run failed: {e:#}"),
+    };
     assert_eq!(
-        stdout.trim(),
-        // pwd may resolve symlinks (e.g. /tmp → /private/tmp on some hosts);
-        // we canonicalize to compare against what the kernel reports.
-        dir.path().canonicalize().unwrap().to_string_lossy()
+        outcome.exit_status,
+        ExitStatus::Exited(0),
+        "exit={:?} stderr={}",
+        outcome.exit_status,
+        String::from_utf8_lossy(&outcome.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&outcome.stdout).trim(),
+        workdir.to_string_lossy(),
     );
 }
 

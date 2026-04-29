@@ -78,19 +78,27 @@ pub(super) async fn run_action(
     // 64 KiB Linux pipe-buffer size, so this never blocks. We deliberately
     // bound `file`'s scope so its Drop closes the fd *before* we wait on
     // the child — otherwise the runner would block forever on `read_to_end`.
-    {
+    //
+    // EPIPE is intentionally tolerated here: it means the runner already
+    // exited (e.g. its `pre_exec` or startup failed). In that case the
+    // runner's stderr + exit status is the authoritative error, not the
+    // pipe write — let `wait_with_output` collect them and report.
+    let write_err = {
         use std::io::Write as _;
         // OwnedFd → File is a safe conversion (impl From in std).
         let mut file = File::from(pipe.writer);
-        file.write_all(&payload).map_err(|e| SandboxError::Setup {
-            step: "write config payload",
-            source: e,
-        })?;
-        file.flush().map_err(|e| SandboxError::Setup {
-            step: "flush config payload",
-            source: e,
-        })?;
-    } // file dropped here → write end closed → runner sees EOF on fd 3
+        let res = file.write_all(&payload).and_then(|()| file.flush()).err();
+        drop(file);
+        res
+    };
+    if let Some(e) = &write_err {
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            return Err(SandboxError::Setup {
+                step: "write config payload",
+                source: io::Error::new(e.kind(), e.to_string()),
+            });
+        }
+    }
 
     let exec_start = Instant::now();
     let setup_elapsed = exec_start - setup_start;
@@ -102,6 +110,15 @@ pub(super) async fn run_action(
             step: "wait for runner",
             source: e,
         })?;
+
+    // If the host's write hit EPIPE *and* the runner exited non-zero with a
+    // diagnostic on stderr, prefer the runner's message — it's almost
+    // certainly more informative than "Broken pipe".
+    if write_err.is_some() && !output.status.success() && !output.stderr.is_empty() {
+        return Err(SandboxError::RunnerCrashed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
 
     let teardown_start = Instant::now();
     let exec_elapsed = teardown_start - exec_start;
