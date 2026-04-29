@@ -131,14 +131,35 @@ pub async fn run_command(
         })
         .collect();
     if !requests.is_empty() {
-        client
+        let resp = client
             .cas
             .batch_update_blobs(rapi::BatchUpdateBlobsRequest {
                 instance_name: String::new(),
                 requests,
                 digest_function: 0,
             })
-            .await?;
+            .await?
+            .into_inner();
+        // BatchUpdateBlobs may report per-blob failures while the gRPC call
+        // itself succeeds. Surface the first such failure as an error so it
+        // does not get silently swallowed and resurface later as a confusing
+        // "blob not found" during Execute.
+        for r in &resp.responses {
+            let status = r.status.as_ref();
+            if status.map(|s| s.code != 0).unwrap_or(false) {
+                let digest = r
+                    .digest
+                    .as_ref()
+                    .map(|d| format!("{}/{}", d.hash, d.size_bytes))
+                    .unwrap_or_else(|| "<no digest>".to_string());
+                let (code, message) = status
+                    .map(|s| (s.code, s.message.as_str()))
+                    .unwrap_or((-1, ""));
+                return Err(anyhow!(
+                    "CAS rejected blob {digest}: code={code} message={message:?}"
+                ));
+            }
+        }
     }
 
     let mut stream = client
