@@ -1145,11 +1145,11 @@ Place ADRs (Architecture Decision Records) in `docs/architecture/`. Format:
 
 Track unresolved design questions here. Resolve before they become blockers.
 
-- [ ] **License:** Apache-2.0 (default for infra) vs. MIT (simpler)? **Tentative: Apache-2.0** for explicit patent grant.
+- [x] **License:** Apache-2.0 (default for infra) vs. MIT (simpler)? **Resolved: Apache-2.0** — see ADR `0006-license-apache-2-0.md`.
 - [ ] **MSRV policy:** lock to 1.78 or follow latest stable? **Tentative: lock, bump quarterly.**
 - [ ] **Single binary vs. multi-binary?** Probably multi (`brokk`, `brokkr-control`, `brokkr-worker`, `brokkr-cas`) — clearer ops, separate metrics.
 - [ ] **Action cache TTL default?** 30 days starting point.
-- [ ] **GC strategy for CAS?** Reference counting + LRU. Need an ADR.
+- [ ] **GC strategy for CAS?** Reference counting + LRU. Placeholder ADR `0007-cas-gc-strategy.md`; finalize during Phase 3 design.
 - [ ] **mTLS vs. token auth as default?** Probably mTLS for worker↔control, tokens for client↔control.
 - [ ] **Schema evolution policy for protos?** Brokkr-internal protos versioned per-namespace; REAPI is upstream so we follow upstream.
 - [ ] **Telemetry-by-default?** No. Self-hosted infra ships with telemetry off; opt-in only.
