@@ -99,31 +99,68 @@ pub async fn run_command(
         )),
     );
 
-    // Upload Action, Command, and the empty Directory to CAS.
-    client
+    // FindMissingBlobs precheck so cache-hit calls (where Action/Command are
+    // already present) skip the BatchUpdateBlobs RPC entirely. Plan §13.7
+    // calls for "uploads any missing input blobs".
+    let candidates: [(rapi::Digest, Vec<u8>); 3] = [
+        (action_digest.clone(), action_bytes),
+        (command_digest, command_bytes),
+        (input_root_digest, input_root_bytes),
+    ];
+    let missing_resp = client
         .cas
-        .batch_update_blobs(rapi::BatchUpdateBlobsRequest {
+        .find_missing_blobs(rapi::FindMissingBlobsRequest {
             instance_name: String::new(),
-            requests: vec![
-                bur::Request {
-                    digest: Some(action_digest.clone()),
-                    data: action_bytes,
-                    compressor: 0,
-                },
-                bur::Request {
-                    digest: Some(command_digest),
-                    data: command_bytes,
-                    compressor: 0,
-                },
-                bur::Request {
-                    digest: Some(input_root_digest),
-                    data: input_root_bytes,
-                    compressor: 0,
-                },
-            ],
+            blob_digests: candidates.iter().map(|(d, _)| d.clone()).collect(),
             digest_function: 0,
         })
-        .await?;
+        .await?
+        .into_inner();
+    let missing: std::collections::HashSet<(String, i64)> = missing_resp
+        .missing_blob_digests
+        .into_iter()
+        .map(|d| (d.hash, d.size_bytes))
+        .collect();
+    let requests: Vec<bur::Request> = candidates
+        .into_iter()
+        .filter(|(d, _)| missing.contains(&(d.hash.clone(), d.size_bytes)))
+        .map(|(d, data)| bur::Request {
+            digest: Some(d),
+            data,
+            compressor: 0,
+        })
+        .collect();
+    if !requests.is_empty() {
+        let resp = client
+            .cas
+            .batch_update_blobs(rapi::BatchUpdateBlobsRequest {
+                instance_name: String::new(),
+                requests,
+                digest_function: 0,
+            })
+            .await?
+            .into_inner();
+        // BatchUpdateBlobs may report per-blob failures while the gRPC call
+        // itself succeeds. Surface the first such failure as an error so it
+        // does not get silently swallowed and resurface later as a confusing
+        // "blob not found" during Execute.
+        for r in &resp.responses {
+            let status = r.status.as_ref();
+            if status.map(|s| s.code != 0).unwrap_or(false) {
+                let digest = r
+                    .digest
+                    .as_ref()
+                    .map(|d| format!("{}/{}", d.hash, d.size_bytes))
+                    .unwrap_or_else(|| "<no digest>".to_string());
+                let (code, message) = status
+                    .map(|s| (s.code, s.message.as_str()))
+                    .unwrap_or((-1, ""));
+                return Err(anyhow!(
+                    "CAS rejected blob {digest}: code={code} message={message:?}"
+                ));
+            }
+        }
+    }
 
     let mut stream = client
         .exec

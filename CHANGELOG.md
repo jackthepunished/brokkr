@@ -70,3 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control::dispatch` (scheduler), and `worker::run_action` (worker), each
   recording action digest / job id / cache hit / exit code as the action
   flows through the layers (plan §13.9).
+- `brokkr-sdk`: `run_command` now issues a `FindMissingBlobs` precheck and
+  only uploads the Action / Command / input-root entries that the CAS does
+  not already have. Closes plan §13.7 ("uploads any missing input blobs")
+  and removes a fixed cost from the cache-hit path.
+- `brokkr-control` `tests/phase1_dod.rs`: Phase 1 DoD assertions —
+  `one_hundred_iterations_deterministic` (200 RPCs, 100 distinct
+  commands, miss-then-hit each, `#[ignore]`-soak) and
+  `cache_hit_faster_than_miss` (median-of-10 timing comparison).
+  Shared cluster fixture moved to `tests/common/mod.rs`.
