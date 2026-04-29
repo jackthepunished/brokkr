@@ -41,7 +41,7 @@ pub(super) async fn run_action(
         step: "create config pipe",
         source: e,
     })?;
-    let child_read_fd: RawFd = pipe.child_read_fd;
+    let child_read_fd: RawFd = pipe.reader_raw();
 
     let mut cmd = Command::new(runner_binary);
     cmd.stdin(Stdio::null())
@@ -50,16 +50,27 @@ pub(super) async fn run_action(
         .env_clear();
 
     // SAFETY: pre_exec runs in the freshly-forked child between fork and
-    // exec. We perform only async-signal-safe operations: dup2(2) and
-    // close(2) on a pre-existing file descriptor we own. We do not allocate,
-    // touch globals, or call non-reentrant libc routines.
+    // exec. We perform only async-signal-safe operations: dup2(2),
+    // close(2), and fcntl(2) on file descriptors we own. We do not
+    // allocate, touch globals, or call non-reentrant libc routines.
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
             const TARGET_FD: RawFd = 3;
             if child_read_fd != TARGET_FD {
+                // dup2 atomically clears FD_CLOEXEC on the target.
                 nix::unistd::dup2(child_read_fd, TARGET_FD).map_err(io::Error::from)?;
                 nix::unistd::close(child_read_fd).map_err(io::Error::from)?;
+            } else {
+                // dup2(N, N) is a no-op and does NOT clear CLOEXEC, so we
+                // have to do it explicitly. Without this, the runner's fd 3
+                // (which inherited O_CLOEXEC from `pipe2`) would close on
+                // `execve`, leaving the runner unable to read its config.
+                nix::fcntl::fcntl(
+                    TARGET_FD,
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(io::Error::from)?;
             }
             Ok(())
         });
@@ -69,9 +80,14 @@ pub(super) async fn run_action(
         step: "spawn runner",
         source: e,
     })?;
+    // (If `cmd.spawn()` had failed, `pipe.reader` and `pipe.writer` would
+    // close via Drop on the early return above — no fd leaks.)
 
-    // Close our (host) copy of the read end now that the child has it.
-    let _ = nix::unistd::close(child_read_fd);
+    // Decompose the pipe so the host's copy of the read end closes
+    // immediately (the child has its own copy at fd 3) and `writer` is
+    // free to move into the synchronous-write block below.
+    let crate::host::ipc::ConfigPipe { writer, reader } = pipe;
+    drop(reader);
 
     // Write the JSON payload synchronously and close the write end so the
     // runner sees EOF on fd 3. Phase-2 config payloads are well under the
@@ -86,7 +102,7 @@ pub(super) async fn run_action(
     let write_err = {
         use std::io::Write as _;
         // OwnedFd → File is a safe conversion (impl From in std).
-        let mut file = File::from(pipe.writer);
+        let mut file = File::from(writer);
         let res = file.write_all(&payload).and_then(|()| file.flush()).err();
         drop(file);
         res

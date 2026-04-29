@@ -74,9 +74,9 @@ async fn env_is_passed_through() {
 
 #[tokio::test]
 async fn workdir_is_honoured() {
-    // Use a stable absolute path that exists on every Linux host. The test
-    // crate is `cfg(target_os = "linux")`, so /tmp is /tmp (no symlink
-    // canonicalization quirks like macOS's /private/tmp).
+    // Use a stable absolute path that exists on every Linux host. We
+    // deliberately avoid tempfile + canonicalize here so the test surface
+    // is just `chdir(workdir); pwd`.
     let workdir = std::path::PathBuf::from("/tmp");
     let sandbox = Sandbox::new(runner_path());
     let cfg = SandboxConfig {
@@ -103,18 +103,21 @@ async fn workdir_is_honoured() {
 
 #[tokio::test]
 async fn timings_are_populated() {
+    // Sleep briefly so even on fast machines with coarse timer resolution
+    // the *aggregate* runtime is comfortably above zero. We don't assert
+    // any individual phase is > 0 — `setup`, `execution`, or `teardown`
+    // can legitimately round to zero on a hot path.
     let sandbox = Sandbox::new(runner_path());
-    let cfg = SandboxConfig::new(vec!["/bin/true".to_string()]);
+    let cfg = SandboxConfig::new(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "sleep 0.01".to_string(),
+    ]);
     let outcome = sandbox.run(cfg).await.unwrap();
     assert_eq!(outcome.exit_status, ExitStatus::Exited(0));
-    // Setup and execution should both be > 0; teardown might round to 0 on
-    // very fast paths, so just assert it's non-negative (Duration always is).
+    let total = outcome.timings.setup + outcome.timings.execution + outcome.timings.teardown;
     assert!(
-        outcome.timings.setup.as_nanos() > 0,
-        "setup duration should be > 0"
-    );
-    assert!(
-        outcome.timings.execution.as_nanos() > 0,
-        "execution duration should be > 0"
+        total.as_millis() >= 5,
+        "expected aggregate timing ≥ 5 ms, got {total:?}"
     );
 }

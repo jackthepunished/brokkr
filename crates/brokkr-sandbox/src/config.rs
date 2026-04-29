@@ -31,7 +31,9 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub workdir: Option<PathBuf>,
 
-    /// What the action's stdin should be wired to.
+    /// What the action's stdin should be wired to. **M2 ignores this**:
+    /// the host always spawns the runner with `Stdio::null()`. Honouring
+    /// this field is scheduled alongside the determinism work in M8.
     #[serde(default)]
     pub stdin: StdioPolicy,
 

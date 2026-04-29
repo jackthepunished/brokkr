@@ -27,10 +27,18 @@ pub enum SandboxError {
     #[error("the kernel does not support a feature we require: {0}")]
     Unsupported(&'static str),
 
-    /// The runner process exited or was killed before it could exec the
-    /// action (e.g. failed to parse the config, hit a permission error
-    /// during namespace setup). The string is whatever the runner wrote to
-    /// stderr.
+    /// The runner process exited before the host could finish handing it
+    /// the [`crate::SandboxConfig`] payload (M2: the host's pipe write hit
+    /// `EPIPE` and the runner exited non-zero with diagnostics on stderr;
+    /// later milestones will also surface namespace- or cgroup-setup
+    /// failures that happen before the action begins).
+    ///
+    /// The string is whatever the runner wrote to stderr. A runner that
+    /// reads the config successfully and only fails afterwards (e.g. a
+    /// missing `argv[0]` or a bad `workdir`) does *not* produce this
+    /// error; instead the action's exit status surfaces in
+    /// [`crate::SandboxOutcome::exit_status`] (typically `Exited(127)`)
+    /// alongside the runner's stderr.
     #[error("the sandbox runner exited abnormally before exec: {0}")]
     RunnerCrashed(String),
 
