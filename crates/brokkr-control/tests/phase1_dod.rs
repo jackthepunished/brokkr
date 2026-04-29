@@ -40,17 +40,18 @@ async fn one_hundred_iterations_deterministic() {
     }
 }
 
-/// Take 10 (miss, hit) pairs over distinct echo commands and assert the
+/// Take 11 (miss, hit) pairs over distinct echo commands and assert the
 /// median hit is faster than the median miss. The plan asks only for
 /// "measurably faster" — we compare medians rather than means to keep the
 /// signal robust under scheduler jitter, and use distinct commands per pair
-/// so the miss path actually executes the worker each time.
+/// so the miss path actually executes the worker each time. N is odd so
+/// `samples[N / 2]` is the true middle element.
 #[tokio::test]
 async fn cache_hit_faster_than_miss() {
     let (endpoint, _dir) = boot_cluster().await;
     let mut client = BrokkrClient::connect(endpoint).await.unwrap();
 
-    const N: usize = 10;
+    const N: usize = 11;
     let mut misses = Vec::with_capacity(N);
     let mut hits = Vec::with_capacity(N);
 
