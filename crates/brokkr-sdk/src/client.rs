@@ -56,6 +56,17 @@ pub struct RunOutcome {
 ///
 /// Builds an `Action` (with empty input root + the given Command), uploads
 /// both to CAS, calls `Execute`, and waits for the streamed completion.
+#[tracing::instrument(
+    name = "client::execute",
+    skip(client, argv),
+    fields(
+        argv_len = argv.len(),
+        skip_cache_lookup,
+        action_digest = tracing::field::Empty,
+        cache_hit = tracing::field::Empty,
+        exit_code = tracing::field::Empty,
+    ),
+)]
 pub async fn run_command(
     client: &mut BrokkrClient,
     argv: &[String],
@@ -80,6 +91,13 @@ pub async fn run_command(
     };
     let action_bytes = action.encode_to_vec();
     let action_digest = digest_of(&action_bytes);
+    tracing::Span::current().record(
+        "action_digest",
+        tracing::field::display(format_args!(
+            "{}/{}",
+            action_digest.hash, action_digest.size_bytes
+        )),
+    );
 
     // Upload Action, Command, and the empty Directory to CAS.
     client
@@ -130,6 +148,9 @@ pub async fn run_command(
                 let result = resp
                     .result
                     .ok_or_else(|| anyhow!("ExecuteResponse missing ActionResult"))?;
+                tracing::Span::current()
+                    .record("cache_hit", resp.cached_result)
+                    .record("exit_code", result.exit_code);
                 return Ok(RunOutcome {
                     exit_code: result.exit_code,
                     stdout: Bytes::from(result.stdout_raw),
