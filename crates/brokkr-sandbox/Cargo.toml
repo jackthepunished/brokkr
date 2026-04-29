@@ -11,7 +11,21 @@ description = "Linux-primitive sandbox runtime for Brokkr (namespaces, cgroups, 
 [lints]
 workspace = true
 
+[[bin]]
+name = "brokkr-sandboxd"
+path = "src/bin/sandboxd.rs"
+
 [dependencies]
 brokkr-common.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

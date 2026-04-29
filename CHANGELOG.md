@@ -97,3 +97,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/sys/fs/cgroup/brokkr.slice`, chowns it to the target user, and
   delegates the cpu/memory/pids/io controllers. Idempotent.
 - `docs/journal/phase-2.md` — Phase 2 journal, started with the M1 entry.
+- `brokkr-sandbox` public API: `Sandbox`, `SandboxConfig`, `SandboxOutcome`,
+  `ExitStatus`, `ResourceAccounting`, `SandboxTimings`, `SandboxError` —
+  full type surface that subsequent milestones light up incrementally.
+  `SandboxConfig` is also the IPC payload between host and runner
+  (serde JSON over fd 3).
+- `brokkr-sandboxd` runner binary inside the `brokkr-sandbox` crate.
+  M2 reads the config from fd 3, optionally chdirs to `workdir`, and
+  `execvpe`s the action — Phase-1 parity inside the new re-exec model.
+  Namespace / cgroup / seccomp setup is added by M3–M8.
+- Host-side spawn uses `pipe2(O_CLOEXEC)` for the config pipe so the
+  runner's inherited copy of the write end auto-closes on `execve`,
+  letting `read_to_end(fd 3)` see EOF. `pre_exec` clears
+  `FD_CLOEXEC` on fd 3 even when `pipe2` happens to return the read
+  end already at fd 3.
+- `brokkr-sandbox/tests/sandbox_smoke.rs` — seven end-to-end smoke
+  tests (echo, /bin/false, missing argv0, empty argv error, env
+  passthrough, workdir, timings populated).
+- `nix` workspace dep (`features = ["fs", "process", "user"]`) for the
+  raw Linux primitives the sandbox needs.
