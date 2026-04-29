@@ -20,19 +20,17 @@ pub struct Digest {
 impl Digest {
     /// Creates a `Digest` from raw SHA-256 bytes and a size.
     ///
-    /// # Panics
-    ///
-    /// Panics if `hash` is not exactly 32 bytes.
+    /// `size_bytes` is the size of the content in bytes, not the hash.
     #[inline]
     #[must_use]
-    pub fn new(hash: [u8; 32], size_bytes: i64) -> Self {
+    pub const fn new(hash: [u8; 32], size_bytes: i64) -> Self {
         Self { hash, size_bytes }
     }
 
     /// Creates a `Digest` from raw SHA-256 bytes produced by a hasher.
     #[inline]
     #[must_use]
-    pub fn from_hash(hash: [u8; 32]) -> Self {
+    pub const fn from_hash(hash: [u8; 32]) -> Self {
         Self {
             hash,
             size_bytes: 0,
@@ -87,6 +85,18 @@ impl fmt::Debug for Digest {
     }
 }
 
+impl PartialOrd for Digest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.hash.cmp(&other.hash))
+    }
+}
+
+impl Ord for Digest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.hash.cmp(&other.hash)
+    }
+}
+
 /// Parse a digest from `hex/size` string form.
 impl FromStr for Digest {
     type Err = DigestParseError;
@@ -98,11 +108,9 @@ impl FromStr for Digest {
             .or_else(|| s.split_once('/'))
             .ok_or(DigestParseError::Malformed)?;
 
-        let hash_hex = hash_part.trim_end_matches('/');
+        let hash_hex = hash_part;
         let hash = <[u8; 32]>::from_hex(hash_hex).map_err(|_| DigestParseError::BadHex)?;
-        let size_bytes = size_part
-            .parse()
-            .map_err(|_| DigestParseError::BadSize)?;
+        let size_bytes = size_part.parse().map_err(|_| DigestParseError::BadSize)?;
 
         Ok(Self { hash, size_bytes })
     }
