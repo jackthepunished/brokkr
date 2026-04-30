@@ -13,12 +13,18 @@
 //! runner stays as the existing PID, and its first fork after this
 //! call is PID 1 in the new namespace.)
 //!
+//! M5 adds `CLONE_NEWNET` so the action gets an empty network
+//! namespace by default (no interfaces, no routes, not even loopback).
+//! The runner can opt the new netns into a usable state — currently
+//! just "bring `lo` up" via [`super::netns::apply_policy`] — based on
+//! [`crate::NetworkPolicy`].
+//!
 //! Sequencing nuances captured here:
 //!
-//! - `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)` in a single
-//!   call. The kernel creates the user namespace first, so the new
-//!   mount + PID namespaces are born with the caller already
-//!   privileged in them (per `clone(2)`).
+//! - `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET)`
+//!   in a single call. The kernel creates the user namespace first,
+//!   so the new mount / PID / net namespaces are born with the caller
+//!   already privileged in them (per `clone(2)`).
 //! - `/proc/self/setgroups` must be written `deny` *before* `gid_map` is
 //!   writable under an unprivileged user namespace. Forgetting this is
 //!   the most common failure mode.
@@ -42,13 +48,18 @@ pub(super) struct UidGidMap {
     pub host_gid: u32,
 }
 
-/// Enter a fresh user namespace plus a fresh mount namespace plus a
-/// fresh PID namespace, then write the uid / gid maps so the runner has
-/// full capabilities inside all three. The runner stays as its existing
-/// PID; the next `fork(2)` is PID 1 in the new PID namespace.
+/// Enter a fresh user namespace plus mount, PID, and network
+/// namespaces, then write the uid / gid maps so the runner has full
+/// capabilities inside all four. The runner stays as its existing PID;
+/// the next `fork(2)` is PID 1 in the new PID namespace.
 pub(super) fn setup_namespaces(map: UidGidMap) -> io::Result<()> {
-    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
-        .map_err(nix_io)?;
+    unshare(
+        CloneFlags::CLONE_NEWUSER
+            | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWPID
+            | CloneFlags::CLONE_NEWNET,
+    )
+    .map_err(nix_io)?;
 
     // setgroups must be 'deny' before gid_map is writable in an
     // unprivileged user namespace (kernel ≥ 3.19). The file may not exist

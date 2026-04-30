@@ -191,3 +191,55 @@ debrief.
   miss because `nix::sys::signal::Signal` itself is in scope; the
   failure shows up as a "missing function" error rather than a
   "missing module" error.
+
+## M5 — `feat/phase2-network-namespace`
+
+- **Date:** 2026-04-30
+- **PR:** _(filled in after merge)_
+- **Outcome:** `unshare` now also asks for `CLONE_NEWNET`, so the
+  action gets an empty network namespace by default — no interfaces,
+  no routes, not even loopback. `NetworkPolicy::Loopback` brings `lo`
+  up via a hand-rolled `RTM_NEWLINK` netlink message. Three EV/AC
+  tests (`net_ns.rs`) prove this with errno-level assertions: 1.1.1.1
+  is `ENETUNREACH`, 127.0.0.1 is `ENETUNREACH` with policy=None and
+  `ECONNREFUSED` with policy=Loopback.
+
+### Decisions
+
+- **Hand-roll the netlink, don't pull in `rtnetlink`.** The
+  `rtnetlink` crate works but drags in a tokio-flavoured async stack
+  (futures, channels, an executor) for what's a single 32-byte
+  request and a single ack. Two `repr(C)` structs and ~150 lines of
+  raw libc were cheaper than the dep tree review.
+- **Use `nix::libc` instead of taking a direct `libc` dep or the
+  `nix` `socket`/`net` features.** nix already re-exports `libc`, and
+  AF_NETLINK / `if_nametoindex` are in `libc` proper. Adding the nix
+  feature would have been one line in `Cargo.toml` but pulled
+  hundreds of lines of nix wrappers we don't want.
+- **Apply the network policy in the outer runner, before fork.** The
+  netns is created at `unshare`, so it's already correct when init
+  starts; doing the loopback bring-up before fork keeps init's job
+  small (still just mount `/proc` + reap) and lets us surface
+  netlink failures with the same `die("apply network policy", …)`
+  diagnostic plumbing as the other setup steps.
+- **Errno through exit code as the EV-test contract.** Using
+  `python3 -c '... sys.exit(e.errno)'` is the cleanest way to
+  distinguish `ENETUNREACH` (101) from `ECONNREFUSED` (111). Both fit
+  in the 0–255 exit-code window. The alternative (parsing stderr from
+  `bash`'s `/dev/tcp` redirect) is brittle.
+
+### What surprised me
+
+- `127.0.0.1` is `ENETUNREACH`, not `ECONNREFUSED`, when `lo` is
+  `DOWN`. I'd expected the kernel to fall back to a generic
+  "no route" or to silently drop, but it's the same `ENETUNREACH`
+  that an external IP gets — useful, because it means policy=None
+  vs policy=Loopback is distinguishable from inside the action via
+  errno alone.
+- The kernel always replies to netlink requests with
+  `NLM_F_ACK` set, even on success — the ack is an `NLMSG_ERROR`
+  message with `errno=0`. Surprised me on first read of the spec;
+  documented in `man 7 netlink`.
+- `c"lo"` (a C-string literal in edition 2024 / Rust 1.85) is a
+  cleaner spelling than `b"lo\0"`. clippy actually fired on the
+  byte-string version (`manual_c_str_literals`).
