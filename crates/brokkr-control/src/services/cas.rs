@@ -19,6 +19,11 @@ pub struct CasService<C: Cas> {
 
 impl<C: Cas> CasService<C> {
     /// Wrap a CAS backend into a tonic service.
+    ///
+    /// The `backend` argument must be an `Arc` wrapper around the concrete CAS
+    /// implementation (e.g. [`brokkr_cas::InMemoryCas`]). The `Arc` is required
+    /// because the service may clone the handle to spawn per-request background
+    /// work.
     pub fn new(backend: Arc<C>) -> Self {
         Self { backend }
     }

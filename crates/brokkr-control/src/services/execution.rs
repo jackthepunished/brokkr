@@ -31,6 +31,10 @@ pub struct ExecutionService {
 
 impl ExecutionService {
     /// Bind the service to a scheduler.
+    ///
+    /// The [`Scheduler`] is clonable via `Arc` so multiple gRPC handler threads
+    /// can share the same scheduler instance. The service does not take
+    /// ownership of the scheduler — it keeps an `Arc<Scheduler>` internally.
     pub fn new(scheduler: Arc<Scheduler>) -> Self {
         Self { scheduler }
     }

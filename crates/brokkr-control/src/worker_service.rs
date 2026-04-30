@@ -21,6 +21,9 @@ pub struct WorkerServiceImpl {
 
 impl WorkerServiceImpl {
     /// Bind the service to a scheduler.
+    ///
+    /// The service keeps an `Arc<Scheduler>` internally. Multiple concurrent
+    /// workers can register and stream jobs through the same instance.
     pub fn new(scheduler: Arc<Scheduler>) -> Self {
         Self { scheduler }
     }
