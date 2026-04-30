@@ -9,11 +9,12 @@
 //! exactly the entries we put there.
 //!
 //! Skip-on-not-supported: unprivileged user namespaces are required.
-//! The probe runs `unshare(1)` to actually attempt the namespace
-//! creation rather than guessing from sysctls — that catches AppArmor
-//! `restrict_unprivileged_userns` (Ubuntu 24.04+), SELinux denials,
-//! container restrictions, and the legacy
-//! `/proc/sys/kernel/unprivileged_userns_clone = 0` knob in one shot.
+//! The probe checks the universal `user.max_user_namespaces` sysctl,
+//! the legacy Debian/Ubuntu `unprivileged_userns_clone` sysctl, and
+//! Ubuntu 24.04+'s AppArmor `restrict_unprivileged_userns` knob. The
+//! AppArmor check is what catches GitHub Actions runners — util-linux
+//! ships with an allow profile (so an `unshare(1)` runtime probe
+//! lies), but unprofiled binaries like `brokkr-sandboxd` are denied.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_methods)]
@@ -61,14 +62,14 @@ fn minimal_linux_rootfs() -> RootfsSpec {
     }
 }
 
-/// Probe whether unprivileged user namespaces work on this host. If
-/// they don't, return Some(reason) so the caller can skip the test
-/// cleanly.
+/// Probe whether unprivileged user namespaces work *for an unprofiled
+/// binary like `brokkr-sandboxd`*. If they don't, return Some(reason)
+/// so the caller can skip the test cleanly.
 ///
-/// Strategy: cheap static gates first (clear diagnostic strings), then
-/// an authoritative runtime probe via `unshare(1)` from util-linux —
-/// catches AppArmor / SELinux / container restrictions that the
-/// sysctls miss.
+/// Static gates only — the runtime `unshare(1)` probe is unreliable on
+/// Ubuntu 24.04+ because util-linux ships with an AppArmor allow
+/// profile, so it succeeds even when arbitrary binaries are denied.
+/// We check the AppArmor restriction sysctl directly instead.
 fn unsupported_reason() -> Option<String> {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
         if s.trim().parse::<u64>().unwrap_or(0) == 0 {
@@ -82,22 +83,16 @@ fn unsupported_reason() -> Option<String> {
             return Some(format!("unprivileged_userns_clone = {}", s.trim()));
         }
     }
-
-    // Authoritative runtime probe.
-    match std::process::Command::new("unshare")
-        .args(["--user", "true"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
+    // Ubuntu 24.04+ default: AppArmor denies unshare(CLONE_NEWUSER) for
+    // any binary without an explicit allow profile. brokkr-sandboxd has
+    // no profile, so this is a hard skip.
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     {
-        Ok(o) if o.status.success() => None,
-        Ok(o) => Some(format!(
-            "unshare --user true failed ({}): {}",
-            o.status,
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) => Some(format!("unshare(1) probe could not run: {e}")),
+        if s.trim() == "1" {
+            return Some("apparmor_restrict_unprivileged_userns = 1".into());
+        }
     }
+    None
 }
 
 macro_rules! skip_if_unsupported {
