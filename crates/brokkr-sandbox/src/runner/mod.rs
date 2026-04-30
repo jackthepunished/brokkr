@@ -5,10 +5,11 @@
 //!
 //! - **M2**: read [`SandboxConfig`](crate::SandboxConfig) from fd 3,
 //!   chdir, `execvpe`. No isolation.
-//! - **M3** (this milestone): user namespace + mount namespace +
-//!   `pivot_root` into a tmpfs rootfs assembled from
-//!   [`crate::RootfsSpec`].
-//! - **M4–M8**: PID / network / cgroup / seccomp / capability / determinism.
+//! - **M3**: user namespace + mount namespace + `pivot_root` into a
+//!   tmpfs rootfs assembled from [`crate::RootfsSpec`].
+//! - **M4** (this milestone): PID namespace + an init that reaps
+//!   zombies and mirrors the action's exit status.
+//! - **M5–M8**: network / cgroup / seccomp / capability / determinism.
 //!
 //! [`run_as_runner`] returns `!`: it always ends in either `execve` or
 //! `_exit`. Errors before exec are written to stderr and exit with code
@@ -19,6 +20,8 @@ mod exec;
 #[cfg(target_os = "linux")]
 mod mount;
 #[cfg(target_os = "linux")]
+mod pidns;
+#[cfg(target_os = "linux")]
 mod userns;
 
 /// Translate a `nix::errno::Errno` into a `std::io::Error` via its raw
@@ -28,6 +31,21 @@ mod userns;
 #[cfg(target_os = "linux")]
 fn nix_io(errno: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(errno as i32)
+}
+
+/// Format an `Errno` for inclusion in a runner diagnostic message.
+#[cfg(target_os = "linux")]
+fn errno_message(errno: nix::errno::Errno) -> String {
+    format!("{} ({})", errno.desc(), errno as i32)
+}
+
+/// Print a setup-failure diagnostic and exit 127 — matches the
+/// `sh: command not found` convention so the host's existing
+/// `ExitStatus::Exited(127)` plumbing surfaces it as a runner error.
+#[cfg(target_os = "linux")]
+fn die(step: &str, message: &str) -> ! {
+    eprintln!("brokkr-sandboxd: {step}: {message}");
+    std::process::exit(127);
 }
 
 /// Runner-side `main`. Called from the `brokkr-sandboxd` binary.

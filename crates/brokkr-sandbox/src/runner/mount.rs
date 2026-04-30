@@ -11,10 +11,12 @@
 //!    `RootfsSpec.tmpfs`, and `RootfsSpec.symlinks`.
 //! 4. `pivot_root` into the new rootfs, detach and `rmdir` the old one.
 //!
-//! `/proc`, `/sys`, and `/dev` are *not* mounted yet — `/proc` is useful
-//! only inside a PID namespace (M4), and `/dev` minimal device nodes need
+//! `/sys` and `/dev` are *not* mounted yet — minimal device nodes need
 //! either bind-mounts of host nodes or `mknod` (which user namespaces
-//! restrict). M4 / M8 light those up.
+//! restrict). M8 lights those up. `/proc` is mounted by the PID-1 init
+//! in [`super::pidns`] (procfs reflects the *reader's* PID namespace,
+//! so the mount has to happen inside the new pidns); we just create
+//! the mount point here.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -99,6 +101,14 @@ pub(super) fn setup_rootfs(spec: &RootfsSpec) -> io::Result<()> {
             Some(opts.as_str()),
         )
         .map_err(nix_io)?;
+    }
+
+    // 4b. Always create /proc inside the rootfs as a mount point — the
+    //     init child mounts procfs onto it from inside the new PID
+    //     namespace.
+    {
+        let proc_dir = inside(&new_root, Path::new("/proc"));
+        std::fs::create_dir_all(&proc_dir)?;
     }
 
     // 5. Symlinks (e.g. /bin → /usr/bin) inside the tmpfs root. These have

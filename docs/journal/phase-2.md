@@ -136,3 +136,58 @@ debrief.
   then a `MS_REMOUNT | MS_BIND | MS_RDONLY` to flip the read-only
   flag. The first call ignores `MS_RDONLY`; the man page documents
   this as "fs-independent flags only take effect on remount".
+
+## M4 — `feat/phase2-pid-namespace`
+
+- **Date:** 2026-04-30
+- **PR:** _(filled in after merge)_
+- **Outcome:** Runner adds `CLONE_NEWPID` to its `unshare` and forks
+  twice. Outer runner waits on init; init (PID 1 in the new pidns)
+  mounts `/proc`, forks the action (PID 2), and reaps orphans until
+  the action exits. Both layers translate the child's `WaitStatus` to
+  their own exit (`process::exit(code)` or `signal::raise(sig)` after
+  restoring `SigDfl`), so the host's `ExitStatus::Exited` /
+  `ExitStatus::Signaled` mapping is unchanged. AC-01, EV-13, EV-16
+  pass; the existing M3 tests continue to pass with one tweak (`/proc`
+  is now in the sandbox root).
+
+### Decisions
+
+- **Two forks, not one.** `unshare(CLONE_NEWPID)` does *not* move the
+  caller into the new pidns — its next fork lands there as PID 1. So
+  the outer runner stays in the host pidns (necessary so the host can
+  `waitpid` it), and we need an init child to be PID 1, plus an
+  action grandchild so PID 1 can do its reaper job without being the
+  thing that execs the action. Three processes, two `fork(2)` calls,
+  one `execvpe`.
+- **Mount `/proc` inside init, not in the outer runner.** Procfs
+  reflects the *reader's* PID namespace, so a `/proc` mounted before
+  the pidns split would show the host's PIDs. Init mounts it
+  post-fork (and post-pivot — `setup_rootfs` `mkdir /proc` so the
+  mount point exists when init gets there).
+- **Signal re-raise instead of `_exit(128 + sig)`.** When the action
+  is killed by a signal, init / outer runner restore the default
+  disposition for that signal and `raise()` it on themselves so the
+  host sees `ExitStatus::Signaled { signal: <orig> }`. Falling back
+  to `process::exit(128 + sig)` only on the (unreachable) path where
+  re-raise didn't actually kill us. This keeps Phase 2's exit-status
+  contract identical to Phase 1's plain-process model.
+
+### What surprised me
+
+- `impl FnOnce() -> !` is gated behind the unstable `never_type`
+  feature even though `-> !` on a free function compiles fine on
+  stable. Workaround: drop the closure-shaped API and inline the two
+  forks at the call site, exposing only helpers (`exit_with`,
+  `mount_proc`, `reap_until`) from `pidns.rs`. Less elegant on paper
+  but kept the runner readable and stable-Rust-clean.
+- `libc::_exit` is *not* declared `-> !` in the Rust binding —
+  `std::process::exit` is. Switched to the std variant; we accept
+  that Rust runs atexit handlers (we don't register any in the
+  runner) in exchange for a function that's actually divergent in the
+  type system.
+- nix's `signal::raise` lives behind the `signal` cargo feature,
+  separate from the existing `process` and `sched` features. Easy to
+  miss because `nix::sys::signal::Signal` itself is in scope; the
+  failure shows up as a "missing function" error rather than a
+  "missing module" error.
