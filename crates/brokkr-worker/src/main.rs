@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use brokkr_sandbox::host_check;
+use brokkr_sandbox::host_check::check_run;
 use brokkr_worker::{run_worker, WorkerConfig};
 use clap::Parser;
 
@@ -57,7 +57,7 @@ async fn run_daemon(args: Args) -> Result<()> {
 }
 
 fn run_check_host() -> ExitCode {
-    let report = host_check::run();
+    let report = check_run();
     print!("{report}");
     if report.is_functional() {
         ExitCode::SUCCESS

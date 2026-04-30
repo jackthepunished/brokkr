@@ -16,7 +16,7 @@
 //!   the config over file descriptor 3, and waits for it to `execve` the
 //!   action.
 //!
-//! [`host_check`] is a separate, free-standing module that runs Linux
+//! [`checks`] is a separate, free-standing module that runs Linux
 //! probes ahead of any sandbox work; the worker's `--check-host` flag
 //! delegates to it.
 //!
@@ -37,6 +37,7 @@ mod host;
 mod outcome;
 mod runner;
 
+pub mod checks;
 pub mod host_check;
 
 pub use config::{
