@@ -86,8 +86,17 @@ pub enum StdioPolicy {
     InheritStdin,
 }
 
-/// Filesystem layout for the sandbox rootfs. M2 ignores this; M3 starts
-/// honouring it. See `docs/phase-2-plan.md` §5.1.
+/// Filesystem layout for the sandbox rootfs. See
+/// `docs/phase-2-plan.md` §5.1. M3 starts honouring `ro_binds`, `tmpfs`,
+/// and `symlinks`; `input_root` materialization is deferred to M9.
+///
+/// ## Empty default
+///
+/// A default `RootfsSpec` (no binds, no tmpfs, no symlinks) is treated as
+/// "no rootfs work" — the runner skips mount-namespace setup and runs the
+/// action directly against the host filesystem (M2 behaviour). This lets
+/// callers opt into the mount-namespace path explicitly while keeping the
+/// existing M2 smoke tests working.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RootfsSpec {
     /// Read-only host paths to bind into the rootfs. Each entry is
@@ -100,9 +109,24 @@ pub struct RootfsSpec {
     #[serde(default)]
     pub tmpfs: Vec<(PathBuf, u64)>,
 
+    /// Symbolic links to create inside the rootfs. Each entry is
+    /// `(link_path_inside_sandbox, target)`. Useful for `/bin → /usr/bin`
+    /// on usrmerge systems where the host's `/bin` is itself a symlink we
+    /// can't bind directly.
+    #[serde(default)]
+    pub symlinks: Vec<(PathBuf, PathBuf)>,
+
     /// Optional input tree to materialize under [`SandboxConfig::workdir`].
     #[serde(default)]
     pub input_root: Option<PathBuf>,
+}
+
+impl RootfsSpec {
+    /// True when this spec has no binds, no tmpfs, no symlinks. The runner
+    /// treats this as "skip the whole mount-namespace path".
+    pub fn is_empty(&self) -> bool {
+        self.ro_binds.is_empty() && self.tmpfs.is_empty() && self.symlinks.is_empty()
+    }
 }
 
 /// Per-action resource limits. `None` means "do not constrain". M6 wires
