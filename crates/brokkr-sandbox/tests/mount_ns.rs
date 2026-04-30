@@ -9,9 +9,11 @@
 //! exactly the entries we put there.
 //!
 //! Skip-on-not-supported: unprivileged user namespaces are required.
-//! Hosts with `/proc/sys/kernel/unprivileged_userns_clone = 0` (some
-//! hardened Debian/Ubuntu defaults) print a clear skip message instead
-//! of failing.
+//! The probe runs `unshare(1)` to actually attempt the namespace
+//! creation rather than guessing from sysctls — that catches AppArmor
+//! `restrict_unprivileged_userns` (Ubuntu 24.04+), SELinux denials,
+//! container restrictions, and the legacy
+//! `/proc/sys/kernel/unprivileged_userns_clone = 0` knob in one shot.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_methods)]
@@ -59,8 +61,14 @@ fn minimal_linux_rootfs() -> RootfsSpec {
     }
 }
 
-/// Probe whether unprivileged user namespaces work on this host. If they
-/// don't, return Some(reason) so the caller can skip the test cleanly.
+/// Probe whether unprivileged user namespaces work on this host. If
+/// they don't, return Some(reason) so the caller can skip the test
+/// cleanly.
+///
+/// Strategy: cheap static gates first (clear diagnostic strings), then
+/// an authoritative runtime probe via `unshare(1)` from util-linux —
+/// catches AppArmor / SELinux / container restrictions that the
+/// sysctls miss.
 fn unsupported_reason() -> Option<String> {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
         if s.trim().parse::<u64>().unwrap_or(0) == 0 {
@@ -74,7 +82,22 @@ fn unsupported_reason() -> Option<String> {
             return Some(format!("unprivileged_userns_clone = {}", s.trim()));
         }
     }
-    None
+
+    // Authoritative runtime probe.
+    match std::process::Command::new("unshare")
+        .args(["--user", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(format!(
+            "unshare --user true failed ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Some(format!("unshare(1) probe could not run: {e}")),
+    }
 }
 
 macro_rules! skip_if_unsupported {
