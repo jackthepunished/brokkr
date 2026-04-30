@@ -48,13 +48,6 @@ impl WorkerId {
         Ok(Self(inner))
     }
 
-    /// Construct a [`WorkerId`] without validation, for cases where the caller
-    /// knows the value is already valid (e.g. when converting from a proto
-    /// that was already validated by the generating side).
-    pub fn new_unchecked(inner: String) -> Self {
-        Self(inner)
-    }
-
     /// Returns the raw string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -103,13 +96,6 @@ impl JobId {
             });
         }
         Ok(Self(inner))
-    }
-
-    /// Construct a [`JobId`] without validation, for cases where the caller
-    /// knows the value is already valid (e.g. when converting from a proto
-    /// that was already validated by the generating side).
-    pub fn new_unchecked(inner: String) -> Self {
-        Self(inner)
     }
 
     /// Returns the raw string slice.

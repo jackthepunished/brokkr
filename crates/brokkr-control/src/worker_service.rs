@@ -65,7 +65,9 @@ impl WorkerService for WorkerServiceImpl {
                         tracing::debug!("worker stream: hello received");
                     }
                     Some(bv1::worker_stream_message::Payload::Result(result)) => {
-                        scheduler_in.report(result).await;
+                        if let Err(e) = scheduler_in.report(result).await {
+                            tracing::warn!(error = %e, "failed to report job result");
+                        }
                     }
                     None => {}
                 }

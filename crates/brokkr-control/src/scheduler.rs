@@ -149,14 +149,15 @@ impl Scheduler {
     }
 
     /// Worker-side entry: receive a job result and wake the matching waiter.
-    pub async fn report(&self, result: bv1::JobResult) {
+    pub async fn report(&self, result: bv1::JobResult) -> Result<()> {
         let job_id = JobId::new(result.job_id.clone())
-            .unwrap_or_else(|_| JobId::new_unchecked(result.job_id.clone()));
+            .map_err(|e| anyhow!("invalid job_id in result: {}", e))?;
         let waiter = self.waiters.lock().await.remove(&job_id);
         if let Some(tx) = waiter {
             // If the receiver dropped (e.g. client cancelled), discard the result.
             let _ = tx.send(result);
         }
+        Ok(())
     }
 
     async fn fetch_message<M: Message + Default>(&self, digest: &Digest) -> Result<M> {
