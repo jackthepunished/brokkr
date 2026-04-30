@@ -59,42 +59,43 @@ impl ExecSvc for ExecutionService {
         let scheduler = self.scheduler.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
-        tokio::spawn(async move {
-            let outcome = scheduler
-                .execute(action_digest, skip_cache_lookup)
-                .await;
-            let op = match outcome {
-                Ok(o) => {
-                    let resp = rapi::ExecuteResponse {
-                        result: Some(o.result),
-                        cached_result: o.cache_hit,
-                        status: Some(brokkr_proto::rpc::Status::default()),
-                        ..Default::default()
-                    };
-                    brokkr_proto::longrunning::Operation {
+        tokio::spawn(
+            async move {
+                let outcome = scheduler.execute(action_digest, skip_cache_lookup).await;
+                let op = match outcome {
+                    Ok(o) => {
+                        let resp = rapi::ExecuteResponse {
+                            result: Some(o.result),
+                            cached_result: o.cache_hit,
+                            status: Some(brokkr_proto::rpc::Status::default()),
+                            ..Default::default()
+                        };
+                        brokkr_proto::longrunning::Operation {
+                            name: format!("operations/{}", uuid::Uuid::new_v4()),
+                            done: true,
+                            result: Some(brokkr_proto::longrunning::operation::Result::Response(
+                                execute_response_to_any(resp),
+                            )),
+                            ..Default::default()
+                        }
+                    }
+                    Err(e) => brokkr_proto::longrunning::Operation {
                         name: format!("operations/{}", uuid::Uuid::new_v4()),
                         done: true,
-                        result: Some(brokkr_proto::longrunning::operation::Result::Response(
-                            execute_response_to_any(resp),
+                        result: Some(brokkr_proto::longrunning::operation::Result::Error(
+                            brokkr_proto::rpc::Status {
+                                code: 13,
+                                message: e.to_string(),
+                                details: vec![],
+                            },
                         )),
                         ..Default::default()
-                    }
-                }
-                Err(e) => brokkr_proto::longrunning::Operation {
-                    name: format!("operations/{}", uuid::Uuid::new_v4()),
-                    done: true,
-                    result: Some(brokkr_proto::longrunning::operation::Result::Error(
-                        brokkr_proto::rpc::Status {
-                            code: 13,
-                            message: e.to_string(),
-                            details: vec![],
-                        },
-                    )),
-                    ..Default::default()
-                },
-            };
-            let _ = tx.send(Ok(op)).await;
-        }.instrument(span));
+                    },
+                };
+                let _ = tx.send(Ok(op)).await;
+            }
+            .instrument(span),
+        );
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
