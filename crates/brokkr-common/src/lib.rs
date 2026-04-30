@@ -6,5 +6,7 @@
 #![deny(missing_docs)]
 
 pub mod digest;
+pub mod ids;
 
 pub use digest::{Digest, DigestError};
+pub use ids::{IdError, JobId, WorkerId};
