@@ -3,10 +3,11 @@
 //! These replace raw `String` usages for worker and job IDs throughout the
 //! Brokkr codebase, providing compile-time type safety and validation.
 
+use std::convert::TryFrom;
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
 /// Maximum byte length for any worker or job identifier.
@@ -29,7 +30,8 @@ pub enum IdError {
 }
 
 /// A worker node identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(try_from = "String")]
 pub struct WorkerId(String);
 
 impl WorkerId {
@@ -78,11 +80,28 @@ impl FromStr for WorkerId {
     }
 }
 
+impl TryFrom<String> for WorkerId {
+    type Error = IdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for WorkerId {
+    type Error = IdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value.to_string())
+    }
+}
+
 // Note: WorkerId intentionally has no Borrow<str> impl — it is never
 // used as a HashMap key, so the ergonomic lookup trick is unnecessary.
 
 /// A job (work item) identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(try_from = "String")]
 pub struct JobId(String);
 
 impl JobId {
@@ -134,6 +153,22 @@ impl FromStr for JobId {
     type Err = IdError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s.to_string())
+    }
+}
+
+impl TryFrom<String> for JobId {
+    type Error = IdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for JobId {
+    type Error = IdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value.to_string())
     }
 }
 
