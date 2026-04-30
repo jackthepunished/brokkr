@@ -1,11 +1,12 @@
 //! Linux runner main: read config, set up namespaces / rootfs, exec.
 //!
 //! M2 ran the action with no isolation. M3 inserts user + mount
-//! namespace setup; M4 adds a PID namespace and a fork-and-reap step:
+//! namespace setup; M4 adds a PID namespace and a fork-and-reap step;
+//! M5 adds a network namespace and an optional loopback bring-up:
 //!
 //! ```text
 //! brokkr-sandboxd (host pidns)
-//!   └─ unshare(NEWUSER|NEWNS|NEWPID), setup_rootfs, then fork
+//!   └─ unshare(NEWUSER|NEWNS|NEWPID|NEWNET), setup_rootfs, apply_policy, fork
 //!        ├─ outer runner: waitpid(init); mirror init's exit
 //!        └─ init = PID 1 in new pidns: mount /proc, fork
 //!             ├─ init: reap orphans, waitpid(action); mirror its exit
@@ -14,7 +15,9 @@
 //!
 //! The whole namespace path is gated on whether the caller asked for a
 //! rootfs: a default-empty [`RootfsSpec`] keeps the M2 path so existing
-//! smoke tests don't break.
+//! smoke tests don't break. (`NetworkPolicy` only takes effect on the
+//! namespace path; pairing it with an empty rootfs is silently ignored
+//! today — to be split out if a real workload needs it.)
 
 use std::ffi::CString;
 use std::io::Read as _;
@@ -26,6 +29,7 @@ use nix::unistd::{fork, ForkResult};
 use crate::config::SandboxConfig;
 
 use super::mount::setup_rootfs;
+use super::netns::apply_policy as apply_network_policy;
 use super::pidns::{exit_with, mount_proc, reap_until};
 use super::userns::{setup_namespaces, UidGidMap};
 use super::{die, errno_message};
@@ -55,6 +59,9 @@ pub(super) fn runner_main() -> ! {
     }
     if let Err(e) = setup_rootfs(&cfg.rootfs) {
         die("setup rootfs", &e.to_string());
+    }
+    if let Err(e) = apply_network_policy(cfg.network) {
+        die("apply network policy", &e.to_string());
     }
 
     // First fork: child becomes PID 1 in the new PID namespace.

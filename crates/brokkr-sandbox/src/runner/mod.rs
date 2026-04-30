@@ -7,9 +7,12 @@
 //!   chdir, `execvpe`. No isolation.
 //! - **M3**: user namespace + mount namespace + `pivot_root` into a
 //!   tmpfs rootfs assembled from [`crate::RootfsSpec`].
-//! - **M4** (this milestone): PID namespace + an init that reaps
-//!   zombies and mirrors the action's exit status.
-//! - **M5–M8**: network / cgroup / seccomp / capability / determinism.
+//! - **M4**: PID namespace + an init that reaps zombies and mirrors
+//!   the action's exit status.
+//! - **M5** (this milestone): network namespace; the runner lands in a
+//!   fresh empty netns by default, with optional `lo`-up via
+//!   [`crate::NetworkPolicy::Loopback`].
+//! - **M6–M8**: cgroup / seccomp / capability / determinism.
 //!
 //! [`run_as_runner`] returns `!`: it always ends in either `execve` or
 //! `_exit`. Errors before exec are written to stderr and exit with code
@@ -19,6 +22,8 @@
 mod exec;
 #[cfg(target_os = "linux")]
 mod mount;
+#[cfg(target_os = "linux")]
+mod netns;
 #[cfg(target_os = "linux")]
 mod pidns;
 #[cfg(target_os = "linux")]

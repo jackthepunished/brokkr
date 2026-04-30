@@ -145,3 +145,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it).
 - `nix` features extended to include `signal` (for `raise` / signal
   re-delivery in the reaper).
+- M5: network namespace + optional loopback. `unshare` now also asks
+  for `CLONE_NEWNET`, so the action lands in an empty netns by
+  default — no interfaces, no routes, not even loopback. With
+  `NetworkPolicy::Loopback`, the runner sends a hand-rolled
+  `RTM_NEWLINK` over a raw netlink socket to flip `lo` `UP` before
+  the action exec. New `runner/netns.rs` module; ~150 lines, no
+  extra crate dependencies.
+- `brokkr-sandbox/tests/net_ns.rs` — three M5 tests using `python3`
+  to read `errno` through the action's exit code: EV-08 (`1.1.1.1:443`
+  is `ENETUNREACH`), policy-`None` makes `127.0.0.1` `ENETUNREACH`
+  too (lo is `DOWN`), and policy-`Loopback` upgrades `127.0.0.1`'s
+  failure mode from `ENETUNREACH` to `ECONNREFUSED` — proving the
+  link is actually up.
