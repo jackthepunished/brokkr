@@ -5,8 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
     self as bv1, worker_service_client::WorkerServiceClient, worker_stream_message::Payload,
-    JobResult, RegisterWorkerRequest, WorkerHello as ProtoWorkerHello,
-    WorkerId as ProtoWorkerId, WorkerStreamMessage,
+    JobResult, RegisterWorkerRequest, WorkerHello as ProtoWorkerHello, WorkerId as ProtoWorkerId,
+    WorkerStreamMessage,
 };
 use brokkr_proto::reapi_v2::{
     self as rapi, batch_update_blobs_request as bur,

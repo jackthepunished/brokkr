@@ -78,6 +78,9 @@ impl FromStr for WorkerId {
     }
 }
 
+// Note: WorkerId intentionally has no Borrow<str> impl — it is never
+// used as a HashMap key, so the ergonomic lookup trick is unnecessary.
+
 /// A job (work item) identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(String);
