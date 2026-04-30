@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
+use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
     self as bv1, worker_service_server::WorkerService, JobAssignment, RegisterWorkerRequest,
-    RegisterWorkerResponse, WorkerId, WorkerStreamMessage,
+    RegisterWorkerResponse, WorkerId as ProtoWorkerId, WorkerStreamMessage,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,9 +32,12 @@ impl WorkerService for WorkerServiceImpl {
         &self,
         _request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        let worker_id = uuid::Uuid::new_v4().to_string();
+        let worker_id = WorkerId::new(uuid::Uuid::new_v4().to_string())
+            .map_err(|e| Status::internal(format!("invalid worker id: {e}")))?;
         Ok(Response::new(RegisterWorkerResponse {
-            worker_id: Some(WorkerId { id: worker_id }),
+            worker_id: Some(ProtoWorkerId {
+                id: worker_id.into_string(),
+            }),
             heartbeat_seconds: 30,
         }))
     }
