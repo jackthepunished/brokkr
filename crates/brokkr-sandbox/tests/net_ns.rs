@@ -25,8 +25,8 @@ use std::path::PathBuf;
 
 use brokkr_sandbox::{ExitStatus, NetworkPolicy, RootfsSpec, Sandbox, SandboxConfig};
 
-const ENETUNREACH: i32 = 101;
-const ECONNREFUSED: i32 = 111;
+const ENETUNREACH: i32 = libc::ENETUNREACH;
+const ECONNREFUSED: i32 = libc::ECONNREFUSED;
 
 fn runner_path() -> &'static str {
     env!("CARGO_BIN_EXE_brokkr-sandboxd")

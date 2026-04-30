@@ -64,10 +64,10 @@ struct LinkUpRequest {
     ifi: IfInfoMsg,
 }
 
-const RTM_NEWLINK: u16 = 16;
-const NLMSG_ERROR: u16 = 2;
-const NLM_F_REQUEST: u16 = 0x1;
-const NLM_F_ACK: u16 = 0x4;
+const RTM_NEWLINK: u16 = libc::RTM_NEWLINK;
+const NLMSG_ERROR: u16 = libc::NLMSG_ERROR as u16;
+const NLM_F_REQUEST: u16 = libc::NLM_F_REQUEST as u16;
+const NLM_F_ACK: u16 = libc::NLM_F_ACK as u16;
 
 /// Send `RTM_NEWLINK` with `IFF_UP` set on the loopback interface, then
 /// read the ack and surface any kernel-reported error.
@@ -103,12 +103,18 @@ fn bring_loopback_up() -> io::Result<()> {
     }
     let fd = Fd(raw);
 
+    // Bound the ack `recvfrom` so a kernel that swallows our request
+    // doesn't deadlock the runner. 5s is generous for a local kernel
+    // ack — anything slower is a real failure we want to surface.
+    set_recv_timeout(fd.0, 5)?;
+
+    const REQ_SEQ: u32 = 1;
     let req = LinkUpRequest {
         nl: NlMsgHdr {
             len: mem::size_of::<LinkUpRequest>() as u32,
             ty: RTM_NEWLINK,
             flags: NLM_F_REQUEST | NLM_F_ACK,
-            seq: 1,
+            seq: REQ_SEQ,
             pid: 0,
         },
         ifi: IfInfoMsg {
@@ -144,38 +150,100 @@ fn bring_loopback_up() -> io::Result<()> {
     if sent < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Datagram-style sends should be all-or-nothing, but make that
+    // explicit so a partial write would surface as an error rather
+    // than a silent kernel-side parse failure on the ack.
+    if (sent as usize) != mem::size_of::<LinkUpRequest>() {
+        return Err(io::Error::other(format!(
+            "short netlink send: {sent} of {} bytes",
+            mem::size_of::<LinkUpRequest>()
+        )));
+    }
 
     // Read the ack. The kernel always replies with an NLMSG_ERROR for
     // requests that set NLM_F_ACK; an errno of 0 means success.
+    // Netlink is datagram-based and unrelated messages can arrive
+    // first (multicast notifications etc.), so loop until we see the
+    // matching `NLMSG_ERROR` from the kernel (sender pid 0) carrying
+    // our request's `seq`.
     let mut buf = [0u8; 4096];
-    // SAFETY: buf is a writable byte slice we own.
-    #[allow(unsafe_code)]
-    let n = unsafe { libc::recv(fd.0, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let n = n as usize;
-    if n < mem::size_of::<NlMsgHdr>() + mem::size_of::<i32>() {
-        return Err(io::Error::other(format!("short netlink ack: {n} bytes")));
-    }
-    let reply_ty = u16::from_ne_bytes([buf[4], buf[5]]);
-    if reply_ty != NLMSG_ERROR {
-        return Err(io::Error::other(format!(
-            "unexpected netlink reply type: {reply_ty}"
-        )));
-    }
-    let errno_field = i32::from_ne_bytes([
-        buf[mem::size_of::<NlMsgHdr>()],
-        buf[mem::size_of::<NlMsgHdr>() + 1],
-        buf[mem::size_of::<NlMsgHdr>() + 2],
-        buf[mem::size_of::<NlMsgHdr>() + 3],
-    ]);
-    if errno_field != 0 {
-        // Kernel reports negative errno.
-        return Err(io::Error::from_raw_os_error(-errno_field));
-    }
+    loop {
+        // SAFETY: zeroing a sockaddr_nl is valid; we initialise
+        // sender_len with the byte size the kernel expects.
+        #[allow(unsafe_code)]
+        let mut sender: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        let mut sender_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
 
-    Ok(())
+        // SAFETY: buf is a writable byte slice we own; sender and
+        // sender_len point to valid storage for the kernel to fill.
+        #[allow(unsafe_code)]
+        let n = unsafe {
+            libc::recvfrom(
+                fd.0,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                0,
+                (&mut sender as *mut libc::sockaddr_nl).cast::<libc::sockaddr>(),
+                &mut sender_len,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n < mem::size_of::<NlMsgHdr>() + mem::size_of::<i32>() {
+            // Truncated / spurious; keep looking.
+            continue;
+        }
+        // Only accept replies from the kernel (pid 0). Anything else
+        // (e.g. another userland netlink peer) is ignored.
+        if sender.nl_pid != 0 {
+            continue;
+        }
+        let reply_ty = u16::from_ne_bytes([buf[4], buf[5]]);
+        let reply_seq = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if reply_ty != NLMSG_ERROR || reply_seq != REQ_SEQ {
+            continue;
+        }
+        let errno_field = i32::from_ne_bytes([
+            buf[mem::size_of::<NlMsgHdr>()],
+            buf[mem::size_of::<NlMsgHdr>() + 1],
+            buf[mem::size_of::<NlMsgHdr>() + 2],
+            buf[mem::size_of::<NlMsgHdr>() + 3],
+        ]);
+        if errno_field != 0 {
+            // Kernel reports negative errno.
+            return Err(io::Error::from_raw_os_error(-errno_field));
+        }
+        return Ok(());
+    }
+}
+
+/// Set `SO_RCVTIMEO` on `fd` to `secs` seconds. Used to bound the
+/// netlink ack `recvfrom`.
+fn set_recv_timeout(fd: libc::c_int, secs: i64) -> io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: secs,
+        tv_usec: 0,
+    };
+    // SAFETY: fd is owned by the caller for the duration of this
+    // call; tv lives on this stack frame. setsockopt returns -1 on
+    // error and 0 on success.
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&tv as *const libc::timeval).cast::<libc::c_void>(),
+            mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Owning wrapper around a raw fd that closes on drop. Used here to
