@@ -152,7 +152,9 @@ async fn ls_root_shows_only_expected_entries() {
 
     // Every entry must be one of the things we deliberately mounted /
     // symlinked into the sandbox.
-    let allowed: &[&str] = &["usr", "lib", "lib64", "sbin", "bin", "etc", "tmp", "work"];
+    let allowed: &[&str] = &[
+        "usr", "lib", "lib64", "sbin", "bin", "etc", "tmp", "work", "proc",
+    ];
     for entry in &entries {
         assert!(
             allowed.contains(entry),
@@ -161,7 +163,10 @@ async fn ls_root_shows_only_expected_entries() {
     }
 
     // Sanity-check that some host paths definitely DON'T leak.
-    for forbidden in ["home", "root", "var", "boot", "proc", "sys"] {
+    // /proc and /sys are intentionally absent in M3 and (for /sys) M4
+    // — /proc gets mounted by init in M4 so it IS present, see allowed
+    // list above.
+    for forbidden in ["home", "root", "var", "boot", "sys"] {
         assert!(
             !entries.contains(&forbidden),
             "host path {forbidden:?} leaked into sandbox; listing: {entries:?}"

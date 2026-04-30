@@ -1,4 +1,4 @@
-//! User-namespace setup inside the runner.
+//! User + mount + PID namespace setup inside the runner.
 //!
 //! Phase 2 / M3 uses the simplest unprivileged form: a single mapping of
 //! length 1 (`0 <host_uid> 1`), so the runner is UID 0 *inside* the
@@ -6,11 +6,19 @@
 //! synthesise the `CAP_SYS_ADMIN` we need for `mount(2)` and `pivot_root(2)`
 //! without requiring `newuidmap` / `/etc/subuid`.
 //!
+//! M4 adds `CLONE_NEWPID` to the same unshare so the runner becomes
+//! PID 1 inside the new PID namespace once it forks. (Note: `unshare`
+//! itself does *not* move the caller into the new PID namespace — only
+//! its subsequent `fork(2)`/`clone(2)` children land there. So the
+//! runner stays as the existing PID, and its first fork after this
+//! call is PID 1 in the new namespace.)
+//!
 //! Sequencing nuances captured here:
 //!
-//! - `unshare(CLONE_NEWUSER | CLONE_NEWNS)` in a single call. The kernel
-//!   creates the user namespace first, so the new mount namespace is born
-//!   with the caller already privileged in it (per `clone(2)`).
+//! - `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)` in a single
+//!   call. The kernel creates the user namespace first, so the new
+//!   mount + PID namespaces are born with the caller already
+//!   privileged in them (per `clone(2)`).
 //! - `/proc/self/setgroups` must be written `deny` *before* `gid_map` is
 //!   writable under an unprivileged user namespace. Forgetting this is
 //!   the most common failure mode.
@@ -34,10 +42,13 @@ pub(super) struct UidGidMap {
     pub host_gid: u32,
 }
 
-/// Enter a fresh user namespace plus a fresh mount namespace, then write
-/// the uid / gid maps so the runner has full capabilities inside both.
-pub(super) fn setup_user_and_mount_namespaces(map: UidGidMap) -> io::Result<()> {
-    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS).map_err(nix_io)?;
+/// Enter a fresh user namespace plus a fresh mount namespace plus a
+/// fresh PID namespace, then write the uid / gid maps so the runner has
+/// full capabilities inside all three. The runner stays as its existing
+/// PID; the next `fork(2)` is PID 1 in the new PID namespace.
+pub(super) fn setup_namespaces(map: UidGidMap) -> io::Result<()> {
+    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+        .map_err(nix_io)?;
 
     // setgroups must be 'deny' before gid_map is writable in an
     // unprivileged user namespace (kernel ≥ 3.19). The file may not exist

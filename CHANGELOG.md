@@ -130,3 +130,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/proc/self/mountinfo` is byte-identical before and after the
   sandbox runs an explicit `mount -t tmpfs`).
 - `nix` features extended to include `mount` and `sched`.
+- M4: PID namespace + init reaper. `unshare` now also asks for
+  `CLONE_NEWPID`; the runner forks twice — outer runner waits on init,
+  init mounts `/proc` from inside the new pidns and forks the action,
+  then loops on `waitpid(-1, …)` reaping orphans until the action
+  exits. Both forks translate the action's `WaitStatus` back into the
+  caller's exit code or signal so the host's
+  `std::process::ExitStatus` mapping still works. `runner/pidns.rs` is
+  the new module.
+- `brokkr-sandbox/tests/pid_ns.rs` — three M4 evil-action tests:
+  AC-01 (`/proc/1/comm` is `brokkr-sandboxd`), EV-16 (action's `$$`
+  is 2 and `/proc` shows only single-digit PIDs), EV-13 (orphaned
+  `sleep 60` does not outlive the sandbox — pidns teardown SIGKILLs
+  it).
+- `nix` features extended to include `signal` (for `raise` / signal
+  re-delivery in the reaper).
