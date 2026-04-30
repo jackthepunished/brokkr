@@ -96,8 +96,9 @@ fn run_init_then_exec(cfg: SandboxConfig) -> ! {
 }
 
 /// Final step of the action child: chdir into the configured workdir
-/// (if any) and `execvpe` the action. Diverges; only returns by way of
-/// `_exit(127)` if exec setup fails.
+/// (if any) and `execvpe` the action. Diverges; on any setup failure
+/// it calls `die(...)` which prints a diagnostic and terminates via
+/// `std::process::exit(127)`.
 fn chdir_and_exec(cfg: &SandboxConfig) -> ! {
     if let Some(workdir) = &cfg.workdir {
         if let Err(e) = std::env::set_current_dir(workdir) {
