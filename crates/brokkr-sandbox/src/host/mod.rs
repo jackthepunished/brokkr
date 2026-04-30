@@ -10,6 +10,8 @@ use crate::error::SandboxError;
 use crate::outcome::SandboxOutcome;
 
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -21,6 +23,7 @@ mod linux;
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     runner_binary: PathBuf,
+    cgroup_root: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -30,6 +33,7 @@ impl Sandbox {
     pub fn new(runner_binary: impl Into<PathBuf>) -> Self {
         Self {
             runner_binary: runner_binary.into(),
+            cgroup_root: None,
         }
     }
 
@@ -45,9 +49,30 @@ impl Sandbox {
         }
     }
 
+    /// Use `cgroup_root` (e.g. `/sys/fs/cgroup/brokkr.slice`) as the
+    /// parent cgroup for every action. The runner pid will be moved into
+    /// a freshly-created leaf inside it before the action starts; on
+    /// exit the leaf is removed. Without this set the sandbox does no
+    /// cgroup work and [`crate::ResourceAccounting`] stays at zero.
+    ///
+    /// `cgroup_root` must be a writable cgroup-v2 directory whose
+    /// parent has the `cpu`, `memory`, and `pids` controllers enabled
+    /// in `cgroup.subtree_control`. `scripts/install-cgroup-slice.sh`
+    /// sets that up; alternatively, run the worker under a systemd
+    /// unit with `Delegate=yes`.
+    pub fn with_cgroup_root(mut self, cgroup_root: impl Into<PathBuf>) -> Self {
+        self.cgroup_root = Some(cgroup_root.into());
+        self
+    }
+
     /// Path to the runner binary that this sandbox will spawn.
     pub fn runner_binary(&self) -> &Path {
         &self.runner_binary
+    }
+
+    /// Configured cgroup root, if any.
+    pub fn cgroup_root(&self) -> Option<&Path> {
+        self.cgroup_root.as_deref()
     }
 
     /// Execute `cfg` inside the sandbox. On Linux this spawns
@@ -72,7 +97,7 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         {
-            linux::run_action(&self.runner_binary, cfg).await
+            linux::run_action(&self.runner_binary, self.cgroup_root.as_deref(), cfg).await
         }
         #[cfg(not(target_os = "linux"))]
         {

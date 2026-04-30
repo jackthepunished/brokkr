@@ -158,3 +158,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too (lo is `DOWN`), and policy-`Loopback` upgrades `127.0.0.1`'s
   failure mode from `ENETUNREACH` to `ECONNREFUSED` — proving the
   link is actually up.
+- M6: per-action cgroup-v2 + wall-clock timeout + OOM detection +
+  resource accounting. `Sandbox::with_cgroup_root(path)` opts into
+  it; without that builder call the sandbox does no cgroup work and
+  M2-M5 behaviour is preserved. New host module `host/cgroup.rs`
+  creates `<root>/action-<uuid>/`, applies `memory.max` /
+  `memory.swap.max` / `pids.max` / `cpu.max` from
+  `ResourceLimits`, attaches the runner pid to `cgroup.procs`
+  before the runner makes any progress, reads `cpu.stat` /
+  `memory.peak` / `pids.peak` / `io.stat` for accounting, and
+  checks `memory.events:oom_kill` to translate kernel-OOM kills into
+  `ExitStatus::OutOfMemory`. `cgroup.kill` is used for atomic
+  cleanup on wall-clock timeout (kernel ≥ 5.14, with a per-pid
+  fallback).
+- Host-side wall-clock enforcement: when `ResourceLimits.wall_clock_secs`
+  is set, the runner wait is wrapped in `tokio::time::timeout`; on
+  elapsed the cgroup is `kill_all`'d (or the runner alone, sans
+  cgroup) and `ExitStatus::Timeout` is returned.
+- `host/linux.rs` now drives stdout/stderr drains via
+  `tokio::spawn(read_to_end)` rather than `wait_with_output`, so
+  `child.wait()` is interruptible by the timeout path.
+- `brokkr-sandbox/tests/cgroup.rs` — four M6 tests:
+  `wall_clock_timeout_kills_long_action` (always runs),
+  `fork_bomb_capped_by_pids_max`, `memory_max_triggers_oom_status`,
+  `accounting_is_populated_for_a_normal_action`. The last three
+  skip cleanly unless `BROKKR_TEST_CGROUP_ROOT` is set or
+  `/sys/fs/cgroup/brokkr.slice/` is writable; locally they pass under
+  `systemd-run --user --scope -- bash -c 'BROKKR_TEST_CGROUP_ROOT=…
+  cargo test'`.
+- Added `uuid` as a direct dep of `brokkr-sandbox` for action-cgroup
+  naming.
