@@ -31,19 +31,19 @@ impl<C: Cas> CasSvc for CasService<C> {
         request: Request<rapi::FindMissingBlobsRequest>,
     ) -> Result<Response<rapi::FindMissingBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::find_missing_blobs");
+        let _enter = span.enter();
         let req = request.into_inner();
         let digests: Vec<super::Digest> = req
             .blob_digests
             .iter()
             .map(proto_to_digest)
             .collect::<Result<_, _>>()?;
+        tracing::info!(blob_count = req.blob_digests.len());
         let missing = self
             .backend
             .find_missing_blobs(&digests)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let _enter = span.enter();
-        tracing::info!(blob_count = req.blob_digests.len());
         Ok(Response::new(rapi::FindMissingBlobsResponse {
             missing_blob_digests: missing.iter().map(digest_to_proto).collect(),
         }))
@@ -54,6 +54,7 @@ impl<C: Cas> CasSvc for CasService<C> {
         request: Request<rapi::BatchUpdateBlobsRequest>,
     ) -> Result<Response<rapi::BatchUpdateBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::batch_update_blobs");
+        let _enter = span.enter();
         let req = request.into_inner();
         let request_count = req.requests.len();
         let mut blobs: Vec<(super::Digest, Bytes)> = Vec::with_capacity(request_count);
@@ -65,13 +66,19 @@ impl<C: Cas> CasSvc for CasService<C> {
             let digest = proto_to_digest(d)?;
             blobs.push((digest, Bytes::from(r.data)));
         }
+        tracing::info!(request_count);
         let results = self
             .backend
             .batch_update_blobs(blobs)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let _enter = span.enter();
-        tracing::info!(request_count);
+        if results.len() != request_count {
+            return Err(Status::internal(format!(
+                "backend returned {} results for {} requests",
+                results.len(),
+                request_count
+            )));
+        }
         let responses = results
             .into_iter()
             .map(|u| rapi::batch_update_blobs_response::Response {
@@ -99,6 +106,7 @@ impl<C: Cas> CasSvc for CasService<C> {
         request: Request<rapi::BatchReadBlobsRequest>,
     ) -> Result<Response<rapi::BatchReadBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::batch_read_blobs");
+        let _enter = span.enter();
         let req = request.into_inner();
         let digest_count = req.digests.len();
         let digests: Vec<super::Digest> = req
@@ -106,13 +114,19 @@ impl<C: Cas> CasSvc for CasService<C> {
             .iter()
             .map(proto_to_digest)
             .collect::<Result<_, _>>()?;
+        tracing::info!(digest_count);
         let results = self
             .backend
             .batch_read_blobs(&digests)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let _enter = span.enter();
-        tracing::info!(digest_count);
+        if results.len() != digest_count {
+            return Err(Status::internal(format!(
+                "backend returned {} results for {} digests",
+                results.len(),
+                digest_count
+            )));
+        }
         let responses = digests
             .into_iter()
             .zip(results)

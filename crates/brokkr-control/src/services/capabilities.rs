@@ -13,6 +13,8 @@ impl CapSvc for CapabilitiesService {
         &self,
         _request: Request<rapi::GetCapabilitiesRequest>,
     ) -> Result<Response<rapi::ServerCapabilities>, Status> {
+        let span = tracing::info_span!("capabilities::get_capabilities");
+        let _enter = span.enter();
         let caps = rapi::ServerCapabilities {
             cache_capabilities: Some(rapi::CacheCapabilities {
                 digest_functions: vec![rapi::digest_function::Value::Sha256 as i32],
@@ -26,7 +28,7 @@ impl CapSvc for CapabilitiesService {
             }),
             execution_capabilities: Some(rapi::ExecutionCapabilities {
                 digest_function: rapi::digest_function::Value::Sha256 as i32,
-                exec_enabled: false,
+                exec_enabled: true,
                 digest_functions: vec![rapi::digest_function::Value::Sha256 as i32],
                 ..Default::default()
             }),
@@ -41,6 +43,7 @@ impl CapSvc for CapabilitiesService {
             }),
             ..Default::default()
         };
+        tracing::info!(enabled = true);
         Ok(Response::new(caps))
     }
 }

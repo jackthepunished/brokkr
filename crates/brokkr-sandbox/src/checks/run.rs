@@ -1,6 +1,6 @@
 //! Run all host-compatibility probes and return a structured report.
 
-use crate::checks::{Outcome, Report, Status};
+use crate::checks::Report;
 
 /// Run all host-compatibility probes and return a structured report.
 ///
@@ -17,6 +17,7 @@ pub fn run() -> Report {
 
     #[cfg(not(target_os = "linux"))]
     {
+        use crate::checks::{Outcome, Status};
         Report {
             os,
             arch,
