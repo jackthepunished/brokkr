@@ -26,6 +26,11 @@ impl<C: Cas> CasService<C> {
 
 #[tonic::async_trait]
 impl<C: Cas> CasSvc for CasService<C> {
+    #[tracing::instrument(
+        name = "cas::find_missing_blobs",
+        skip(self),
+        fields(blob_count = req.blob_digests.len()),
+    )]
     async fn find_missing_blobs(
         &self,
         request: Request<rapi::FindMissingBlobsRequest>,
@@ -46,6 +51,11 @@ impl<C: Cas> CasSvc for CasService<C> {
         }))
     }
 
+    #[tracing::instrument(
+        name = "cas::batch_update_blobs",
+        skip(self),
+        fields(request_count = req.requests.len()),
+    )]
     async fn batch_update_blobs(
         &self,
         request: Request<rapi::BatchUpdateBlobsRequest>,
@@ -87,6 +97,11 @@ impl<C: Cas> CasSvc for CasService<C> {
         Ok(Response::new(rapi::BatchUpdateBlobsResponse { responses }))
     }
 
+    #[tracing::instrument(
+        name = "cas::batch_read_blobs",
+        skip(self),
+        fields(digest_count = req.digests.len()),
+    )]
     async fn batch_read_blobs(
         &self,
         request: Request<rapi::BatchReadBlobsRequest>,

@@ -23,8 +23,8 @@ pub use execution::ExecutionService;
 
 // Shared helpers used across service implementations.
 pub(crate) fn proto_to_digest(d: &rapi::Digest) -> Result<Digest, Status> {
-    Digest::new(d.hash.clone(), d.size_bytes)
-        .map_err(|e| Status::invalid_argument(format!("invalid digest: {e}")))
+    Digest::from_str(&d.hash)
+        .map_err(|e| Status::invalid_argument(format!("invalid digest hash: {e}")))
 }
 
 pub(crate) fn digest_to_proto(d: &Digest) -> rapi::Digest {

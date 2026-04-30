@@ -22,6 +22,11 @@ impl<A: ActionCache> ActionCacheService<A> {
 
 #[tonic::async_trait]
 impl<A: ActionCache> AcSvc for ActionCacheService<A> {
+    #[tracing::instrument(
+        name = "action_cache::get_action_result",
+        skip(self),
+        fields(action_digest = ?req.action_digest),
+    )]
     async fn get_action_result(
         &self,
         request: Request<rapi::GetActionResultRequest>,
@@ -43,6 +48,10 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
         }
     }
 
+    #[tracing::instrument(
+        name = "action_cache::update_action_result",
+        skip(self),
+    )]
     async fn update_action_result(
         &self,
         request: Request<rapi::UpdateActionResultRequest>,

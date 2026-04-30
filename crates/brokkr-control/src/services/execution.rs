@@ -7,6 +7,7 @@ use brokkr_proto::reapi_v2::{self as rapi, execution_server::Execution as ExecSv
 use prost::Message;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 use super::proto_to_digest;
 use crate::scheduler::Scheduler;
@@ -47,13 +48,20 @@ impl ExecSvc for ExecutionService {
             .action_digest
             .ok_or_else(|| Status::invalid_argument("missing action_digest"))?;
         let action_digest = proto_to_digest(&action_digest_proto)?;
+        let skip_cache_lookup = req.skip_cache_lookup;
+
+        let span = tracing::info_span!(
+            "execution::execute",
+            action_digest = %action_digest,
+            skip_cache_lookup,
+        );
 
         let scheduler = self.scheduler.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         tokio::spawn(async move {
             let outcome = scheduler
-                .execute(action_digest, req.skip_cache_lookup)
+                .execute(action_digest, skip_cache_lookup)
                 .await;
             let op = match outcome {
                 Ok(o) => {
@@ -86,7 +94,7 @@ impl ExecSvc for ExecutionService {
                 },
             };
             let _ = tx.send(Ok(op)).await;
-        });
+        }.instrument(span));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
