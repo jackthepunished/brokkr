@@ -67,7 +67,9 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
             .update_action_result(&digest, result.clone())
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        tracing::info!(action_digest = %format!("{}/{}", d.hash, d.size_bytes));
+        if let Some(ref d) = req.action_digest {
+            tracing::info!(action_digest = %format!("{}/{}", d.hash, d.size_bytes));
+        }
         Ok(Response::new(result))
     }
 }
