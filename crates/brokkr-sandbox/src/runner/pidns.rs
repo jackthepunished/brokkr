@@ -33,8 +33,8 @@ use super::{die, errno_message, nix_io};
 ///
 /// On `Exited`: exit with `code`. On `Signaled`: re-raise the same
 /// signal after restoring the default disposition; fall back to
-/// `128 + signal` if the kernel doesn't actually deliver it (e.g.
-/// SIGSTOP).
+/// `128 + signal` if `signal()` or `raise()` itself fails (e.g. EINVAL
+/// for an out-of-range signal number) so we still terminate.
 pub(super) fn exit_with(status: WaitStatus) -> ! {
     match status {
         WaitStatus::Exited(_, code) => std::process::exit(code),
