@@ -62,14 +62,12 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
         let result = req
             .action_result
             .ok_or_else(|| Status::invalid_argument("missing action_result"))?;
+        let _enter = span.enter();
         self.backend
             .update_action_result(&digest, result.clone())
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let _enter = span.enter();
-        if let Some(ref d) = req.action_digest {
-            tracing::info!(action_digest = %format!("{}/{}", d.hash, d.size_bytes));
-        }
+        tracing::info!(action_digest = %format!("{}/{}", d.hash, d.size_bytes));
         Ok(Response::new(result))
     }
 }

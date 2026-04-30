@@ -106,12 +106,12 @@ impl<C: Cas> CasSvc for CasService<C> {
             .iter()
             .map(proto_to_digest)
             .collect::<Result<_, _>>()?;
+        let _enter = span.enter();
         let results = self
             .backend
             .batch_read_blobs(&digests)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let _enter = span.enter();
         tracing::info!(digest_count);
         let responses = digests
             .into_iter()
