@@ -2,9 +2,11 @@
 //! received run the command and report the result.
 
 use anyhow::{anyhow, Context, Result};
+use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
     self as bv1, worker_service_client::WorkerServiceClient, worker_stream_message::Payload,
-    JobResult, RegisterWorkerRequest, WorkerHello, WorkerStreamMessage,
+    JobResult, RegisterWorkerRequest, WorkerHello as ProtoWorkerHello, WorkerId as ProtoWorkerId,
+    WorkerStreamMessage,
 };
 use brokkr_proto::reapi_v2::{
     self as rapi, batch_update_blobs_request as bur,
@@ -43,16 +45,20 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
         })
         .await?
         .into_inner();
-    let worker_id = reg
+    let proto_worker_id = reg
         .worker_id
         .ok_or_else(|| anyhow!("control plane returned no worker_id"))?;
-    tracing::info!(worker_id = %worker_id.id, "worker registered");
+    let worker_id = WorkerId::new(proto_worker_id.id.clone())
+        .map_err(|e| anyhow!("invalid worker id from control plane: {e}"))?;
+    tracing::info!(worker_id = %worker_id, "worker registered");
 
     // Outbound channel: hello + job results.
     let (tx, rx) = mpsc::channel::<WorkerStreamMessage>(8);
     tx.send(WorkerStreamMessage {
-        payload: Some(Payload::Hello(WorkerHello {
-            worker_id: Some(worker_id.clone()),
+        payload: Some(Payload::Hello(ProtoWorkerHello {
+            worker_id: Some(ProtoWorkerId {
+                id: worker_id.as_str().to_string(),
+            }),
         })),
     })
     .await

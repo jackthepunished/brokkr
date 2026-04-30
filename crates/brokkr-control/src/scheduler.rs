@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use brokkr_cas::{ActionCache, Cas};
-use brokkr_common::Digest;
+use brokkr_common::{Digest, JobId};
 use brokkr_proto::brokkr_v1 as bv1;
 use brokkr_proto::reapi_v2 as rapi;
 use prost::Message;
@@ -27,7 +27,7 @@ pub struct ExecutionOutcome {
 pub struct Scheduler {
     queue_tx: mpsc::UnboundedSender<bv1::Job>,
     queue_rx: Mutex<Option<mpsc::UnboundedReceiver<bv1::Job>>>,
-    waiters: Mutex<HashMap<String, oneshot::Sender<bv1::JobResult>>>,
+    waiters: Mutex<HashMap<JobId, oneshot::Sender<bv1::JobResult>>>,
     cas: Arc<dyn Cas>,
     action_cache: Arc<dyn ActionCache>,
 }
@@ -104,13 +104,14 @@ impl Scheduler {
             .await
             .with_context(|| "fetching Command from CAS")?;
 
-        let job_id = uuid::Uuid::new_v4().to_string();
+        let job_id = JobId::new(uuid::Uuid::new_v4().to_string())
+            .map_err(|e| anyhow!("invalid job id: {e}"))?;
         tracing::Span::current().record("job_id", job_id.as_str());
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.insert(job_id.clone(), tx);
 
         let job = bv1::Job {
-            job_id: job_id.clone(),
+            job_id: job_id.clone().into_string(),
             action_digest: Some(rapi::Digest {
                 hash: action_digest.hash().to_string(),
                 size_bytes: action_digest.size_bytes(),
@@ -148,12 +149,15 @@ impl Scheduler {
     }
 
     /// Worker-side entry: receive a job result and wake the matching waiter.
-    pub async fn report(&self, result: bv1::JobResult) {
-        let waiter = self.waiters.lock().await.remove(&result.job_id);
+    pub async fn report(&self, result: bv1::JobResult) -> Result<()> {
+        let job_id = JobId::new(result.job_id.clone())
+            .map_err(|e| anyhow!("invalid job_id in result: {}", e))?;
+        let waiter = self.waiters.lock().await.remove(&job_id);
         if let Some(tx) = waiter {
             // If the receiver dropped (e.g. client cancelled), discard the result.
             let _ = tx.send(result);
         }
+        Ok(())
     }
 
     async fn fetch_message<M: Message + Default>(&self, digest: &Digest) -> Result<M> {
