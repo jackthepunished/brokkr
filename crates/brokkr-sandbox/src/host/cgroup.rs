@@ -159,11 +159,14 @@ impl Cgroup {
                 let procs = fs::read_to_string(self.path.join("cgroup.procs"))?;
                 for pid_str in procs.split_whitespace() {
                     if let Ok(pid) = pid_str.parse::<i32>() {
-                        // SAFETY: kill is async-signal-safe; passing an
-                        // out-of-range pid returns ESRCH which we ignore.
-                        #[allow(unsafe_code)]
-                        unsafe {
-                            nix::libc::kill(pid, nix::libc::SIGKILL);
+                        // ESRCH (process already gone) is benign and
+                        // expected during teardown races; swallow it.
+                        match nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        ) {
+                            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                            Err(_) => {}
                         }
                     }
                 }

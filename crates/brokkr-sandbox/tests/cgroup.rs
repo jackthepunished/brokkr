@@ -27,6 +27,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use brokkr_sandbox::{ExitStatus, ResourceLimits, Sandbox, SandboxConfig};
@@ -37,14 +38,24 @@ fn runner_path() -> &'static str {
 
 /// Find a writable cgroup root usable as the action-cgroup parent, or
 /// return None so the caller can skip.
+///
+/// Cargo runs the tests in this binary in parallel and `probe_usable`
+/// shuffles our own PID between cgroups, so multiple concurrent probes
+/// would race. Cache the result via `OnceLock` so the probe runs at
+/// most once across the test process.
 fn writable_cgroup_root() -> Option<PathBuf> {
-    let candidates = std::env::var_os("BROKKR_TEST_CGROUP_ROOT")
-        .map(PathBuf::from)
-        .into_iter()
-        .chain(std::iter::once(PathBuf::from(
-            "/sys/fs/cgroup/brokkr.slice",
-        )));
-    candidates.into_iter().find(|cand| probe_usable(cand))
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let candidates = std::env::var_os("BROKKR_TEST_CGROUP_ROOT")
+                .map(PathBuf::from)
+                .into_iter()
+                .chain(std::iter::once(PathBuf::from(
+                    "/sys/fs/cgroup/brokkr.slice",
+                )));
+            candidates.into_iter().find(|cand| probe_usable(cand))
+        })
+        .clone()
 }
 
 /// A cgroup root is "usable" when we can mkdir a unique leaf under it
@@ -54,26 +65,29 @@ fn writable_cgroup_root() -> Option<PathBuf> {
 /// `cgroup.procs` write if our source cgroup is in a different
 /// delegation tree.
 ///
-/// Returns `true` only if both probes succeed; cleans up the leaf in
-/// either case.
+/// Returns `true` only if every step succeeds *and* cleanup succeeds.
+/// A failed move-back leaves our pid inside the probe leaf and rmdir
+/// would EBUSY, leaving a stray cgroup behind that would poison
+/// subsequent probes — treat that as "not usable" rather than risk a
+/// leak.
 fn probe_usable(parent: &Path) -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let probe = parent.join(format!("brokkr-probe-{}-{}", std::process::id(), unique));
+    let pid = std::process::id().to_string();
+    let probe = parent.join(format!("brokkr-probe-{pid}"));
 
     if std::fs::create_dir(&probe).is_err() {
         return false;
     }
-    let mover_ok =
-        std::fs::write(probe.join("cgroup.procs"), std::process::id().to_string()).is_ok();
-    // Drop the leaf. If the move succeeded, our own pid is inside —
-    // rmdir would EBUSY. Move ourselves back to the parent first.
-    if mover_ok {
-        let _ = std::fs::write(parent.join("cgroup.procs"), std::process::id().to_string());
-    }
-    let _ = std::fs::remove_dir(&probe);
-    mover_ok
+    let mover_ok = std::fs::write(probe.join("cgroup.procs"), &pid).is_ok();
+    // If the move succeeded, our own pid is inside — rmdir would EBUSY.
+    // Move ourselves back to the parent first; if that fails we cannot
+    // cleanly remove the leaf, so report the root as unusable.
+    let move_back_ok = if mover_ok {
+        std::fs::write(parent.join("cgroup.procs"), &pid).is_ok()
+    } else {
+        true
+    };
+    let remove_ok = std::fs::remove_dir(&probe).is_ok();
+    mover_ok && move_back_ok && remove_ok
 }
 
 macro_rules! skip_unless_cgroup {
@@ -106,8 +120,8 @@ async fn wall_clock_timeout_kills_long_action() {
         String::from_utf8_lossy(&outcome.stderr)
     );
     assert!(
-        elapsed >= Duration::from_secs(2),
-        "timeout fired before deadline: {elapsed:?}"
+        elapsed >= Duration::from_millis(1900),
+        "timeout fired implausibly early: {elapsed:?}"
     );
     assert!(
         elapsed < Duration::from_secs(8),

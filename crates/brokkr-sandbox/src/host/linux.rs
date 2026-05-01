@@ -172,16 +172,38 @@ pub(super) async fn run_action(
             }
             Err(_elapsed) => {
                 // SIGKILL the whole cgroup if we have one (catches
-                // grandchildren); otherwise just kill the runner.
-                if let Some(cg) = &cgroup {
-                    let _ = cg.kill_all();
-                } else {
+                // grandchildren); otherwise just kill the runner. If
+                // the cgroup kill fails (delegation hiccup, cgroup
+                // already gone), fall back to killing just the runner
+                // so we still have a chance of reaping.
+                let cgroup_killed = match &cgroup {
+                    Some(cg) => cg.kill_all().is_ok(),
+                    None => false,
+                };
+                if !cgroup_killed {
                     let _ = child.kill().await;
                 }
-                let s = child.wait().await.map_err(|e| SandboxError::Setup {
-                    step: "wait for runner after timeout",
-                    source: e,
-                })?;
+                // Bound the post-kill wait. If the kernel won't reap
+                // the runner within the same deadline budget, surface
+                // a TimedOut error rather than hang forever.
+                let s = match tokio::time::timeout(deadline, child.wait()).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        return Err(SandboxError::Setup {
+                            step: "wait for runner after timeout",
+                            source: e,
+                        });
+                    }
+                    Err(_) => {
+                        return Err(SandboxError::Setup {
+                            step: "wait for runner after timeout kill",
+                            source: io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "runner did not exit after timeout SIGKILL",
+                            ),
+                        });
+                    }
+                };
                 (s, true)
             }
         },
