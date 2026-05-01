@@ -64,7 +64,13 @@ pub(super) async fn run_action(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear();
+        .env_clear()
+        // If anything between `spawn` and the final `wait` returns
+        // early (cgroup setup, config-pipe write, etc.), `Child` gets
+        // dropped. Without `kill_on_drop`, the runner would keep
+        // running orphaned — this guarantees SIGKILL on drop so the
+        // wall-clock contract holds on the error paths too.
+        .kill_on_drop(true);
 
     // SAFETY: pre_exec runs in the freshly-forked child between fork and
     // exec. We perform only async-signal-safe operations: dup2(2),
