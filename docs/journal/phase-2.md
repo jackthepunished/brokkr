@@ -243,3 +243,79 @@ debrief.
 - `c"lo"` (a C-string literal in edition 2024 / Rust 1.85) is a
   cleaner spelling than `b"lo\0"`. clippy actually fired on the
   byte-string version (`manual_c_str_literals`).
+
+## M6 — `feat/phase2-cgroups`
+
+- **Date:** 2026-04-30
+- **PR:** _(filled in after merge)_
+- **Outcome:** Per-action cgroup-v2 created under a configurable
+  slice root; the runner pid is attached before the runner makes
+  any progress, so the action and all its descendants live inside
+  bounded `memory.max` / `pids.max` / `cpu.max`. Wall-clock timeout
+  fires via `tokio::time::timeout` and uses `cgroup.kill` to
+  atomically tear down the whole tree. OOM kills are detected via
+  `memory.events:oom_kill > 0` and surfaced as
+  `ExitStatus::OutOfMemory`. Accounting (`cpu.stat`, `memory.peak`,
+  `pids.peak`, `io.stat` aggregated) is read after the action exits.
+  Four new tests; the wall-clock one runs everywhere, the cgroup
+  ones skip unless we have a writable delegated slice.
+
+### Decisions
+
+- **Builder, not constructor.** `Sandbox::with_cgroup_root(path)` is
+  optional. Without it, the sandbox is M2-M5 — no cgroup, accounting
+  stays at zero. This kept all 16 existing tests passing without
+  touching them, and lets workers that don't have a delegated slice
+  still run actions (with no resource limits).
+- **Attach happens between spawn and config write.** The runner is
+  parked on `read_to_end(fd 3)` immediately after exec because the
+  pipe stays open until the host closes its writer end. We exploit
+  that gap: spawn → attach pid → write config → close. By the time
+  the runner unblocks and forks into init/action, every PID in the
+  tree inherits the cgroup automatically. No barrier protocol needed.
+- **`cgroup.kill` over per-pid loops.** Kernel ≥ 5.14 has a single
+  atomic write that SIGKILLs every PID in the cgroup at once. We try
+  it first; on ENOENT we fall back to walking `cgroup.procs` and
+  `kill(pid, SIGKILL)`-ing each. Important for wall-clock timeout
+  on actions with grandchildren (e.g., `sh -c '... &'`).
+- **Stop using `wait_with_output`.** It consumes the `Child`, so
+  there's no handle to `kill()` on timeout. Now we `take()` stdout
+  and stderr, spawn drain tasks, and `wait()` the child directly.
+  Same observable behaviour, but interruptible.
+- **OOM > Signaled override.** When the OOM-killer fires, the kernel
+  reports the action's `WaitStatus` as `Signaled(SIGKILL)`. That's
+  technically true but useless to the caller — they want to know
+  it was OOM, not "killed by something". So after `wait`, we check
+  `memory.events:oom_kill` and overwrite the exit status if the
+  kernel says yes. Same idea for `Timeout`.
+- **Test skip via "can move ourselves into it" probe.** Tests use a
+  two-step probe: mkdir a unique leaf, then write our own pid into
+  its `cgroup.procs`. The second step catches the cgroup-v2
+  cross-delegation rule that mkdir alone can't see — a slice we can
+  mkdir under may still reject our `cgroup.procs` write if our
+  source cgroup is in a different delegation tree. CI / fresh WSL2
+  fail at the second step and skip cleanly.
+
+### What surprised me
+
+- Cgroup-v2 cross-delegation rules are stricter than I'd remembered.
+  Even with the slice chowned to our user, you can't move a process
+  into it from `/init.scope` (root-owned source) — the kernel checks
+  write permission on the *source* cgroup too, and on the common
+  ancestor. The fix in real deployments is to run the worker
+  *inside* the delegated tree (systemd unit with `Delegate=yes`, or
+  `systemd-run --user --scope`); for tests we just probe and skip.
+- A naive bash fork bomb (`f() { f & f; }; f`) under `pids.max`
+  doesn't *die* — bash retries `clone()` forever, printing
+  "Resource temporarily unavailable" until the wall-clock timeout
+  fires. Switched to a python loop that exits on first `OSError`
+  for a deterministic non-zero exit. The test still has a wall-clock
+  guard as a backstop.
+- `memory.swap.max` doesn't exist on kernels without the swap
+  controller; we ignore ENOENT on the write so a missing controller
+  doesn't block the run.
+- `tokio::process::Child::wait_with_output` consumes the child by
+  value, which makes timeout-with-kill awkward. The fix (split
+  stdout/stderr off, spawn drains, wait separately) is exactly
+  what `wait_with_output` does internally — we just had to inline
+  it to keep a `&mut Child` for `kill()`.
