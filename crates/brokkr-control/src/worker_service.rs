@@ -32,6 +32,8 @@ impl WorkerService for WorkerServiceImpl {
         &self,
         _request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
+        let span = tracing::info_span!("worker_service::register");
+        let _guard = span.enter();
         let worker_id = WorkerId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|e| Status::internal(format!("invalid worker id: {e}")))?;
         Ok(Response::new(RegisterWorkerResponse {
@@ -47,6 +49,8 @@ impl WorkerService for WorkerServiceImpl {
         &self,
         request: Request<Streaming<WorkerStreamMessage>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
+        let span = tracing::info_span!("worker_service::stream");
+        let _guard = span.enter();
         let mut inbound = request.into_inner();
         let scheduler = self.scheduler.clone();
         let mut job_rx = scheduler
