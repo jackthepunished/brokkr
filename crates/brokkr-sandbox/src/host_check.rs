@@ -165,6 +165,7 @@ mod linux {
             check_user_namespaces(),
             check_cgroup_v2(),
             check_brokkr_slice(),
+            check_subtree_controllers(),
             check_seccomp(),
             check_memory_peak(kernel_release.as_deref()),
             check_setgroups(),
@@ -315,6 +316,58 @@ mod linux {
                 detail: Some(format!("cannot mkdir under {SLICE}: {e}")),
             },
         }
+    }
+
+    fn check_subtree_controllers() -> Outcome {
+        const NAME: &str = "brokkr slice cgroup controllers";
+        const SLICE_SUBTREE_CONTROL: &str = "/sys/fs/cgroup/brokkr.slice/cgroup.subtree_control";
+        const REQUIRED: &[&str] = &["cpu", "memory", "pids", "io"];
+
+        let content = match fs::read_to_string(SLICE_SUBTREE_CONTROL) {
+            Ok(c) => c,
+            Err(e) => {
+                return Outcome {
+                    name: NAME.to_string(),
+                    status: Status::Fail,
+                    detail: Some(format!("{SLICE_SUBTREE_CONTROL}: {e}")),
+                };
+            }
+        };
+
+        let controllers = parse_subtree_controllers(&content);
+
+        let missing: Vec<&str> = REQUIRED
+            .iter()
+            .filter(|c| !controllers.contains(*c))
+            .copied()
+            .collect();
+
+        if missing.is_empty() {
+            Outcome {
+                name: NAME.to_string(),
+                status: Status::Pass,
+                detail: None,
+            }
+        } else {
+            Outcome {
+                name: NAME.to_string(),
+                status: Status::Fail,
+                detail: Some(format!(
+                    "missing controllers in subtree_control: {} — re-run scripts/install-cgroup-slice.sh",
+                    missing.join(", ")
+                )),
+            }
+        }
+    }
+
+    /// Parse a `cgroup.subtree_control` file contents into a set of controller
+    /// names. Handles `+`-prefixed controllers (e.g. `+cpu`) and trailing
+    /// whitespace.
+    pub(super) fn parse_subtree_controllers(content: &str) -> std::collections::HashSet<&str> {
+        content
+            .split_whitespace()
+            .map(|s| s.trim_start_matches('+'))
+            .collect()
     }
 
     fn check_seccomp() -> Outcome {
@@ -475,10 +528,46 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_run_produces_seven_outcomes() {
+    fn parse_subtree_controllers_basic() {
+        use super::linux::parse_subtree_controllers;
+
+        // All four required controllers present
+        let set = parse_subtree_controllers("cpu memory pids io");
+        assert!(set.contains("cpu"));
+        assert!(set.contains("memory"));
+        assert!(set.contains("pids"));
+        assert!(set.contains("io"));
+        assert_eq!(set.len(), 4);
+
+        // Plus-prefixed controllers (as written by cgroup filesystem)
+        let set = parse_subtree_controllers("+cpu +memory +pids +io");
+        assert!(set.contains("cpu"));
+        assert!(set.contains("memory"));
+        assert!(set.contains("pids"));
+        assert!(set.contains("io"));
+
+        // Mixed prefixes
+        let set = parse_subtree_controllers("+cpu memory +pids io");
+        assert!(set.contains("cpu"));
+        assert!(set.contains("memory"));
+
+        // Trailing whitespace
+        let set = parse_subtree_controllers("cpu memory pids io   \n");
+        assert_eq!(set.len(), 4);
+
+        // Extra controllers not in REQUIRED list — parser retains them (rdma,
+        // hugetlb appear in the set). The checker later filters against REQUIRED
+        // when determining which controllers are missing.
+        let set = parse_subtree_controllers("cpu memory pids io rdma hugetlb");
+        assert_eq!(set.len(), 6);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_run_produces_eight_outcomes() {
         let report = run();
         assert_eq!(report.os, "linux");
-        assert_eq!(report.outcomes.len(), 7);
+        assert_eq!(report.outcomes.len(), 8);
     }
 
     #[cfg(not(target_os = "linux"))]
