@@ -134,7 +134,7 @@ pub fn run() -> Report {
         let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .ok()
             .map(|s| s.trim().to_string());
-        let outcomes = linux::run_linux(kernel_release.as_ref());
+        let outcomes = linux::run_linux(kernel_release.as_ref().map(|s| s.as_str()));
         Report {
             os,
             arch,
@@ -228,7 +228,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_kernel_version_basic() {
-        use linux::parse_kernel_version;
+        use linux::kernel_version::parse_kernel_version;
         assert_eq!(parse_kernel_version("5.10.0"), Some((5, 10)));
         assert_eq!(parse_kernel_version("6.6.87.2-microsoft"), Some((6, 6)));
         assert_eq!(parse_kernel_version("6.10-rc2"), Some((6, 10)));
@@ -239,7 +239,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_subtree_controllers_basic() {
-        use linux::parse_subtree_controllers;
+        use linux::subtree_controllers::parse_subtree_controllers;
 
         // All four required controllers present
         let set = parse_subtree_controllers("cpu memory pids io");

@@ -24,7 +24,7 @@ pub(super) fn check_kernel_version(release: Option<&str>) -> Outcome {
 
 /// Parse the leading `MAJOR.MINOR` from a kernel release string like
 /// `6.6.87.2-microsoft-standard-WSL2`.
-pub(super) fn parse_kernel_version(s: &str) -> Option<(u32, u32)> {
+pub fn parse_kernel_version(s: &str) -> Option<(u32, u32)> {
     let mut parts = s.split(['.', '-']);
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;

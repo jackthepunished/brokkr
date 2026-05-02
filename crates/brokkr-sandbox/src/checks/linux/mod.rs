@@ -8,15 +8,15 @@ mod brokkr_slice;
 #[cfg(target_os = "linux")]
 mod cgroup2;
 #[cfg(target_os = "linux")]
-mod kernel_version;
+pub(crate) mod kernel_version;
 #[cfg(target_os = "linux")]
-mod memory_peak;
+pub(crate) mod memory_peak;
 #[cfg(target_os = "linux")]
 mod seccomp;
 #[cfg(target_os = "linux")]
 mod setgroups;
 #[cfg(target_os = "linux")]
-mod subtree_controllers;
+pub(crate) mod subtree_controllers;
 #[cfg(target_os = "linux")]
 mod user_namespaces;
 
@@ -34,9 +34,3 @@ pub fn run_linux(kernel_release: Option<&str>) -> Vec<super::Outcome> {
         setgroups::check_setgroups(),
     ]
 }
-
-// Re-export helpers used by tests in checks/mod.rs
-#[cfg(target_os = "linux")]
-pub use kernel_version::parse_kernel_version;
-#[cfg(target_os = "linux")]
-pub use subtree_controllers::parse_subtree_controllers;

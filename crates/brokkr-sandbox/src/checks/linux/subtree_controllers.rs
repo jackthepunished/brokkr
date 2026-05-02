@@ -48,7 +48,7 @@ pub(super) fn check_subtree_controllers() -> Outcome {
 /// Parse a `cgroup.subtree_control` file contents into a set of controller
 /// names. Handles `+`-prefixed controllers (e.g. `+cpu`) and trailing
 /// whitespace.
-pub(super) fn parse_subtree_controllers(content: &str) -> HashSet<&str> {
+pub(crate) fn parse_subtree_controllers(content: &str) -> HashSet<&str> {
     content
         .split_whitespace()
         .map(|s| s.trim_start_matches('+'))
