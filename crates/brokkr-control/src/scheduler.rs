@@ -16,6 +16,7 @@ use prost::Message;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Outcome of a scheduled action execution.
+#[derive(Debug)]
 pub struct ExecutionOutcome {
     /// REAPI ActionResult to return to the caller.
     pub result: rapi::ActionResult,
@@ -172,5 +173,145 @@ impl Scheduler {
             .remove(0)
             .map_err(|e| anyhow!("blob {} not in CAS: {e}", digest))?;
         M::decode(bytes.as_ref()).with_context(|| format!("decoding {} from CAS", digest))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+mod tests {
+    use async_trait::async_trait;
+    use brokkr_cas::{ActionCache, Cas, CasError};
+    use brokkr_common::Digest;
+    use brokkr_proto::reapi_v2::ActionResult;
+    use bytes::Bytes;
+
+    use super::*;
+
+    /// Mock `Cas` that returns a configurable error for `batch_read_blobs`.
+    struct MockCas {
+        /// If `true`, `batch_read_blobs` returns `CasError::NotFound` for all digests.
+        /// Otherwise it returns `NotFound` for each digest (simulating a true miss).
+        force_not_found: bool,
+    }
+
+    #[async_trait]
+    impl Cas for MockCas {
+        async fn find_missing_blobs(&self, _digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
+            Ok(vec![])
+        }
+
+        async fn batch_read_blobs(
+            &self,
+            digests: &[Digest],
+        ) -> Result<Vec<Result<Bytes, CasError>>, CasError> {
+            if self.force_not_found {
+                // Return a real NotFound error for each digest.
+                Ok(digests
+                    .iter()
+                    .map(|d| Err(CasError::NotFound(d.clone())))
+                    .collect())
+            } else {
+                // Simulate a real miss — read a blob that was never written.
+                Ok(digests
+                    .iter()
+                    .map(|_| Err(CasError::NotFound(Digest::of(b"missing"))))
+                    .collect())
+            }
+        }
+
+        async fn batch_update_blobs(
+            &self,
+            _blobs: Vec<(Digest, Bytes)>,
+        ) -> Result<Vec<brokkr_cas::traits::UpdateResult>, CasError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Mock `ActionCache` that returns a configurable error for `get_action_result`.
+    struct MockActionCache {
+        /// If `true`, `get_action_result` returns an `Io` error; otherwise returns `Ok(None)`.
+        force_error: bool,
+    }
+
+    #[async_trait]
+    impl ActionCache for MockActionCache {
+        async fn get_action_result(
+            &self,
+            _action_digest: &Digest,
+        ) -> Result<Option<ActionResult>, CasError> {
+            if self.force_error {
+                Err(CasError::Io(std::io::Error::other("simulated")))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn update_action_result(
+            &self,
+            _action_digest: &Digest,
+            _result: ActionResult,
+        ) -> Result<(), CasError> {
+            Ok(())
+        }
+    }
+
+    /// Verify `report` returns an error when given an empty job_id string.
+    #[tokio::test]
+    async fn report_rejects_invalid_job_id() {
+        let cas = Arc::new(MockCas {
+            force_not_found: true,
+        });
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let scheduler = Scheduler::new(cas, ac);
+
+        let result = bv1::JobResult {
+            job_id: String::new(), // empty string is invalid for JobId
+            result: None,
+            cache_hit: false,
+            error_message: String::new(),
+        };
+        let err = scheduler.report(result).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid job_id"),
+            "expected 'invalid job_id' in error, got: {err}"
+        );
+    }
+
+    /// Verify `execute` propagates CAS `NotFound` errors from `fetch_message`
+    /// when the action digest is not in the CAS.
+    #[tokio::test]
+    async fn execute_returns_err_when_action_not_in_cas() {
+        let missing_digest = Digest::of(b"action never stored");
+        let cas = Arc::new(MockCas {
+            force_not_found: true,
+        });
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let scheduler = Scheduler::new(cas, ac);
+
+        let err = scheduler.execute(missing_digest, false).await.unwrap_err();
+        // The NotFound error is wrapped by with_context("fetching Action from CAS").
+        assert!(
+            err.to_string().contains("fetching Action from CAS"),
+            "expected 'fetching Action from CAS' in error, got: {err}"
+        );
+    }
+
+    /// Verify `execute` propagates action cache get errors.
+    #[tokio::test]
+    async fn execute_returns_err_when_action_cache_get_fails() {
+        let cas = Arc::new(MockCas {
+            force_not_found: true,
+        });
+        let ac = Arc::new(MockActionCache { force_error: true });
+        let scheduler = Scheduler::new(cas, ac);
+
+        let err = scheduler
+            .execute(Digest::of(b"any action"), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("action cache get"),
+            "expected 'action cache get' in error, got: {err}"
+        );
     }
 }
