@@ -134,7 +134,7 @@ pub fn run() -> Report {
         let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .ok()
             .map(|s| s.trim().to_string());
-        let outcomes = linux::run_linux(kernel_release.as_ref().map(|s| s.as_str()));
+        let outcomes = linux::run_linux(kernel_release.as_deref());
         Report {
             os,
             arch,
