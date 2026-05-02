@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn display_summary_branches() {
-        let r = Report {
+        let mut r = Report {
             os: "linux",
             arch: "x86_64",
             kernel_release: Some("6.6.0".into()),
@@ -223,6 +223,23 @@ mod tests {
         let out = format!("{r}");
         assert!(out.contains("Sandbox is functional."));
         assert!(!out.contains("warning"));
+
+        r.outcomes.push(Outcome {
+            name: "warn".into(),
+            status: Status::Warn,
+            detail: None,
+        });
+        let out = format!("{r}");
+        assert!(out.contains("1 warning."));
+
+        r.outcomes.push(Outcome {
+            name: "fail".into(),
+            status: Status::Fail,
+            detail: Some("d".into()),
+        });
+        let out = format!("{r}");
+        assert!(out.contains("Sandbox is NOT functional"));
+        assert!(out.contains("1 failure"));
     }
 
     #[cfg(target_os = "linux")]
