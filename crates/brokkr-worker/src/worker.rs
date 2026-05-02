@@ -28,6 +28,7 @@ pub struct WorkerConfig {
 
 /// Run the worker. Returns when the control plane closes the stream or an
 /// unrecoverable error occurs.
+#[tracing::instrument(name = "worker::run", skip(cfg))]
 pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
     let channel = Endpoint::from_shared(cfg.control_endpoint.clone())
         .with_context(|| format!("invalid endpoint {:?}", cfg.control_endpoint))?

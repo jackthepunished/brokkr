@@ -47,6 +47,7 @@ impl Scheduler {
 
     /// Take ownership of the job receiver. Returns `None` after the first call;
     /// only one worker stream is supported in Phase 1.
+    #[tracing::instrument(name = "scheduler::take_receiver", skip(self))]
     pub async fn take_receiver(&self) -> Option<mpsc::UnboundedReceiver<bv1::Job>> {
         self.queue_rx.lock().await.take()
     }
@@ -149,6 +150,7 @@ impl Scheduler {
     }
 
     /// Worker-side entry: receive a job result and wake the matching waiter.
+    #[tracing::instrument(name = "scheduler::report", skip(self, result))]
     pub async fn report(&self, result: bv1::JobResult) -> Result<()> {
         let job_id = JobId::new(result.job_id.clone())
             .map_err(|e| anyhow!("invalid job_id in result: {}", e))?;
