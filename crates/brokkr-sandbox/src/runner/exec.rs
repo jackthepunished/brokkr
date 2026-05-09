@@ -28,9 +28,11 @@ use nix::unistd::{fork, ForkResult};
 
 use crate::config::SandboxConfig;
 
+use super::caps::drop_all_except;
 use super::mount::setup_rootfs;
 use super::netns::apply_policy as apply_network_policy;
 use super::pidns::{exit_with, mount_proc, reap_until};
+use super::seccomp::install as install_seccomp;
 use super::userns::{setup_namespaces, UidGidMap};
 use super::{die, errno_message};
 
@@ -110,6 +112,22 @@ fn chdir_and_exec(cfg: &SandboxConfig) -> ! {
     if let Some(workdir) = &cfg.workdir {
         if let Err(e) = std::env::set_current_dir(workdir) {
             die("failed to chdir into workdir", &e.to_string());
+        }
+    }
+
+    // M7: drop capabilities (also sets PR_SET_NO_NEW_PRIVS) and then
+    // install the default-deny seccomp filter. Gated on the namespace
+    // path (non-empty rootfs): on the M2 no-isolation path the host
+    // process lacks CAP_SETPCAP and PR_CAPBSET_DROP would EPERM, and
+    // running on the host filesystem under seccomp is not the
+    // contract. Order matters: caps first (sets PR_SET_NO_NEW_PRIVS),
+    // seccomp last so the filter applies to execve and beyond.
+    if !cfg.rootfs.is_empty() {
+        if let Err(e) = drop_all_except(&cfg.retained_caps) {
+            die("drop capabilities", &e.to_string());
+        }
+        if let Err(e) = install_seccomp(&cfg.extra_seccomp_allow) {
+            die("install seccomp", &e.to_string());
         }
     }
 

@@ -14,8 +14,11 @@
 //!   [`crate::NetworkPolicy::Loopback`].
 //! - **M6**: cgroup v2 limits + wall-clock timeout + OOM detection,
 //!   wired host-side around the runner.
-//! - **M7** (work-in-progress): default-deny seccomp-bpf filter +
-//!   capability drop + `PR_SET_NO_NEW_PRIVS`.
+//! - **M7**: default-deny seccomp-bpf filter + capability drop +
+//!   `PR_SET_NO_NEW_PRIVS`. Capabilities are drained from all five
+//!   sets and `no_new_privs` is set first; the seccomp filter is
+//!   the last thing installed before `execve` so the action runs
+//!   under the locked-down policy (mismatch → `EPERM`).
 //! - **M8**: determinism knobs.
 //!
 //! [`run_as_runner`] returns `!`: it always ends in either `execve` or

@@ -15,7 +15,6 @@ use nix::libc;
 /// Parse a list of textual capability names (e.g. `"CAP_NET_ADMIN"`) into
 /// a `HashSet<Capability>`. Unknown names are reported as
 /// [`io::ErrorKind::InvalidInput`].
-#[allow(dead_code)] // wired up in M7-D
 fn parse_retained(retained: &[String]) -> io::Result<HashSet<Capability>> {
     let mut out = HashSet::with_capacity(retained.len());
     for name in retained {
@@ -36,7 +35,6 @@ fn parse_retained(retained: &[String]) -> io::Result<HashSet<Capability>> {
 ///
 /// This is destructive to the calling thread/process and is intended
 /// to run in the runner child immediately before `execve`.
-#[allow(dead_code)] // wired up in M7-D
 pub(super) fn drop_all_except(retained: &[String]) -> io::Result<()> {
     let keep = parse_retained(retained)?;
 
@@ -51,9 +49,17 @@ pub(super) fn drop_all_except(retained: &[String]) -> io::Result<()> {
         }
     }
 
-    // Inheritable / Permitted / Effective: replace the set with the
+    // Effective / Permitted / Inheritable: replace each set with the
     // intersection of the current set and `keep`.
-    for set in [CapSet::Inheritable, CapSet::Permitted, CapSet::Effective] {
+    //
+    // Order matters. The kernel's capset() validates the *whole*
+    // capability vector on each call: in particular, the new
+    // Effective set must be a subset of the new Permitted set. If we
+    // shrank Permitted first and Effective still held caps, the next
+    // capset would EPERM. Drop Effective first (always safe), then
+    // Permitted (now Effective ⊆ new Permitted holds trivially), then
+    // Inheritable.
+    for set in [CapSet::Effective, CapSet::Permitted, CapSet::Inheritable] {
         let current =
             caps::read(None, set).map_err(|e| io::Error::other(format!("caps {set:?}: {e}")))?;
         let new: HashSet<Capability> = current.intersection(&keep).copied().collect();

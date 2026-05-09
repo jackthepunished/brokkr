@@ -201,3 +201,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `prctl`/`ioctl` is intentionally deferred (TODO marker in the
   source). Wiring `install()` into the runner pipeline is the next
   M7 step and is owned by the integration agent.
+- M7 (capabilities): `runner/caps.rs` drains the Bounding /
+  Permitted / Effective / Inheritable / Ambient capability sets
+  down to `SandboxConfig.retained_caps` (default empty) and sets
+  `PR_SET_NO_NEW_PRIVS=1` so subsequent `execve` cannot regain
+  privileges via setuid binaries or file caps. Capset order is
+  Effective → Permitted → Inheritable to satisfy the kernel's
+  "new Effective ⊆ new Permitted" invariant. Ambient is
+  best-effort (older kernels return ENOENT).
+- M7 (integration): `runner/exec.rs` calls
+  `caps::drop_all_except` followed by `seccomp::install` in the
+  action child, after `chdir(workdir)` and immediately before
+  `execve`. The hardening only fires on the namespace path
+  (non-empty `RootfsSpec`) — the M2 no-isolation path stays as
+  a thin host-process wrapper since it lacks `CAP_SETPCAP` to
+  drain the bounding set.
+- M7 (seccomp allowlist): expanded `DEFAULT_ALLOW` to cover the
+  common workload syscall surface — directory iteration
+  (`getdents`/`getdents64`), file metadata (`access`,
+  `readlink`/`readlinkat`, `statfs`/`fstatfs`), file mutation
+  (`mkdir`/`mkdirat`, `unlink`/`unlinkat`, `rename` family,
+  `chmod`/`chown` family, link/symlink family, `truncate`,
+  `fsync`/`fdatasync`, `utimensat`, `umask`), TCP/IP socket I/O
+  (`connect`/`bind`/`listen`/`accept[4]`/`shutdown`,
+  `getsockname`/`getpeername`, `setsockopt`/`getsockopt`,
+  `sendto`/`recvfrom`, `sendmsg`/`recvmsg`, `sendmmsg`/`recvmmsg`),
+  signal delivery (`kill`/`tkill`/`tgkill`), and a handful of
+  modern glibc helpers (`rseq`, `membarrier`, `set_tid_address`,
+  `fadvise64`). `mount`, `keyctl`, `ptrace`, `bpf`, `userfaultfd`,
+  `init_module` etc. remain blocked → EPERM.
+- `brokkr-sandbox/tests/evil_seccomp_caps.rs` — five new M7 evil
+  tests (EV-02 mount, EV-03 keyctl, EV-04 ptrace, EV-10
+  no_new_privs, EV-14 CapEff zeroed) plus an `#[ignore]`d EV-09
+  RDTSC stub (TODO: needs `prctl(PR_SET_TSC)` wiring + arg-level
+  prctl filter, both deferred). Tests skip cleanly when the host
+  cannot open an unprivileged user namespace, mirroring
+  `mount_ns.rs` / `net_ns.rs`.
