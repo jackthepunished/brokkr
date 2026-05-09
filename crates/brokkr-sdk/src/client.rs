@@ -24,6 +24,7 @@ pub struct BrokkrClient {
 impl BrokkrClient {
     /// Connect to the control plane at `endpoint` (e.g.
     /// `http://127.0.0.1:7878`).
+    #[tracing::instrument(name = "client::connect", skip(endpoint))]
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
         let channel = Endpoint::from_shared(endpoint.clone())
