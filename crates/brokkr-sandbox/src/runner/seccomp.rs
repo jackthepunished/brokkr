@@ -84,7 +84,6 @@ const DEFAULT_ALLOW: &[&str] = &[
     "futimesat",
     "statfs",
     "fstatfs",
-    "getdents",
     "tgkill",
     "tkill",
     "kill",
