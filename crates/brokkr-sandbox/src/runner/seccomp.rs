@@ -4,11 +4,365 @@
 //! after all setup syscalls have completed and immediately before
 //! `execve`, so the action runs under the restricted policy.
 //!
-//! This file is a scaffold; the real allowlist + `seccompiler` wiring
-//! lands in M7-B.
+//! On a syscall mismatch we return `EPERM`, not kill the thread: the plan
+//! argues that a killed process makes debugging painful and prevents the
+//! user's command from emitting a sensible error message.
+//!
+//! ## seccompiler 0.5 API note
+//!
+//! `seccompiler` 0.5 keys its `SeccompFilter` rules by syscall *number*
+//! (`BTreeMap<i64, Vec<SeccompRule>>`) and does not expose its internal
+//! `SyscallTable` name resolver publicly. We therefore resolve names via
+//! `nix::libc::SYS_*` constants, which `libc` defines per `target_arch`.
+//! That is sound because the runner only ever installs a filter for the
+//! current process — host arch and target arch are always the same.
 
-#[allow(dead_code)] // wired up in M7-B
-pub(super) fn install(_extra_allow: &[String]) -> std::io::Result<()> {
-    // TODO(M7-B): implement default-deny filter via seccompiler.
+use std::collections::BTreeSet;
+use std::io::{self, ErrorKind};
+
+use nix::libc;
+use seccompiler::{
+    apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+};
+
+/// Default syscall allowlist. Mirrors `docs/phase-2-plan.md` §5.6.
+///
+/// Names here that do not exist on the current target arch are silently
+/// skipped (e.g. `fork`/`vfork`/`open`/`stat` on aarch64). Names supplied
+/// via `extra_allow` that are unknown for this arch are an error.
+const DEFAULT_ALLOW: &[&str] = &[
+    "read",
+    "write",
+    "readv",
+    "writev",
+    "pread64",
+    "pwrite64",
+    "open",
+    "openat",
+    "openat2",
+    "close",
+    "close_range",
+    "stat",
+    "fstat",
+    "lstat",
+    "newfstatat",
+    "statx",
+    "lseek",
+    "mmap",
+    "mmap2",
+    "munmap",
+    "mremap",
+    "mprotect",
+    "madvise",
+    "msync",
+    "brk",
+    "execve",
+    "execveat",
+    "wait4",
+    "waitid",
+    "exit",
+    "exit_group",
+    "rt_sigaction",
+    "rt_sigprocmask",
+    "rt_sigreturn",
+    "rt_sigsuspend",
+    "sigaltstack",
+    "clone",
+    "clone3",
+    "fork",
+    "vfork", // fork/vfork still useful for spawn helpers
+    "pipe",
+    "pipe2",
+    "dup",
+    "dup2",
+    "dup3",
+    "getpid",
+    "getppid",
+    "gettid",
+    "getuid",
+    "geteuid",
+    "getgid",
+    "getegid",
+    "getgroups",
+    "setgroups",
+    "getcwd",
+    "chdir",
+    "fchdir",
+    "fcntl",
+    "fcntl64",
+    "ioctl", // ioctl filtered further by arg
+    "prlimit64",
+    "getrlimit",
+    "setrlimit",
+    "arch_prctl",
+    "prctl", // prctl filtered further by arg
+    "sched_yield",
+    "sched_getaffinity",
+    "nanosleep",
+    "clock_nanosleep",
+    "clock_gettime",
+    "clock_getres",
+    "futex",
+    "futex_waitv",
+    "set_robust_list",
+    "get_robust_list",
+    "epoll_create",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_wait",
+    "epoll_pwait",
+    "poll",
+    "ppoll",
+    "select",
+    "pselect6",
+    "socket",
+    "socketpair", // intentionally allowed; netns blocks egress
+    "uname",
+    "sysinfo",
+    "getrandom",
+];
+
+// TODO(M7+): argument filter for prctl/ioctl per §5.6. For now both are
+// allowed unconditionally; argument-level filtering is where seccomp's
+// real complexity lives and was deliberately punted out of M7.
+
+/// Resolve a syscall name to its number on the current target arch.
+///
+/// Returns `None` for names that do not exist on this arch (e.g. `fork`
+/// on aarch64). Backed by `libc::SYS_*` constants, gated by
+/// `cfg(target_arch)` so missing constants never break the build.
+fn syscall_nr(name: &str) -> Option<i64> {
+    // Common syscalls present on both x86_64 and aarch64 (and most other
+    // Linux arches). Listed first so the giant arch-specific blocks below
+    // stay readable.
+    let common = match name {
+        "read" => Some(libc::SYS_read),
+        "write" => Some(libc::SYS_write),
+        "readv" => Some(libc::SYS_readv),
+        "writev" => Some(libc::SYS_writev),
+        "pread64" => Some(libc::SYS_pread64),
+        "pwrite64" => Some(libc::SYS_pwrite64),
+        "openat" => Some(libc::SYS_openat),
+        "openat2" => Some(libc::SYS_openat2),
+        "close" => Some(libc::SYS_close),
+        "close_range" => Some(libc::SYS_close_range),
+        "fstat" => Some(libc::SYS_fstat),
+        "newfstatat" => Some(libc::SYS_newfstatat),
+        "statx" => Some(libc::SYS_statx),
+        "lseek" => Some(libc::SYS_lseek),
+        "mmap" => Some(libc::SYS_mmap),
+        "munmap" => Some(libc::SYS_munmap),
+        "mremap" => Some(libc::SYS_mremap),
+        "mprotect" => Some(libc::SYS_mprotect),
+        "madvise" => Some(libc::SYS_madvise),
+        "msync" => Some(libc::SYS_msync),
+        "brk" => Some(libc::SYS_brk),
+        "execve" => Some(libc::SYS_execve),
+        "execveat" => Some(libc::SYS_execveat),
+        "wait4" => Some(libc::SYS_wait4),
+        "waitid" => Some(libc::SYS_waitid),
+        "exit" => Some(libc::SYS_exit),
+        "exit_group" => Some(libc::SYS_exit_group),
+        "rt_sigaction" => Some(libc::SYS_rt_sigaction),
+        "rt_sigprocmask" => Some(libc::SYS_rt_sigprocmask),
+        "rt_sigreturn" => Some(libc::SYS_rt_sigreturn),
+        "rt_sigsuspend" => Some(libc::SYS_rt_sigsuspend),
+        "sigaltstack" => Some(libc::SYS_sigaltstack),
+        "clone" => Some(libc::SYS_clone),
+        "clone3" => Some(libc::SYS_clone3),
+        "pipe2" => Some(libc::SYS_pipe2),
+        "dup" => Some(libc::SYS_dup),
+        "dup3" => Some(libc::SYS_dup3),
+        "getpid" => Some(libc::SYS_getpid),
+        "getppid" => Some(libc::SYS_getppid),
+        "gettid" => Some(libc::SYS_gettid),
+        "getuid" => Some(libc::SYS_getuid),
+        "geteuid" => Some(libc::SYS_geteuid),
+        "getgid" => Some(libc::SYS_getgid),
+        "getegid" => Some(libc::SYS_getegid),
+        "getgroups" => Some(libc::SYS_getgroups),
+        "setgroups" => Some(libc::SYS_setgroups),
+        "getcwd" => Some(libc::SYS_getcwd),
+        "chdir" => Some(libc::SYS_chdir),
+        "fchdir" => Some(libc::SYS_fchdir),
+        "fcntl" => Some(libc::SYS_fcntl),
+        "ioctl" => Some(libc::SYS_ioctl),
+        "prlimit64" => Some(libc::SYS_prlimit64),
+        "setrlimit" => Some(libc::SYS_setrlimit),
+        "prctl" => Some(libc::SYS_prctl),
+        "sched_yield" => Some(libc::SYS_sched_yield),
+        "sched_getaffinity" => Some(libc::SYS_sched_getaffinity),
+        "nanosleep" => Some(libc::SYS_nanosleep),
+        "clock_nanosleep" => Some(libc::SYS_clock_nanosleep),
+        "clock_gettime" => Some(libc::SYS_clock_gettime),
+        "clock_getres" => Some(libc::SYS_clock_getres),
+        "futex" => Some(libc::SYS_futex),
+        "set_robust_list" => Some(libc::SYS_set_robust_list),
+        "get_robust_list" => Some(libc::SYS_get_robust_list),
+        "epoll_create1" => Some(libc::SYS_epoll_create1),
+        "epoll_ctl" => Some(libc::SYS_epoll_ctl),
+        "epoll_pwait" => Some(libc::SYS_epoll_pwait),
+        "ppoll" => Some(libc::SYS_ppoll),
+        "pselect6" => Some(libc::SYS_pselect6),
+        "socket" => Some(libc::SYS_socket),
+        "socketpair" => Some(libc::SYS_socketpair),
+        "uname" => Some(libc::SYS_uname),
+        "sysinfo" => Some(libc::SYS_sysinfo),
+        "getrandom" => Some(libc::SYS_getrandom),
+        _ => None,
+    };
+    if common.is_some() {
+        return common;
+    }
+
+    // x86_64-only legacy syscalls.
+    #[cfg(target_arch = "x86_64")]
+    {
+        match name {
+            "open" => return Some(libc::SYS_open),
+            "stat" => return Some(libc::SYS_stat),
+            "lstat" => return Some(libc::SYS_lstat),
+            "fork" => return Some(libc::SYS_fork),
+            "vfork" => return Some(libc::SYS_vfork),
+            "pipe" => return Some(libc::SYS_pipe),
+            "getrlimit" => return Some(libc::SYS_getrlimit),
+            "arch_prctl" => return Some(libc::SYS_arch_prctl),
+            "epoll_create" => return Some(libc::SYS_epoll_create),
+            "epoll_wait" => return Some(libc::SYS_epoll_wait),
+            "poll" => return Some(libc::SYS_poll),
+            "select" => return Some(libc::SYS_select),
+            _ => {}
+        }
+    }
+
+    // futex_waitv is gated on kernel and libc version; only present on
+    // some arches in libc 0.2.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        if name == "futex_waitv" {
+            return Some(libc::SYS_futex_waitv);
+        }
+    }
+
+    // mmap2 / fcntl64 are 32-bit-only ABIs. We compile for 64-bit, so they
+    // don't exist as `libc::SYS_*`. Treating them as unknown is correct.
+    None
+}
+
+/// Map `std::env::consts::ARCH` to seccompiler's `TargetArch`.
+fn host_target_arch() -> io::Result<TargetArch> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok(TargetArch::x86_64),
+        "aarch64" => Ok(TargetArch::aarch64),
+        other => Err(io::Error::new(
+            ErrorKind::Unsupported,
+            format!("seccomp: unsupported arch {other}"),
+        )),
+    }
+}
+
+/// Build (but do not install) the BPF program for the default allowlist
+/// merged with `extra_allow`. Split out so unit tests can exercise the
+/// compiler without locking down the test process.
+fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
+    let arch = host_target_arch()?;
+
+    // Resolve names → numbers. DEFAULT_ALLOW silently drops names that do
+    // not exist on this arch (they're informational); extras must resolve.
+    let mut numbers: BTreeSet<i64> = BTreeSet::new();
+    for name in DEFAULT_ALLOW {
+        if let Some(nr) = syscall_nr(name) {
+            numbers.insert(nr);
+        }
+    }
+    for name in extra_allow {
+        if name.is_empty() {
+            continue;
+        }
+        match syscall_nr(name) {
+            Some(nr) => {
+                numbers.insert(nr);
+            }
+            None => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("seccomp: unknown syscall in extra_allow: {name}"),
+                ));
+            }
+        }
+    }
+
+    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+        numbers.into_iter().map(|nr| (nr, Vec::new())).collect();
+
+    let filter = SeccompFilter::new(
+        rules,
+        // Mismatch: return EPERM (not Kill) — see module docs.
+        SeccompAction::Errno(libc::EPERM as u32),
+        // Match: allow.
+        SeccompAction::Allow,
+        arch,
+    )
+    .map_err(|e| io::Error::other(format!("seccomp: build filter: {e}")))?;
+
+    let prog: BpfProgram = filter
+        .try_into()
+        .map_err(|e| io::Error::other(format!("seccomp: compile to BPF: {e}")))?;
+
+    Ok(prog)
+}
+
+/// Install a default-deny seccomp filter on the calling thread.
+///
+/// `extra_allow` is an additive allowlist of syscall names beyond
+/// [`DEFAULT_ALLOW`]. Unknown names are rejected with
+/// [`io::ErrorKind::InvalidInput`] so misconfiguration surfaces loudly
+/// instead of silently widening the policy.
+#[allow(dead_code)] // wired into the runner pipeline by the M7 integration step
+pub(super) fn install(extra_allow: &[String]) -> io::Result<()> {
+    let prog = build_filter(extra_allow)?;
+    let allow_count = prog.len();
+    apply_filter(&prog).map_err(|e| io::Error::other(format!("seccomp: apply_filter: {e}")))?;
+    tracing::debug!(allowed = allow_count, "installed seccomp filter");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_allow_contains_essentials() {
+        for must in ["execve", "exit_group", "read", "write"] {
+            assert!(
+                DEFAULT_ALLOW.contains(&must),
+                "DEFAULT_ALLOW missing essential syscall: {must}",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn compiles_on_host_arch() {
+        // Build but do not install — installing would lock down the test
+        // process and break subsequent tests in the same binary.
+        let prog = build_filter(&[]).expect("filter must compile on host arch");
+        assert!(!prog.is_empty(), "BPF program should be non-empty");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn unknown_extra_syscall_is_rejected() {
+        let err = build_filter(&["definitely_not_a_syscall".to_string()])
+            .expect_err("unknown extra syscall must error");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn empty_extra_entries_are_ignored() {
+        // Empty strings come from sloppy config splitting; tolerate them
+        // rather than rejecting, per the spec's "ignore empty strings".
+        build_filter(&[String::new()]).expect("empty extra entries must be ignored");
+    }
 }

@@ -188,3 +188,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cargo test'`.
 - Added `uuid` as a direct dep of `brokkr-sandbox` for action-cgroup
   naming.
+- M7 (partial): default-deny seccomp-bpf filter in
+  `brokkr-sandbox/src/runner/seccomp.rs`. Compiles a
+  `seccompiler::SeccompFilter` whose mismatch action is
+  `Errno(EPERM)` and whose match action is `Allow`, with the syscall
+  allowlist from `docs/phase-2-plan.md` §5.6 plus an additive
+  `extra_seccomp_allow` slot. Syscall names are resolved to numbers via
+  `nix::libc::SYS_*` (seccompiler 0.5 does not expose its internal
+  name table publicly); names absent on the current arch are silently
+  skipped from the default list, but unknown names in the extra list
+  are rejected with `InvalidInput`. Argument-level filtering for
+  `prctl`/`ioctl` is intentionally deferred (TODO marker in the
+  source). Wiring `install()` into the runner pipeline is the next
+  M7 step and is owned by the integration agent.
