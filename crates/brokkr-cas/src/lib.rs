@@ -7,6 +7,8 @@
 #![deny(missing_docs)]
 
 pub mod action_cache;
+pub mod bloom;
+pub mod bloom_cas;
 pub mod error;
 pub mod in_memory;
 pub mod redb_backend;
@@ -15,6 +17,8 @@ pub mod router;
 pub mod traits;
 
 pub use action_cache::{ActionCache, RedbActionCache};
+pub use bloom::Bloom;
+pub use bloom_cas::BloomCas;
 pub use error::CasError;
 pub use in_memory::InMemoryCas;
 pub use redb_backend::RedbCas;

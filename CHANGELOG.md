@@ -234,3 +234,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly from a hand-rolled `Topology`.
 - `tokio-stream` gains the `sync` feature on `brokkr-control` for
   `WatchStream`.
+- M2: `brokkr-cas::bloom::Bloom` — hand-rolled bloom filter sized
+  from `(expected_items, fp_rate)` via the standard formulas
+  (`m = ⌈-n·ln p / (ln 2)²⌉`, `k = ⌈(m/n)·ln 2⌉`). Hashes are
+  derived from the digest's existing sha256 via the
+  Kirsch–Mitzenmacher construction (`h_i = h1 + i·h2` mod m), so
+  insert/check is plain bit-ops without re-hashing. Seven unit
+  tests including an empirical false-positive-rate check (10k
+  members at p=0.01, 100k probes, rate < 2% asserted) and a
+  sizing-formula spot check (1M @ 1% → ~9.6 Mbits, k=7).
+- M2: `brokkr-cas::BloomCas<C: Cas>` — decorator wrapping any
+  `Cas` backend. `find_missing_blobs` partitions inputs into
+  bloom-says-missing vs. bloom-says-maybe; only the latter
+  consults the underlying backend. `batch_update_blobs`
+  delegates and inserts into the bloom on success.
+  `batch_read_blobs` delegates unchanged (the bloom doesn't help
+  reads). `rebuild_from` reseeds the filter from an authoritative
+  digest source for the periodic-rebuild path. Six tests.
+- No new direct deps — bloom is built from the existing
+  `sha2` and standard library.
