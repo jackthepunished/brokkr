@@ -15,7 +15,7 @@ use brokkr_proto::reapi_v2::{
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::runner::{proto_digest, run_command, RunOutcome};
+use crate::runner::{proto_digest, run_command, RunOutcome, Runner};
 
 /// Worker daemon configuration.
 #[derive(Debug, Clone)]
@@ -24,6 +24,22 @@ pub struct WorkerConfig {
     pub control_endpoint: String,
     /// Hostname to advertise (informational).
     pub hostname: String,
+    /// How to actually execute each action. Defaults to
+    /// [`Runner::Plain`] so in-process tests don't need to build the
+    /// `brokkr-sandboxd` runner binary; the CLI binary
+    /// (`brokkr-worker`) overrides this to [`Runner::Sandboxed`]
+    /// unless `--no-sandbox` is passed.
+    pub runner: Runner,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            control_endpoint: "http://127.0.0.1:7878".to_string(),
+            hostname: "worker".to_string(),
+            runner: Runner::Plain,
+        }
+    }
 }
 
 /// Run the worker. Returns when the control plane closes the stream or an
@@ -72,7 +88,7 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
         let Some(job) = assignment.job else { continue };
         let job_id = job.job_id.clone();
         let mut cas_for_job = cas.clone();
-        let report = match handle_job(&mut cas_for_job, job).await {
+        let report = match handle_job(&cfg.runner, &mut cas_for_job, job).await {
             Ok(r) => JobResult {
                 job_id: job_id.clone(),
                 result: Some(r),
@@ -101,7 +117,7 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
 
 #[tracing::instrument(
     name = "worker::run_action",
-    skip(cas, job),
+    skip(runner, cas, job),
     fields(
         job_id = %job.job_id,
         argv0 = tracing::field::Empty,
@@ -109,6 +125,7 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
     ),
 )]
 async fn handle_job(
+    runner: &Runner,
     cas: &mut ContentAddressableStorageClient<Channel>,
     job: bv1::Job,
 ) -> Result<rapi::ActionResult> {
@@ -120,7 +137,7 @@ async fn handle_job(
         exit_code,
         stdout,
         stderr,
-    } = run_command(&command).await?;
+    } = run_command(runner, &command).await?;
     tracing::Span::current().record("exit_code", exit_code);
 
     // Phase 1 stdout/stderr policy: upload to CAS and reference by digest;

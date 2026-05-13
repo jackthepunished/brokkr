@@ -10,4 +10,5 @@
 pub mod runner;
 pub mod worker;
 
+pub use runner::{default_rootfs, Runner, SandboxRunner, SandboxTemplate};
 pub use worker::{run_worker, WorkerConfig};
