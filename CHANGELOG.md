@@ -274,3 +274,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry. Records the architecture decisions made before any code
   lands (HRW over consistent hashing, push-based membership stream,
   `R/2+1` write quorum + async repair).
+- M1: `brokkr.v1.membership.proto` — `CasNode`, `NodeStatus`,
+  `TopologyView`, and `MembershipService.WatchTopology` (long-lived
+  server-streaming RPC). The existing `brokkr.v1` module gains new
+  types; the build script picks up the new proto.
+- M1: `brokkr-cas::ring` — rendezvous-hash (HRW) replica picker.
+  Pure-data `RingNode` + `NodeStatus`; `replicas_for(digest, nodes,
+  R)` returns the top-R eligible nodes ordered primary-first.
+  Backed by sha256. Seven unit tests, including distribution
+  uniformity (10k digests over 4 nodes, ±10% per node) and
+  one-node-removal churn (~20% in expectation, asserted in the
+  10–35% band on a 4k-digest sample).
+- M1: `brokkr-cas::router::Router` — client-side topology view
+  built on top of `ring`. Atomically swappable via
+  `update_topology`; `primary_replicas_for(&digest)` consults the
+  current view at the configured replication factor. `RwLock`-based
+  read path; lock poisoning recovery is graceful. Four unit tests.
+- M1: `brokkr-control::membership::Membership` +
+  `MembershipServiceImpl` — `Membership` holds a
+  `watch::Sender<TopologyView>` that every subscribed client tails;
+  `set_nodes` / `set_replication_factor` bump the generation iff
+  the effective view changes (`send_if_modified`).
+  `MembershipServiceImpl` adapts the watch receiver into a tonic
+  server-stream. Five unit tests.
+- M1: `brokkr-control/tests/membership.rs` — two integration tests.
+  `watch_topology_streams_current_view_then_updates` exercises the
+  gRPC flow end-to-end: first message on connect is the current
+  view, subsequent messages arrive on `set_nodes`.
+  `router_routes_consistently_with_local_topology` proves the
+  proto round-trip is lossless: a `Router` fed from the gRPC
+  stream picks the same primary for each digest as one built
+  directly from a hand-rolled `Topology`.
+- `tokio-stream` gains the `sync` feature on `brokkr-control` for
+  `WatchStream`.
