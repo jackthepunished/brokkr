@@ -29,6 +29,7 @@ use nix::unistd::{fork, ForkResult};
 use crate::config::SandboxConfig;
 
 use super::caps::drop_all_except;
+use super::determinism::{apply_pre_fork as apply_determinism_pre_fork, scrub_env};
 use super::mount::setup_rootfs;
 use super::netns::apply_policy as apply_network_policy;
 use super::pidns::{exit_with, mount_proc, reap_until};
@@ -64,6 +65,13 @@ pub(super) fn runner_main() -> ! {
     }
     if let Err(e) = apply_network_policy(cfg.network) {
         die("apply network policy", &e.to_string());
+    }
+    // M8: hostname + /etc/localtime. We still have synthetic
+    // CAP_SYS_ADMIN here (user-namespace privileges) and the tmpfs
+    // `/etc` is in place from setup_rootfs. Env scrubbing is deferred
+    // to the action child (scrub_env is called from chdir_and_exec).
+    if let Err(e) = apply_determinism_pre_fork(&cfg.determinism) {
+        die("apply determinism", &e.to_string());
     }
 
     // First fork: child becomes PID 1 in the new PID namespace.
@@ -135,7 +143,11 @@ fn chdir_and_exec(cfg: &SandboxConfig) -> ! {
         Ok(a) => a,
         Err(msg) => die("invalid argv", msg),
     };
-    let env = match build_env(&cfg.env) {
+    // M8: scrub LD_PRELOAD / LD_LIBRARY_PATH / PATH and inject TZ /
+    // SOURCE_DATE_EPOCH per DeterminismPolicy. Pure data manipulation,
+    // safe on both the namespace path and the M2 no-isolation path.
+    let scrubbed_env = scrub_env(&cfg.env, &cfg.determinism);
+    let env = match build_env(&scrubbed_env) {
         Ok(e) => e,
         Err(msg) => die("invalid env", msg),
     };

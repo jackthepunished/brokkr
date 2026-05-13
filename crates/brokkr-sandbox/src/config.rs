@@ -173,7 +173,8 @@ pub struct DeterminismPolicy {
     /// Default policy in `brokkr-worker` will set this to `brokkr-sandbox`.
     #[serde(default)]
     pub hostname: Option<String>,
-    /// Force `/etc/localtime` → `Etc/UTC`.
+    /// Force `/etc/localtime` → `Etc/UTC` and inject `TZ=UTC0` into the
+    /// action's env.
     #[serde(default)]
     pub timezone_utc: bool,
     /// `SOURCE_DATE_EPOCH` to inject for reproducible-build tooling.
@@ -185,6 +186,23 @@ pub struct DeterminismPolicy {
     /// Replace `PATH` with a fixed default (`/usr/bin:/bin`).
     #[serde(default)]
     pub strip_path: bool,
+}
+
+impl DeterminismPolicy {
+    /// The policy `brokkr-worker` applies by default: fixed hostname,
+    /// UTC timezone, LD_PRELOAD / LD_LIBRARY_PATH stripped, PATH
+    /// replaced. `SOURCE_DATE_EPOCH` is left unset because there is no
+    /// universally-correct value — callers that want reproducible
+    /// builds inject it per-action via `Action.Platform`.
+    pub fn brokkr_defaults() -> Self {
+        Self {
+            hostname: Some("brokkr-sandbox".to_string()),
+            timezone_utc: true,
+            source_date_epoch: None,
+            strip_ld_preload: true,
+            strip_path: true,
+        }
+    }
 }
 
 #[cfg(test)]

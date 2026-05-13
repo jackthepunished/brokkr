@@ -19,12 +19,19 @@
 //! just "bring `lo` up" via [`super::netns::apply_policy`] — based on
 //! [`crate::NetworkPolicy`].
 //!
+//! M8 adds `CLONE_NEWUTS` so the runner can [`sethostname(2)`] inside
+//! the sandbox without affecting the host. Without the UTS namespace,
+//! a sethostname call would need real `CAP_SYS_ADMIN` (the user
+//! namespace's synthetic capability is only meaningful inside
+//! namespaces owned by the user ns).
+//!
 //! Sequencing nuances captured here:
 //!
-//! - `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET)`
-//!   in a single call. The kernel creates the user namespace first,
-//!   so the new mount / PID / net namespaces are born with the caller
-//!   already privileged in them (per `clone(2)`).
+//! - `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET
+//!   | CLONE_NEWUTS)` in a single call. The kernel creates the user
+//!   namespace first, so the new mount / PID / net / UTS namespaces
+//!   are born with the caller already privileged in them (per
+//!   `clone(2)`).
 //! - `/proc/self/setgroups` must be written `deny` *before* `gid_map` is
 //!   writable under an unprivileged user namespace. Forgetting this is
 //!   the most common failure mode.
@@ -57,7 +64,8 @@ pub(super) fn setup_namespaces(map: UidGidMap) -> io::Result<()> {
         CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
             | CloneFlags::CLONE_NEWPID
-            | CloneFlags::CLONE_NEWNET,
+            | CloneFlags::CLONE_NEWNET
+            | CloneFlags::CLONE_NEWUTS,
     )
     .map_err(nix_io)?;
 
