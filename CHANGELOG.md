@@ -326,3 +326,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   digest source for the periodic-rebuild path. Six tests.
 - No new direct deps — bloom is built from the existing
   `sha2` and standard library.
+- M3a: `brokkr-cas::tiered::TieredCas<W: Cas>` — composes an
+  in-memory size-bounded LRU "hot" tier in front of any `Cas`
+  backend (typically `RedbCas`). Reads serve from hot on hit;
+  hot misses fall through to warm and promote on success. Writes
+  populate warm authoritatively and hot eagerly (workers
+  frequently re-read what they just wrote). `find_missing_blobs`
+  delegates straight to warm — hot is a cache, not authoritative.
+- M3a: Hand-rolled `HotTier` LRU. Byte-bounded (not entry-bounded
+  — blob sizes vary too widely for a count to be useful). Hash
+  map for O(1) lookups + intrusive doubly-linked-list of `usize`
+  indices into a node pool, with a free-list for evicted slots.
+  All safe Rust. Blobs larger than the whole capacity are not
+  cached (avoids evicting the entire tier for one outsized
+  insert). Zero capacity disables hot caching entirely (useful
+  for tests).
+- M3a: Eleven unit tests on `HotTier` + `TieredCas` covering
+  empty get, put/get round-trip, LRU eviction, MRU touch,
+  oversized-blob skip, zero-capacity bypass, hot warmup on
+  write, warm-to-hot promotion on read, find-missing delegation,
+  and rejection of failed writes from the cache.
+- Cold tier (OpenDAL S3) is deferred to M3b — a follow-up PR.

@@ -161,3 +161,55 @@ debrief.
   realistic.** A `Vec<u64>` would have to be `u64::MAX / 64` ≈
   290 exabits long before this matters. Documented the lack of
   overflow check in the source.
+
+## M3a — `feat/phase3-tiered-storage`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `brokkr-cas::tiered::TieredCas<W: Cas>` composes
+  an in-memory size-bounded LRU "hot" tier in front of any `Cas`
+  backend. Hand-rolled `HotTier` with hash-map + doubly-linked-list
+  via `usize` indices into a node pool, all safe Rust. Eleven
+  unit tests. Cold (S3) tier deferred to M3b.
+
+### Decisions
+
+- **Decorator pattern again.** Mirrors `BloomCas` and is the
+  same composability win: a test that wants undecorated
+  `RedbCas` keeps having it; a node that wants hot caching wraps.
+- **Byte-bounded LRU, not entry-bounded.** Blob sizes vary from
+  hundreds of bytes (action protos) to multiple MiB (compiler
+  binaries). An entry count can't size memory; a byte budget
+  can. Single-blob inserts that exceed the whole budget are
+  silently skipped — caching a 4 GiB blob in a 64 MiB hot tier
+  would evict everything else for one promotion.
+- **Eager write-through to hot.** Workers re-read their own
+  outputs (action results inline blobs they just produced). The
+  hot tier is the right place for those by definition.
+- **`find_missing_blobs` skips hot entirely.** Hot is a cache,
+  not authoritative; a blob can be evicted but still present in
+  warm, so a hot-miss answer would be wrong. The bloom (M2)
+  short-circuits on the absent side; hot only helps reads.
+- **Split M3 into M3a + M3b.** OpenDAL pulls a large dep tree
+  (rustls / hyper / xml / opendal-core); landing it together
+  with the in-memory LRU would have made the PR's review
+  surface much wider than it needs to be. Cold tier is its own
+  PR with its own feature gate.
+
+### What surprised me
+
+- **Safe Rust + `usize` indices is the cleanest LRU shape.**
+  I started with `Box<Node>` and prev/next `Option<NonNull<Node>>`
+  before remembering this is a code smell — `Vec<Slot>` with
+  `usize` prev/next and a free-list is shorter, has no
+  unsafe, and reuses node slots on eviction. The free-list adds
+  ten lines; reusing slots saves more than ten in lifetime hassle.
+- **`Bytes::clone` being cheap is load-bearing here.** The
+  promote-on-read path clones the warm response into the hot
+  tier. If `Bytes` weren't Arc-backed, this would copy the
+  whole blob per promotion. As it is, we move one `Arc`.
+- **Hot-tier `Mutex` is fine; an `RwLock` would buy us less
+  than expected.** LRU touch on `get` needs a write lock anyway
+  (moving the entry to MRU). The only contention-relevant case
+  is concurrent reads that *both* miss hot — and those serialize
+  on the warm backend, not on the hot lock.
