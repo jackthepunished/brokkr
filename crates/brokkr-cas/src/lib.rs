@@ -10,10 +10,14 @@ pub mod action_cache;
 pub mod error;
 pub mod in_memory;
 pub mod redb_backend;
+pub mod ring;
+pub mod router;
 pub mod traits;
 
 pub use action_cache::{ActionCache, RedbActionCache};
 pub use error::CasError;
 pub use in_memory::InMemoryCas;
 pub use redb_backend::RedbCas;
+pub use ring::{replicas_for, score, NodeStatus, RingNode};
+pub use router::{Router, Topology};
 pub use traits::Cas;
