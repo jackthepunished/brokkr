@@ -103,3 +103,61 @@ debrief.
   realising the tokio API already has the idempotent path.
   Reading module docs beats reaching for the obvious method
   name.
+
+## M2 — `feat/phase3-bloom-filter`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** Hand-rolled bloom filter in `brokkr-cas::bloom`
+  plus a `BloomCas<C: Cas>` decorator that any backend can wear
+  to short-circuit `find_missing_blobs` on definitely-absent
+  digests. ~280 lines total including 13 tests. No new
+  third-party deps.
+
+### Decisions
+
+- **Hand-roll, don't pull a crate.** Considered
+  `growable-bloom-filter` (1.4k stars, MIT) and a few smaller
+  alternatives. The filter we need is genuinely 150 lines of
+  arithmetic and `Vec<u64>` indexing; a dep would have been more
+  code to audit than the filter itself.
+- **Kirsch–Mitzenmacher hash derivation.** The textbook trick of
+  generating `k` hashes from two independent base hashes
+  (`h_i = h1 + i·h2 mod m`) is asymptotically equivalent to `k`
+  truly independent hashes and avoids re-running sha256 per
+  insert/check. We get `h1`/`h2` for free by parsing the leading
+  32 hex chars of the digest's existing sha256.
+- **Decorator over modification.** Instead of bolting the bloom
+  into `RedbCas` directly, `BloomCas<C: Cas>` wraps any backend.
+  Composes with `Arc<dyn Cas>` and keeps the bloom optional —
+  Phase 1 paths that already use `RedbCas` unmodified stay
+  untouched.
+- **No bloom on the read path.** `batch_read_blobs` delegates
+  unchanged. A bloom hit would save us one disk lookup vs. the
+  backend's `NotFound`, but the backend already returns
+  `NotFound` cheaply, and skipping the backend on a
+  bloom-says-missing answer would risk returning a false
+  negative if the bloom is stale (between an insert and the
+  filter update, however briefly). The integrity rule "reads
+  must always hit the backing store" wins.
+- **Saturating insert counter, not exact cardinality.** The
+  bloom can't subtract; duplicates inflate the counter. We
+  expose `approximate_items` rather than `cardinality` to make
+  this explicit.
+
+### What surprised me
+
+- **The false-positive-rate property test is generous and still
+  passes by a wide margin.** Configured for 1%, the measured
+  rate at 10k members + 100k probes is consistently
+  ~0.4–0.7%. Probably the bound on the test
+  (`< 2 * target_p`) could be tightened, but I'd rather absorb
+  the variance than chase a flake later.
+- **`div_ceil` on `usize` is stable.** I'd hand-rolled
+  `(m + 63) / 64` and clippy suggested
+  `usize::div_ceil(63 + m, 64)`. Either way is fine, but the
+  named method is clearer.
+- **`bits.len() * 64` overflowing on a 64-bit machine isn't
+  realistic.** A `Vec<u64>` would have to be `u64::MAX / 64` ≈
+  290 exabits long before this matters. Documented the lack of
+  overflow check in the source.
