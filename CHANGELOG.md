@@ -188,3 +188,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cargo test'`.
 - Added `uuid` as a direct dep of `brokkr-sandbox` for action-cgroup
   naming.
+
+## Phase 3 (in progress)
+
+### Added
+- `docs/phase-3-plan.md` — detailed Phase 3 implementation plan
+  (failure model, rendezvous-hashing routing, tiered storage
+  composition, replication strategy, FUSE materialisation,
+  garbage-collection sketch, M0–M7 milestones, CI / host
+  compatibility notes, deferred items).
+- `docs/journal/phase-3.md` — Phase 3 journal, started with the M0
+  entry. Records the architecture decisions made before any code
+  lands (HRW over consistent hashing, push-based membership stream,
+  `R/2+1` write quorum + async repair).
