@@ -347,3 +347,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write, warm-to-hot promotion on read, find-missing delegation,
   and rejection of failed writes from the cache.
 - Cold tier (OpenDAL S3) is deferred to M3b — a follow-up PR.
+- M4: `brokkr-cas::replicated::ReplicatedCas<P: ReplicaPool>` —
+  quorum-write + read-fan-out across the `R` replicas selected
+  by the rendezvous ring. Writes succeed at `⌈R/2⌉ + 1` acks;
+  reads try replicas primary-first and return the first
+  success. `find_missing_blobs` queries the primary (with
+  failover to the next replica if the primary is unreachable).
+- M4: `ReplicaPool` trait + `StaticPool` impl. The pool maps
+  `node_id → Arc<dyn Cas>`; a future milestone will provide a
+  gRPC-backed pool, but M4 ships the logic and tests in-process
+  against pools of `InMemoryCas` instances.
+- M4: Seven `ReplicatedCas` tests — write fan-out lands on
+  exactly R replicas, read serves from first-available, read
+  returns NotFound when no replica has the blob, quorum holds
+  on one-replica-down with R=3, quorum fails when only 1/2
+  reachable, find-missing returns authoritative answer, empty
+  topology fails closed.
+- `futures` workspace dep added to `brokkr-cas` for
+  `future::join_all` on the replica fan-out.

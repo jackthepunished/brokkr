@@ -213,3 +213,62 @@ debrief.
   (moving the entry to MRU). The only contention-relevant case
   is concurrent reads that *both* miss hot — and those serialize
   on the warm backend, not on the hot lock.
+
+## M4 — `feat/phase3-replication`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `brokkr-cas::replicated::ReplicatedCas<P>` —
+  quorum-write + read-fan-out across the R replicas the
+  rendezvous ring selects. Writes succeed at `⌈R/2⌉ + 1`
+  acks; reads try primary-first and return first success.
+  Seven unit tests verify fan-out behaviour, quorum
+  satisfaction under partial failure, and the
+  `NotFound`-on-absence path.
+
+### Decisions
+
+- **`ReplicaPool` trait, not concrete gRPC client.** The pool
+  maps `node_id → Arc<dyn Cas>`; `StaticPool` is the
+  in-process implementation used in tests and the
+  control-plane fixture. A future milestone will add a
+  `GrpcReplicaPool` that owns one
+  `ContentAddressableStorageClient` per node. Splitting the
+  quorum logic from the transport keeps M4's tests
+  deterministic and lets the partial-failure handling be
+  written once.
+- **Quorum on majority, not strict-all.** With R=2 quorum is 2
+  (strict). With R=3 quorum is 2 — one node down doesn't
+  block writes. The plan's §5.4 chose this because the cold-tier
+  S3 backfill (M3b) is the durability backstop for any blob
+  the worker observed as committed.
+- **`find_missing_blobs` queries the primary only.** Eventually
+  consistent — a brand-new write may not have hit every
+  replica yet, but the primary will have it because the
+  primary is one of the R replicas the write fanned out to.
+  Trades one round trip for the broader fan-out.
+- **Partial-failure conservatism for find-missing.** If every
+  replica for a slice is unreachable, M4 reports the whole
+  slice as "missing" rather than asserting it's present.
+  Better to re-upload than to lie about state.
+
+### What surprised me
+
+- **Building a `StaticPool` "without one entry" is awkward.**
+  Two of the tests need a pool that has 2 of 3 ring nodes (to
+  simulate a replica being down). Cleanest pattern was to
+  build the full pool, ask the ring which 3 nodes were chosen
+  for a probe digest, then rebuild a tighter pool without the
+  third. A more polished API might be `StaticPool::without`
+  but it's a single-test concern.
+- **`futures::future::join_all` doesn't short-circuit on
+  quorum.** We wait for *all* replica writes even after we
+  could have returned. Acceptable in M4 (replicas are local
+  in tests; production gRPC will benefit from a more clever
+  early-return), but called out for the future grpc pool to
+  use `FuturesUnordered` + a counter.
+- **`async_trait` + closures + `Arc<dyn Cas>` is fine.** I
+  expected friction here (lifetime gymnastics around `&self`
+  inside async fns); ended up with no lifetimes annotated.
+  The Pin-Box-Future return type that `async_trait` desugars
+  to handles it.
