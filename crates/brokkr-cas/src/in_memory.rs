@@ -90,6 +90,23 @@ impl Cas for InMemoryCas {
             })
             .collect())
     }
+
+    async fn list_digests(&self) -> Result<Vec<Digest>, CasError> {
+        let guard = self
+            .blobs
+            .read()
+            .map_err(|_| std::io::Error::other("cas lock poisoned"))?;
+        Ok(guard.keys().cloned().collect())
+    }
+
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), CasError> {
+        let mut guard = self
+            .blobs
+            .write()
+            .map_err(|_| std::io::Error::other("cas lock poisoned"))?;
+        guard.remove(digest);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
