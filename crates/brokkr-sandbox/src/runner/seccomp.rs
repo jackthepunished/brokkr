@@ -436,9 +436,12 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
 /// instead of silently widening the policy.
 pub(super) fn install(extra_allow: &[String]) -> io::Result<()> {
     let prog = build_filter(extra_allow)?;
-    let allow_count = prog.len();
+    let bpf_instruction_count = prog.len();
     apply_filter(&prog).map_err(|e| io::Error::other(format!("seccomp: apply_filter: {e}")))?;
-    tracing::debug!(allowed = allow_count, "installed seccomp filter");
+    tracing::debug!(
+        bpf_instructions = bpf_instruction_count,
+        "installed seccomp filter"
+    );
     Ok(())
 }
 
