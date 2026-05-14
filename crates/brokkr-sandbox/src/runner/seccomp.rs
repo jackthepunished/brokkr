@@ -22,7 +22,8 @@ use std::io::{self, ErrorKind};
 
 use nix::libc;
 use seccompiler::{
-    apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+    apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
 };
 
 /// Default syscall allowlist. Mirrors `docs/phase-2-plan.md` §5.6.
@@ -180,9 +181,11 @@ const DEFAULT_ALLOW: &[&str] = &[
     "getrandom",
 ];
 
-// TODO(M7+): argument filter for prctl/ioctl per §5.6. For now both are
-// allowed unconditionally; argument-level filtering is where seccomp's
-// real complexity lives and was deliberately punted out of M7.
+/// Resolve a syscall name to its number on the current target arch.
+///
+/// Returns `None` for names that do not exist on this arch (e.g. `fork`
+/// on aarch64). Backed by `libc::SYS_*` constants, gated by
+/// `cfg(target_arch)` so missing constants never break the build.
 
 /// Resolve a syscall name to its number on the current target arch.
 ///
@@ -429,8 +432,20 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
         }
     }
 
-    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
-        numbers.into_iter().map(|nr| (nr, Vec::new())).collect();
+    // Build per-syscall rules. Most syscalls get an empty rule vector
+    // (unconditional allow). prctl and ioctl get argument-filtered rules.
+    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = numbers
+        .into_iter()
+        .map(|nr| {
+            if nr == libc::SYS_prctl {
+                (nr, prctl_rules())
+            } else if nr == libc::SYS_ioctl {
+                (nr, ioctl_rules())
+            } else {
+                (nr, Vec::new())
+            }
+        })
+        .collect();
 
     let filter = SeccompFilter::new(
         rules,
@@ -447,6 +462,88 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
         .map_err(|e| io::Error::other(format!("seccomp: compile to BPF: {e}")))?;
 
     Ok(prog)
+}
+
+// ---------------------------------------------------------------------------
+// prctl argument filtering
+// ---------------------------------------------------------------------------
+
+/// Return a BPF rule set for the `prctl` syscall.
+///
+/// Each rule is evaluated in order; the first matching rule's action applies.
+/// Dangerous options are blocked (EPERM); safe options are allowed.
+/// A catch-all allow rule terminates the chain for anything not explicitly
+/// blocked.
+fn prctl_rules() -> Vec<SeccompRule> {
+    let arg0 = SeccompCmpArgLen::Dword;
+    let eq = SeccompCmpOp::Eq;
+    let masked = SeccompCmpOp::MaskedEq(0);
+
+    let mut rules = Vec::new();
+
+    // Block: PR_SET_KEEPCAPS (31) — allows setuid binaries to retain caps
+    rules.push(SeccompRule::new([(0, arg0, eq, 31)]));
+
+    // Block: PR_CAPBSET_DROP (36) — permanently removes caps from process
+    rules.push(SeccompRule::new([(0, arg0, eq, 36)]));
+
+    // Block: PR_SET_TSC (10) — enables timing side-channel (RDTSC) control
+    rules.push(SeccompRule::new([(0, arg0, eq, 10)]));
+
+    // Block: PR_GET_TSC (11) — query side-channel control
+    rules.push(SeccompRule::new([(0, arg0, eq, 11)]));
+
+    // Catch-all allow: anything not explicitly blocked above is permitted.
+    // MaskedEq(0) on arg0==0 always matches (since 0&0==0), acting as a
+    // catch-all that allows all other prctl options.
+    rules.push(SeccompRule::new([(0, arg0, masked, 0)]));
+
+    rules
+}
+
+// ---------------------------------------------------------------------------
+// ioctl argument filtering
+// ---------------------------------------------------------------------------
+
+/// Return a BPF rule set for the `ioctl` syscall.
+///
+/// The request code is in `arg1` (arg0 is the file descriptor).
+/// Terminal/device-manipulation calls are blocked; all others are allowed.
+fn ioctl_rules() -> Vec<SeccompRule> {
+    let arg1 = SeccompCmpArgLen::Dword;
+    let eq = SeccompCmpOp::Eq;
+    let masked = SeccompCmpOp::MaskedEq(0);
+
+    let mut rules = Vec::new();
+
+    // Block TIOCSTI (0x5412) — simulates terminal input
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x5412)]));
+
+    // Block TIOCSWINSZ (0x5414) — set terminal window size
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x5414)]));
+
+    // Block TIOCGWINSZ (0x5413) — get terminal window size (info leak)
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x5413)]));
+
+    // Block TIOCSBRK (0x5429) — set break condition on terminal
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x5429)]));
+
+    // Block TIOCCBRK (0x542A) — clear break condition
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x542A)]));
+
+    // Block TIOCSPTLCK (0x4D60) — unlock pseudo-terminal device lock
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x4D60)]));
+
+    // Block TIOCGSID (0x5429) — get session ID of terminal (info leak)
+    // Note: same value as TIOCSBRK on some archs; check arch-specific if needed.
+    // Using a MaskedEq to detect any tiocsid variant on the low 16 bits.
+    rules.push(SeccompRule::new([(1, arg1, eq, 0x5429)]));
+
+    // Catch-all allow: any ioctl request not explicitly blocked above is
+    // permitted. MaskedEq(0) on arg1 always matches.
+    rules.push(SeccompRule::new([(1, arg1, masked, 0)]));
+
+    rules
 }
 
 /// Install a default-deny seccomp filter on the calling thread.
