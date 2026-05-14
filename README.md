@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brokkrbanner.png" alt="Brokkr — many hammers, one forge. A distributed build & compute grid, written in Rust." />
+</p>
+
 # Brokkr
 
 **A distributed build & compute grid, written in Rust.**
@@ -14,10 +18,16 @@ storage, hermetic sandboxing, scheduling, and consensus — are implemented
 from scratch as the project's educational core. There is no Docker, no
 runc, no embedded etcd, no third-party Raft.
 
-> **Status:** Phase 1 complete. `brokk run` executes commands end-to-end
-> across a control plane + worker pair, with action-cache hits on the
-> second invocation. Hermetic sandboxing (Phase 2) and distributed CAS
-> (Phase 3) are next. **Not yet production-ready.**
+> **Status:** Phase 1 complete; Phases 2 and 3 in flight. `brokk run`
+> executes commands end-to-end across a control plane + worker pair, with
+> action-cache hits on the second invocation. The `brokkr-sandbox` runner
+> isolates actions in their own user / mount / pid / network namespaces
+> and a per-action cgroup-v2 with wall-clock + memory + pids + cpu limits
+> and OOM detection (Phase 2, M1–M6). The CAS layer has gained
+> rendezvous-hashing replica routing, a bloom-filtered
+> `find_missing_blobs` fast path, a hot-LRU + warm tiered backend,
+> quorum replication, reference-counted GC, peer repair, and tree
+> materialisation (Phase 3, M0–M6a). **Not yet production-ready.**
 
 ## What works today
 
@@ -66,7 +76,7 @@ Brokkr is a workspace of nine crates with a strict DAG dependency graph.
                                                                           │
                                                                           └──▶ brokkr-worker (binary: brokkr-worker)
                                                                                        │
-                                                                                       └──▶ brokkr-sandbox  (Phase 2)
+                                                                                       └──▶ brokkr-sandbox
 ```
 
 | Crate              | Responsibility                                                                   |
@@ -76,7 +86,7 @@ Brokkr is a workspace of nine crates with a strict DAG dependency graph.
 | `brokkr-cas`       | `Cas` trait, in-memory + `redb`-backed CAS, action cache.                        |
 | `brokkr-control`   | Tonic gRPC server: REAPI services + scheduler + worker stream.                   |
 | `brokkr-worker`    | Worker daemon: registers, pulls jobs, runs them, uploads outputs.                |
-| `brokkr-sandbox`   | (Phase 2) Linux namespaces + cgroups + seccomp from scratch — no runc, no Docker. |
+| `brokkr-sandbox`   | Linux user/mount/pid/net namespaces + cgroup-v2 from scratch — no runc, no Docker (seccomp lands later in Phase 2). |
 | `brokkr-sdk`       | Ergonomic Rust client for the REAPI surface.                                     |
 | `brokkr-cli`       | The `brokk` command-line interface.                                              |
 | `brokkr-test-utils`| Internal test helpers (not published).                                           |
@@ -101,15 +111,15 @@ Brokkr aims for correctness > performance > ergonomics, in that order.
 
 The full plan lives in [`docs/plan.md`](docs/plan.md). At a glance:
 
-| Phase | Theme                       | Status      |
-| ----- | --------------------------- | ----------- |
-| 0     | Bootstrap                   | done        |
-| 1     | First end-to-end slice      | done        |
-| 2     | Hermetic Linux sandboxing   | next        |
-| 3     | Distributed CAS (sharded)   | planned     |
-| 4     | Scheduler + multi-tenancy   | planned     |
-| 5     | Consensus + HA (custom Raft)| planned     |
-| 6+    | Web UI, FUSE inputs, RBE+   | planned     |
+| Phase | Theme                       | Status                                              |
+| ----- | --------------------------- | --------------------------------------------------- |
+| 0     | Bootstrap                   | done                                                |
+| 1     | First end-to-end slice      | done                                                |
+| 2     | Hermetic Linux sandboxing   | in progress (M1–M6 done; seccomp + M7+ remaining)   |
+| 3     | Distributed CAS (sharded)   | in progress (M0–M6a done; cold tier + FUSE next)    |
+| 4     | Scheduler + multi-tenancy   | planned                                             |
+| 5     | Consensus + HA (custom Raft)| planned                                             |
+| 6+    | Web UI, FUSE inputs, RBE+   | planned                                             |
 
 Phase retrospectives are committed to [`docs/journal/`](docs/journal/) at
 the close of each phase.
@@ -123,7 +133,7 @@ rustup show
 # Build everything.
 cargo build --workspace
 
-# Run the full test suite (25 tests including end-to-end gRPC).
+# Run the full test suite (gRPC end-to-end + sandbox smoke + CAS unit tests).
 cargo test --workspace
 
 # Lint (CI runs the same).
@@ -138,8 +148,13 @@ There is also a [`justfile`](justfile) with `fmt`, `lint`, `test`, `ci`,
 
 - [`docs/plan.md`](docs/plan.md) — vision, architecture, roadmap,
   engineering practice. Single source of truth.
+- [`docs/phase-2-plan.md`](docs/phase-2-plan.md) — hermetic sandbox design
+  (threat model, re-exec runner, per-subsystem milestones).
+- [`docs/phase-3-plan.md`](docs/phase-3-plan.md) — distributed CAS design
+  (HRW routing, tiered storage, replication, GC, FUSE).
 - [`docs/architecture/`](docs/architecture/) — Architecture Decision Records.
-- [`docs/journal/`](docs/journal/) — phase retrospectives.
+- [`docs/journal/`](docs/journal/) — phase retrospectives + per-milestone
+  journals.
 - [`CHANGELOG.md`](CHANGELOG.md) — every notable change since bootstrap.
 - [`CLAUDE.md`](CLAUDE.md) — operating manual when pair-programming with
   AI assistants on this repo.
