@@ -1,10 +1,11 @@
 //! `brokkr-worker` daemon entrypoint.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
-use brokkr_sandbox::host_check;
-use brokkr_worker::{run_worker, WorkerConfig};
+use anyhow::{anyhow, Result};
+use brokkr_sandbox::{host_check, ResourceLimits, Sandbox};
+use brokkr_worker::{run_worker, Runner, SandboxRunner, SandboxTemplate, WorkerConfig};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -19,6 +20,39 @@ struct Args {
     /// allowed). See `docs/phase-2-plan.md` §10.3.
     #[arg(long)]
     check_host: bool,
+
+    /// Disable the Phase 2 sandbox. The worker runs actions as plain
+    /// child processes — Phase 1 parity. Useful for development hosts
+    /// that lack unprivileged user namespaces or cgroup delegation.
+    /// Logs a loud warning at startup.
+    #[arg(long)]
+    no_sandbox: bool,
+
+    /// Path to the `brokkr-sandboxd` runner binary. Defaults to a
+    /// lookup adjacent to the worker binary, then `$PATH`.
+    #[arg(long)]
+    sandbox_runner: Option<PathBuf>,
+
+    /// Per-action cgroup parent. Typically
+    /// `/sys/fs/cgroup/brokkr.slice` (created by
+    /// `scripts/install-cgroup-slice.sh`) or a systemd-delegated
+    /// slice. When omitted, the sandbox runs without resource limits
+    /// or accounting.
+    #[arg(long)]
+    sandbox_cgroup_root: Option<PathBuf>,
+
+    /// Default per-action wall-clock timeout, in seconds. Per-action
+    /// `Platform` properties may override this in a later milestone.
+    #[arg(long)]
+    sandbox_wall_clock_secs: Option<u64>,
+
+    /// Default per-action memory cap, in bytes. `0` = unlimited.
+    #[arg(long)]
+    sandbox_memory_bytes: Option<u64>,
+
+    /// Default per-action `pids.max`. `0` = unlimited.
+    #[arg(long)]
+    sandbox_pids_max: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -49,11 +83,59 @@ fn main() -> ExitCode {
 }
 
 async fn run_daemon(args: Args) -> Result<()> {
+    let runner = build_runner(&args)?;
     let cfg = WorkerConfig {
         control_endpoint: args.control,
         hostname: hostname_or("worker".to_string()),
+        runner,
     };
     run_worker(cfg).await
+}
+
+fn build_runner(args: &Args) -> Result<Runner> {
+    if args.no_sandbox {
+        tracing::warn!(
+            "starting with --no-sandbox: actions will run as plain host \
+             processes with no isolation. This is Phase 1 parity and is \
+             intended for development only."
+        );
+        return Ok(Runner::Plain);
+    }
+
+    // Probe the host before doing anything else; surface a useful
+    // error so deployers know to run `scripts/install-cgroup-slice.sh`
+    // or check `brokkr-worker --check-host`.
+    let report = host_check::run();
+    if !report.is_functional() {
+        return Err(anyhow!(
+            "brokkr-worker: host is not sandbox-capable. Run \
+             `brokkr-worker --check-host` for details, or pass \
+             `--no-sandbox` to bypass the sandbox (Phase 1 fallback)."
+        ));
+    }
+
+    let sandbox = match &args.sandbox_runner {
+        Some(path) => Sandbox::new(path),
+        None => Sandbox::with_default_runner()
+            .map_err(|e| anyhow!("locating brokkr-sandboxd runner: {e}"))?,
+    };
+    let sandbox = match &args.sandbox_cgroup_root {
+        Some(root) => sandbox.with_cgroup_root(root),
+        None => sandbox,
+    };
+
+    let mut template = SandboxTemplate::brokkr_default();
+    template.limits = ResourceLimits {
+        wall_clock_secs: args.sandbox_wall_clock_secs,
+        memory_bytes: args.sandbox_memory_bytes.filter(|n| *n != 0),
+        pids_max: args.sandbox_pids_max.filter(|n| *n != 0),
+        ..Default::default()
+    };
+
+    Ok(Runner::Sandboxed(Box::new(SandboxRunner {
+        sandbox,
+        template,
+    })))
 }
 
 fn run_check_host() -> ExitCode {
