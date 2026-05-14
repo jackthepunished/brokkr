@@ -367,17 +367,17 @@ fn syscall_nr(name: &str) -> Option<i64> {
 fn host_target_arch() -> io::Result<TargetArch> {
     #[cfg(target_arch = "x86_64")]
     {
-        return Ok(TargetArch::x86_64);
+        Ok(TargetArch::x86_64)
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return Ok(TargetArch::aarch64);
+        Ok(TargetArch::aarch64)
     }
 
     #[cfg(target_arch = "riscv64")]
     {
-        return Ok(TargetArch::riscv64);
+        Ok(TargetArch::riscv64)
     }
 
     #[cfg(not(any(
