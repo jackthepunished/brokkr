@@ -304,7 +304,7 @@ async fn ev_ioctl_tiocgwinsz_blocked() {
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
          fd = libc.open(b'/dev/null', 0)\n\
          if fd == -1:\n\
-         \x20   sys.exit(0)\n\
+         \x20   sys.exit(2)\n\
          rc = libc.ioctl(fd, 0x5413, 0)\n\
          libc.close(fd)\n\
          if rc == -1:\n\
@@ -333,10 +333,10 @@ async fn ev_ioctl_tiocsti_blocked() {
     // TIOCSTI = 0x5412 — simulate terminal input; dangerous
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
-         # open /dev/null as a stand-in fd
+         # open /dev/null — a harmless fd for testing the ioctl call
          fd = libc.open(b'/dev/null', 0)\n\
          if fd == -1:\n\
-         \x20   sys.exit(0)\n\
+         \x20   sys.exit(2)\n\
          rc = libc.ioctl(fd, 0x5412, 0)\n\
          libc.close(fd)\n\
          if rc == -1:\n\
@@ -353,6 +353,68 @@ async fn ev_ioctl_tiocsti_blocked() {
         outcome.exit_status,
         ExitStatus::Exited(EPERM),
         "ioctl(TIOCSTI) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — ioctl(TIOCSWINSZ) blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_ioctl_tiocswinsz_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // TIOCSWINSZ = 0x5414 — set terminal window size
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         fd = libc.open(b'/dev/null', 0)\n\
+         if fd == -1:\n\
+         \x20   sys.exit(2)\n\
+         rc = libc.ioctl(fd, 0x5414, 0)\n\
+         libc.close(fd)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "ioctl(TIOCSWINSZ) should EPERM under seccomp; stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// EV — ioctl(TIOCSPTLCK) blocked by seccomp argument filter.
+#[tokio::test]
+async fn ev_ioctl_tiocptlck_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // TIOCSPTLCK = 0x4D60 — unlock pseudo-terminal device lock
+    let script = "import ctypes, sys\n\
+         libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
+         fd = libc.open(b'/dev/null', 0)\n\
+         if fd == -1:\n\
+         \x20   sys.exit(2)\n\
+         rc = libc.ioctl(fd, 0x4D60, 0)\n\
+         libc.close(fd)\n\
+         if rc == -1:\n\
+         \x20   sys.exit(ctypes.get_errno())\n\
+         sys.exit(1)\n";
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Exited(EPERM),
+        "ioctl(TIOCSPTLCK) should EPERM under seccomp; stderr={}",
         String::from_utf8_lossy(&outcome.stderr)
     );
 }

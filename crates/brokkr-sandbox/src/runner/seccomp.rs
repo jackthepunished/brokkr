@@ -496,7 +496,10 @@ fn prctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid prctl rule"),
-        // Block: PR_GET_TSC (11) — query side-channel control
+        // Block: PR_GET_TSC (11) — query CPU timestamp-config state.
+        // Even a read-only query is blocked because observing whether
+        // PR_SET_TSC was previously enabled could aid a timing
+        // side-channel attack (the value encodes CPU frequency state).
         SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,

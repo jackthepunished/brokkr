@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   syscall allowlist (absent on aarch64). Tests for
   `ev09_prctl_set_tsc_blocked`, `ev_prctl_keepcaps_blocked`,
   `ev_prctl_capbset_drop_blocked`, `ev_prctl_get_tsc_blocked`,
-  `ev_ioctl_tiocsti_blocked`, and `ev_ioctl_tiocgwinsz_blocked`.
+  `ev_ioctl_tiocsti_blocked`, `ev_ioctl_tiocgwinsz_blocked`,
+  `ev_ioctl_tiocswinsz_blocked`, and `ev_ioctl_tiocptlck_blocked`.
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
