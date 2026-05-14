@@ -365,15 +365,36 @@ fn syscall_nr(name: &str) -> Option<i64> {
     None
 }
 
-/// Map `std::env::consts::ARCH` to seccompiler's `TargetArch`.
+/// Map the compiled target architecture to seccompiler's `TargetArch`.
+///
+/// This is selected with `cfg(target_arch)` rather than a runtime string
+/// match so seccomp follows the architecture the binary was built for.
 fn host_target_arch() -> io::Result<TargetArch> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok(TargetArch::x86_64),
-        "aarch64" => Ok(TargetArch::aarch64),
-        other => Err(io::Error::new(
+    #[cfg(target_arch = "x86_64")]
+    {
+        return Ok(TargetArch::x86_64);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Ok(TargetArch::aarch64);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        return Ok(TargetArch::riscv64);
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    {
+        Err(io::Error::new(
             ErrorKind::Unsupported,
-            format!("seccomp: unsupported arch {other}"),
-        )),
+            format!("seccomp: unsupported arch {}", std::env::consts::ARCH),
+        ))
     }
 }
 
