@@ -344,3 +344,125 @@ debrief.
   This is what trait default methods are for; I'd
   forgotten how much friction-free trait extension Rust
   gives you for free.
+
+## M5b — `feat/phase3-peer-repair`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `brokkr-cas::peer::repair_node(pool, topology,
+  target)` reconciles one target node's local digest set with
+  what HRW says it should hold: scans the universe of digests
+  across all reachable replicas, picks the subset HRW assigns
+  to the target, and pulls bytes from peers for any the target
+  is missing. `repair_cluster` runs `repair_node` against
+  every node. Five unit tests verify no-op idempotency, lost-
+  blob restoration, HRW-aware target filtering, and the
+  every-replica-lost edge case.
+
+### Decisions
+
+- **Take a `ReplicaPool`, not a gRPC client.** Same separation
+  as M4: peer repair is logic + state, not transport. Tests
+  use `StaticPool<InMemoryCas>` and run in-process. A future
+  milestone will provide a gRPC pool with `CasPeer`
+  clients per node.
+- **`repair_node` is a one-shot primitive.** No daemon loop,
+  no periodic scheduler. The control-plane daemon that runs
+  repair on cluster events (member join, heartbeat-fail
+  recovery) lives in a later milestone alongside the GC
+  daemon. Both want the same scheduling story.
+- **Universe = union of all replicas' `list_digests`.** A real
+  cluster would discover the target's expected digest set via
+  a bloom-filter gossip or a peer-enumeration RPC; the in-
+  process pool just enumerates everything for now. The
+  bloom-gossip variant is its own sub-milestone.
+- **Primary-first peer ordering for pulls.** When the target
+  is missing a blob, we try peers in ring-order — the primary
+  is most likely to have the freshest copy. The HRW ordering
+  is already consistent across the cluster, so no extra state
+  is needed.
+- **Don't repeat the write quorum from M4.** Repair writes
+  through `target_cas.batch_update_blobs(...)` directly — no
+  fan-out. The blob is going to *one* node by definition; the
+  M4 quorum write semantics don't apply.
+
+### What surprised me
+
+- **Two test bugs caught by clippy, not by tests:** the
+  unused `bytes::Bytes` import (after I removed an inline
+  helper) and an `.expect(...)` call I'd forgotten about. The
+  workspace `expect_used = "deny"` rule is one of the
+  unobtrusive forcing functions that keeps library code clean
+  — production paths can't silently expect-panic, and tests
+  have to explicitly opt out per-module.
+- **"Every replica lost the blob" is an interesting case.**
+  My intuition was that `unrepairable` would have one entry
+  in that scenario. Actually no: the blob has been deleted
+  from every node that ever held it, so it's not in the
+  `universe` we scanned, so it doesn't show up at all. The
+  report is "0 repairs, 0 unrepairable", and the test asserts
+  exactly that. The data is *gone* — repair can't invent
+  bytes from thin air; that's a real under-replication that
+  cold-tier S3 backfill (M3b) is supposed to catch.
+- **`repair_cluster` doesn't need to be smart.** Running
+  `repair_node` against every node sequentially is O(N²) in
+  blob-set lookups, but on small clusters (single-digit nodes)
+  it's milliseconds. A future iteration can parallelise — the
+  per-node repair passes don't share state, so it's an
+  obvious `join_all` candidate. Deferred until N grows.
+
+## M6a — `feat/phase3-tree-materialization`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `brokkr-cas::tree::materialize_tree(cas,
+  root_digest, target_dir)` walks a REAPI Directory Merkle DAG
+  and writes a faithful copy to disk: files, subdirectories,
+  symlinks, executable bits. Symmetric helper
+  `build_tree_into(cas, source_dir)` packs a directory tree
+  into CAS for round-trip tests. Six unit tests. Foundation
+  for the M6b FUSE filesystem.
+
+### Decisions
+
+- **Pre-FUSE eager materialisation.** A worker can use this
+  today on Phase 3 clusters: stage the input tree to a tmpfs
+  workdir, run the action, tear down. The plan says FUSE is
+  what scales to multi-GiB inputs that the action only
+  partially reads, but a worker that always uses the whole
+  input gets nothing extra from FUSE — eager copy is simpler
+  and the disk write is one-shot.
+- **Recursion via `Box::pin` futures.** `async fn` can't be
+  directly recursive in stable Rust; the alternative is an
+  explicit work-stack with a queue + visited set. Boxed
+  recursion is more code-readable and the tree depth is small
+  enough that the heap allocations are negligible. Documented
+  in the source.
+- **`build_tree_into` is `pub`, not `#[cfg(test)]`.** The
+  helper is useful in integration tests across the workspace
+  and in the future worker upload path. Marked as
+  "internal-but-stable-shaped" in the rustdoc so readers know
+  it's not part of the externally-supported API.
+- **`CasError::Other(String)` is a new catch-all.** Tree
+  walks raise it on proto decode / malformed-digest errors —
+  shapes that don't fit `NotFound`/`Io`/`Redb`. Resisted the
+  urge to make a specific `Tree` variant; the error category
+  is "data didn't decode cleanly" and that's a thing every
+  future CAS-adjacent module will hit.
+
+### What surprised me
+
+- **`std::os::unix::fs::PermissionsExt` is feature-free on
+  Linux.** I expected to need an extra dep for `mode()`; the
+  std prelude has it under `os::unix::fs` already. Same on the
+  symlink side via `os::unix::fs::symlink`.
+- **The recursion-via-`Box::pin` trick is two lines.** I'd
+  seen it before but always reached for the work-stack first.
+  This is the cleaner shape for a true tree walk; the work
+  stack is only worth it for graphs (where cycle detection
+  matters).
+- **`std::fs::write` already opens with `O_TRUNC` if the file
+  exists.** Materialisation into an existing directory just
+  works — we don't have to pre-clean. (Phase 3 still doesn't
+  remove the target directory; the worker manages its
+  workspace lifecycle.)
