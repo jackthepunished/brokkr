@@ -237,3 +237,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prctl filter, both deferred). Tests skip cleanly when the host
   cannot open an unprivileged user namespace, mirroring
   `mount_ns.rs` / `net_ns.rs`.
+- M8 (determinism): `runner/determinism.rs` applies the
+  hostname/symlink half pre-fork (after the rootfs is built and
+  inside the new UTS namespace) and scrubs the action's env
+  pre-exec. `apply_pre_fork` calls `sethostname(2)` (when
+  `DeterminismPolicy.hostname` is set) and symlinks
+  `/etc/localtime` → `/usr/share/zoneinfo/Etc/UTC` when
+  `timezone_utc` is set; `scrub_env` filters `LD_PRELOAD` /
+  `LD_LIBRARY_PATH` (`strip_ld_preload`), replaces `PATH` with
+  `/usr/bin:/bin` (`strip_path`), and upserts `TZ=UTC0` /
+  `SOURCE_DATE_EPOCH` when their knobs are set.
+- M8: `unshare` flags extended with `CLONE_NEWUTS` so
+  `sethostname(2)` only affects the sandbox; required adding the
+  `hostname` feature to the workspace `nix` dependency.
+- M8: `DeterminismPolicy::brokkr_defaults()` — the policy the
+  worker applies by default (hostname `brokkr-sandbox`, UTC
+  timezone, LD_PRELOAD stripped, PATH replaced; SOURCE_DATE_EPOCH
+  left for per-action override).
+- `brokkr-sandbox/tests/determinism.rs` — five M8 tests:
+  hostname is the configured value, EV-11 (`LD_PRELOAD` stripped
+  before the action sees the env), `TZ` set to `UTC0`,
+  `SOURCE_DATE_EPOCH` injected, and AC-04 (two identical runs
+  produce byte-identical stdout under `brokkr_defaults`). Same
+  unprivileged-userns skip policy as the other namespace-path
+  evil tests.

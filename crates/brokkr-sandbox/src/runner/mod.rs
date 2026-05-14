@@ -28,6 +28,8 @@
 #[cfg(target_os = "linux")]
 mod caps;
 #[cfg(target_os = "linux")]
+mod determinism;
+#[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
 mod mount;

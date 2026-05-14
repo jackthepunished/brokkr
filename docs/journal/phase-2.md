@@ -402,3 +402,69 @@ debrief.
   without compiling a helper binary. We already depend on
   `python3` for the M5/M6 tests, so the EV-02/03/04 tests reuse
   the same skip macro and get errno via `ctypes.get_errno()`.
+
+## M8 — `feat/phase2-determinism`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `DeterminismPolicy` is no longer just an IPC payload —
+  the runner honours it. `apply_pre_fork` calls `sethostname(2)`
+  inside a new UTS namespace (added to the existing `unshare` mask)
+  and symlinks `/etc/localtime` → `Etc/UTC`; `scrub_env` filters
+  `LD_PRELOAD` / `LD_LIBRARY_PATH`, replaces `PATH`, and upserts
+  `TZ` / `SOURCE_DATE_EPOCH`. `DeterminismPolicy::brokkr_defaults()`
+  encodes the worker's default policy. Five new tests
+  (`determinism.rs`) cover hostname, EV-11 (LD_PRELOAD stripped),
+  TZ, SOURCE_DATE_EPOCH, and AC-04-ish byte-identical repeatability.
+  EV-12 (wall-clock timeout) was already exercised by the M6 cgroup
+  tests, so M8 doesn't re-add it.
+
+### Decisions
+
+- **Pre-fork vs pre-exec split.** Hostname and `/etc/localtime`
+  need the namespace path: a new UTS namespace plus a writable
+  tmpfs `/etc`. They live in the runner-as-PID-1-init, after
+  `setup_rootfs` and `apply_network_policy`, before the first
+  `fork`. Env scrubbing is pure data manipulation, so it runs on
+  *both* the namespace path and the M2 no-isolation path — it's
+  the only part of the determinism work that's useful without
+  namespaces. Keeping the two halves in the same module made the
+  ordering obvious.
+- **`TZ=UTC0`, not `TZ=UTC`.** POSIX-style time zone strings need
+  the offset suffix; `TZ=UTC` works on glibc but not on musl /
+  busybox. `UTC0` is portable.
+- **Empty hostname is `None`.** Users can pass `Some("")` from
+  config and reasonably expect "don't change the hostname"; the
+  runner treats it like `None` instead of calling `sethostname("")`
+  (which glibc errors on with EINVAL).
+- **Worker default knobs centralised in `brokkr_defaults`.** The
+  policy lives in `brokkr-sandbox::DeterminismPolicy` rather than
+  `brokkr-worker`. Reason: the sandbox crate owns the schema; the
+  worker's default is just one concrete instantiation of that
+  schema. Putting it on the type keeps the field set and the
+  default in one place.
+
+### What surprised me
+
+- **`nix::unistd::sethostname` is feature-gated.** Needed to add
+  `hostname` to the workspace `nix` features (it's separate from
+  `process` and `user`). Discovered via a "no function in scope"
+  error, not a "missing module" error — same flavour of mistake
+  as M4's `signal::raise` (which lives under the `signal`
+  feature). The pattern is: every nix submodule that touches a
+  capability-gated syscall lives behind its own cargo feature.
+- **`/etc/localtime` is best-effort.** The tmpfs `/etc` only
+  exists on the namespace path. If a worker ever skips
+  `RootfsSpec` while keeping `timezone_utc=true`, the
+  `apply_pre_fork` won't run at all and the symlink is never
+  created. Decision: don't try to be clever — the env scrubber
+  injects `TZ=UTC0` regardless, and glibc's fallback path
+  (consult `TZ` when `/etc/localtime` is missing) is the right
+  behaviour anyway. Documented in the module-level rustdoc.
+- **Determinism vs M2 backwards compatibility.** Every previous
+  milestone introduced a knob with `Default::default()` falling
+  back to "off". M8 keeps that contract: a default
+  `DeterminismPolicy` is a pure passthrough — no scrubbing, no
+  hostname change, no env injection. The worker has to explicitly
+  pick `brokkr_defaults()` to get the locked-down behaviour. Means
+  every existing test still passes without touching its config.
