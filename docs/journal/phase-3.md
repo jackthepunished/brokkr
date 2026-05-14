@@ -410,3 +410,59 @@ debrief.
   it's milliseconds. A future iteration can parallelise — the
   per-node repair passes don't share state, so it's an
   obvious `join_all` candidate. Deferred until N grows.
+
+## M6a — `feat/phase3-tree-materialization`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `brokkr-cas::tree::materialize_tree(cas,
+  root_digest, target_dir)` walks a REAPI Directory Merkle DAG
+  and writes a faithful copy to disk: files, subdirectories,
+  symlinks, executable bits. Symmetric helper
+  `build_tree_into(cas, source_dir)` packs a directory tree
+  into CAS for round-trip tests. Six unit tests. Foundation
+  for the M6b FUSE filesystem.
+
+### Decisions
+
+- **Pre-FUSE eager materialisation.** A worker can use this
+  today on Phase 3 clusters: stage the input tree to a tmpfs
+  workdir, run the action, tear down. The plan says FUSE is
+  what scales to multi-GiB inputs that the action only
+  partially reads, but a worker that always uses the whole
+  input gets nothing extra from FUSE — eager copy is simpler
+  and the disk write is one-shot.
+- **Recursion via `Box::pin` futures.** `async fn` can't be
+  directly recursive in stable Rust; the alternative is an
+  explicit work-stack with a queue + visited set. Boxed
+  recursion is more code-readable and the tree depth is small
+  enough that the heap allocations are negligible. Documented
+  in the source.
+- **`build_tree_into` is `pub`, not `#[cfg(test)]`.** The
+  helper is useful in integration tests across the workspace
+  and in the future worker upload path. Marked as
+  "internal-but-stable-shaped" in the rustdoc so readers know
+  it's not part of the externally-supported API.
+- **`CasError::Other(String)` is a new catch-all.** Tree
+  walks raise it on proto decode / malformed-digest errors —
+  shapes that don't fit `NotFound`/`Io`/`Redb`. Resisted the
+  urge to make a specific `Tree` variant; the error category
+  is "data didn't decode cleanly" and that's a thing every
+  future CAS-adjacent module will hit.
+
+### What surprised me
+
+- **`std::os::unix::fs::PermissionsExt` is feature-free on
+  Linux.** I expected to need an extra dep for `mode()`; the
+  std prelude has it under `os::unix::fs` already. Same on the
+  symlink side via `os::unix::fs::symlink`.
+- **The recursion-via-`Box::pin` trick is two lines.** I'd
+  seen it before but always reached for the work-stack first.
+  This is the cleaner shape for a true tree walk; the work
+  stack is only worth it for graphs (where cycle detection
+  matters).
+- **`std::fs::write` already opens with `O_TRUNC` if the file
+  exists.** Materialisation into an existing directory just
+  works — we don't have to pre-clean. (Phase 3 still doesn't
+  remove the target directory; the worker manages its
+  workspace lifecycle.)

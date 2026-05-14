@@ -406,3 +406,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   milestone will wrap a gRPC pool (`CasPeer` clients) for
   cross-process repair. The daemon loop / scheduler is also
   deferred — `repair_node` is a one-shot primitive.
+- M6a: `brokkr-cas::tree::materialize_tree(cas, root_digest,
+  target_dir)` walks a REAPI Directory Merkle DAG and writes a
+  faithful copy of the input tree to disk. Files are fetched
+  from CAS lazily during the walk; symlinks become real
+  symlinks; the Unix executable bit is honoured. Returns
+  `MaterializationStats { files, dirs, symlinks, bytes }`.
+- M6a: `build_tree_into(cas, source_dir)` — symmetric helper
+  that packs a local directory tree into CAS (one `Directory`
+  per actual directory, one blob per actual file) and returns
+  the root digest. Used by the round-trip tests and useful for
+  workers that want to upload their workspace.
+- M6a: six unit tests cover empty trees, flat files, nested
+  trees, executable-bit preservation, symlink preservation, and
+  NotFound propagation on a bogus root digest.
+- M6a: `CasError::Other(String)` variant for non-`Io`/non-`Redb`
+  failures (proto decode, malformed tree entries). The tree
+  module raises it on encode/decode errors.
+- FUSE-based lazy materialisation deferred to M6b. M6a is the
+  pre-FUSE foundation: workers can use it today on Phase 3
+  clusters; M6b will replace it with a FUSE filesystem so trees
+  bigger than RAM mount in ~ms without copying every byte.
