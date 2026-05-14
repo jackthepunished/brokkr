@@ -466,11 +466,10 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
 /// Dangerous options are blocked (EPERM); safe options are allowed.
 /// A catch-all allow rule terminates the chain for anything not explicitly
 /// blocked.
+#[allow(clippy::expect_used, clippy::vec_init_then_push)]
 fn prctl_rules() -> Vec<SeccompRule> {
-    let mut rules = Vec::new();
-
-    // Block: PR_SET_KEEPCAPS (31) — allows setuid binaries to retain caps
-    rules.push(
+    vec![
+        // Block: PR_SET_KEEPCAPS (31) — allows setuid binaries to retain caps
         SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -479,10 +478,7 @@ fn prctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid prctl rule"),
-    );
-
-    // Block: PR_CAPBSET_DROP (36) — permanently removes caps from process
-    rules.push(
+        // Block: PR_CAPBSET_DROP (36) — permanently removes caps from process
         SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -491,10 +487,7 @@ fn prctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid prctl rule"),
-    );
-
-    // Block: PR_SET_TSC (10) — enables timing side-channel (RDTSC) control
-    rules.push(
+        // Block: PR_SET_TSC (10) — enables timing side-channel (RDTSC) control
         SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -503,10 +496,7 @@ fn prctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid prctl rule"),
-    );
-
-    // Block: PR_GET_TSC (11) — query side-channel control
-    rules.push(
+        // Block: PR_GET_TSC (11) — query side-channel control
         SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -515,10 +505,7 @@ fn prctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid prctl rule"),
-    );
-
-    // Catch-all allow: anything not explicitly blocked above is permitted.
-    rules.push(
+        // Catch-all allow: anything not explicitly blocked above is permitted.
         SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -527,9 +514,7 @@ fn prctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid prctl rule"),
-    );
-
-    rules
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -540,11 +525,10 @@ fn prctl_rules() -> Vec<SeccompRule> {
 ///
 /// The request code is in `arg1` (arg0 is the file descriptor).
 /// Terminal/device-manipulation calls are blocked; all others are allowed.
+#[allow(clippy::expect_used, clippy::vec_init_then_push)]
 fn ioctl_rules() -> Vec<SeccompRule> {
-    let mut rules = Vec::new();
-
-    // Block TIOCSTI (0x5412) — simulates terminal input
-    rules.push(
+    vec![
+        // Block TIOCSTI (0x5412) — simulates terminal input
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -553,10 +537,7 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    // Block TIOCSWINSZ (0x5414) — set terminal window size
-    rules.push(
+        // Block TIOCSWINSZ (0x5414) — set terminal window size
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -565,10 +546,7 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    // Block TIOCGWINSZ (0x5413) — get terminal window size (info leak)
-    rules.push(
+        // Block TIOCGWINSZ (0x5413) — get terminal window size (info leak)
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -577,10 +555,7 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    // Block TIOCSBRK (0x5429) — set break condition on terminal
-    rules.push(
+        // Block TIOCSBRK (0x5429) — set break condition on terminal
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -589,10 +564,7 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    // Block TIOCCBRK (0x542A) — clear break condition
-    rules.push(
+        // Block TIOCCBRK (0x542A) — clear break condition
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -601,10 +573,7 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    // Block TIOCSPTLCK (0x4D60) — unlock pseudo-terminal device lock
-    rules.push(
+        // Block TIOCSPTLCK (0x4D60) — unlock pseudo-terminal device lock
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -613,14 +582,10 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    // Note: TIOCGSID (0x5429) has the same value as TIOCSBRK on x86_64/aarch64,
-    // so it is already blocked by the TIOCSBRK rule above.
-
-    // Catch-all allow: any ioctl request not explicitly blocked above is
-    // permitted. MaskedEq(0) on arg1 always matches.
-    rules.push(
+        // Note: TIOCGSID (0x5429) has the same value as TIOCSBRK on x86_64/aarch64,
+        // so it is already blocked by the TIOCSBRK rule above.
+        // Catch-all allow: any ioctl request not explicitly blocked above is
+        // permitted. MaskedEq(0) on arg1 always matches.
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -629,9 +594,7 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-    );
-
-    rules
+    ]
 }
 
 /// Install a default-deny seccomp filter on the calling thread.
