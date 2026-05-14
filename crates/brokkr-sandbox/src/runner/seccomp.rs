@@ -534,10 +534,8 @@ fn ioctl_rules() -> Vec<SeccompRule> {
     // Block TIOCSPTLCK (0x4D60) — unlock pseudo-terminal device lock
     rules.push(SeccompRule::new([(1, arg1, eq, 0x4D60)]));
 
-    // Block TIOCGSID (0x5429) — get session ID of terminal (info leak)
-    // Note: same value as TIOCSBRK on some archs; check arch-specific if needed.
-    // Using a MaskedEq to detect any tiocsid variant on the low 16 bits.
-    rules.push(SeccompRule::new([(1, arg1, eq, 0x5429)]));
+    // Note: TIOCGSID (0x5429) has the same value as TIOCSBRK on x86_64/aarch64,
+    // so it is already blocked by the TIOCSBRK rule above.
 
     // Catch-all allow: any ioctl request not explicitly blocked above is
     // permitted. MaskedEq(0) on arg1 always matches.
