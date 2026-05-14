@@ -316,3 +316,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachability covers output files (the bulk of blob volume).
 - Retention window + atime tracking deferred to M5b; M5a deletes
   unreachable blobs immediately.
+- M5b: `brokkr-cas::peer::repair_node(pool, topology, target)` —
+  reconciles one target node's local digest set with what HRW
+  says it should hold. Scans the universe of digests across all
+  reachable replicas, computes HRW assignment for each, pulls
+  bytes from peers for any the target is missing. Returns a
+  `RepairReport` summarising `expected` / `already_present` /
+  `repaired` / `unrepairable`. `repair_cluster` runs
+  `repair_node` against every node.
+- M5b: Five unit tests on `peer` — no-op when cluster is
+  consistent, restore-a-lost-blob, target-doesn't-get-blobs-it-
+  shouldn't-hold (HRW-aware), every-replica-lost-it edge case,
+  and `repair_cluster` idempotency.
+- M5b: Repair is built on top of M4's `ReplicaPool` abstraction;
+  in-process tests use `StaticPool<InMemoryCas>`. A future
+  milestone will wrap a gRPC pool (`CasPeer` clients) for
+  cross-process repair. The daemon loop / scheduler is also
+  deferred — `repair_node` is a one-shot primitive.
