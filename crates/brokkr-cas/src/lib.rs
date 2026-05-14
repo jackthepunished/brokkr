@@ -19,6 +19,7 @@ pub mod ring;
 pub mod router;
 pub mod tiered;
 pub mod traits;
+pub mod tree;
 
 pub use action_cache::{ActionCache, RedbActionCache};
 pub use bloom::Bloom;
