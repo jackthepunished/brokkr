@@ -555,21 +555,21 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-        // Block TIOCSBRK (0x5429) — set break condition on terminal
+        // Block TIOCSBRK (0x5427) — set break condition on terminal
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
             SeccompCmpOp::Eq,
-            0x5429,
+            0x5427,
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-        // Block TIOCCBRK (0x542A) — clear break condition
+        // Block TIOCCBRK (0x5428) — clear break condition
         SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
             SeccompCmpOp::Eq,
-            0x542A,
+            0x5428,
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
@@ -582,8 +582,11 @@ fn ioctl_rules() -> Vec<SeccompRule> {
         )
         .expect("valid condition")])
         .expect("valid ioctl rule"),
-        // Note: TIOCGSID (0x5429) has the same value as TIOCSBRK on x86_64/aarch64,
-        // so it is already blocked by the TIOCSBRK rule above.
+        // Note: TIOCGSID (0x5429) is distinct from TIOCSBRK (0x5427) and
+        // TIOCCBRK (0x5428); it is not explicitly blocked here, but since
+        // the syscall's mismatch_action is Errno(EPERM), any ioctl request
+        // not explicitly matched above (including TIOCGSID) returns EPERM.
+        //
         // Catch-all allow: any ioctl request not explicitly blocked above is
         // permitted. MaskedEq(0) on arg1 always matches.
         SeccompRule::new(vec![SeccompCondition::new(

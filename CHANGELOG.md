@@ -23,9 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/journal/phase-0.md` — Phase 0 retrospective.
 - `brokkr-sandbox`: seccomp argument-level filtering for `prctl` and `ioctl`
   (blocks `PR_SET_KEEPCAPS`, `PR_CAPBSET_DROP`, `PR_SET_TSC`, `PR_GET_TSC`,
-  and terminal/device `ioctl` calls like `TIOCSTI`). Tests for
-  `ev09_prctl_set_tsc_blocked`, `ev_prctl_keepcaps_blocked`, and
-  `ev_ioctl_tiocsti_blocked`.
+  and terminal/device `ioctl` calls: `TIOCSTI`, `TIOCSWINSZ`, `TIOCGWINSZ`,
+  `TIOCSBRK`, `TIOCCBRK`, `TIOCSPTLCK`). `SYS_fadvise64` removed from the
+  syscall allowlist (absent on aarch64). Tests for
+  `ev09_prctl_set_tsc_blocked`, `ev_prctl_keepcaps_blocked`,
+  `ev_prctl_capbset_drop_blocked`, `ev_prctl_get_tsc_blocked`,
+  `ev_ioctl_tiocsti_blocked`, and `ev_ioctl_tiocgwinsz_blocked`.
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
