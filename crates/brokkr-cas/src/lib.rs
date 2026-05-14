@@ -10,6 +10,7 @@ pub mod action_cache;
 pub mod bloom;
 pub mod bloom_cas;
 pub mod error;
+pub mod gc;
 pub mod in_memory;
 pub mod redb_backend;
 pub mod replicated;
