@@ -365,3 +365,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topology fails closed.
 - `futures` workspace dep added to `brokkr-cas` for
   `future::join_all` on the replica fan-out.
+- M5a: `brokkr-cas::gc` — reference-counted GC for the CAS.
+  `plan(&cas, &action_cache)` walks every cached `ActionResult`,
+  extracts the digests inlined directly (output_files,
+  stdout/stderr, output_directories' tree / root digests), and
+  returns the set difference `local_digests − reachable` as the
+  candidate-deletion list. `sweep` runs `plan` and deletes every
+  unreachable digest; `sweep_with_plan` lets callers dry-run +
+  apply a custom retention filter between the two steps.
+- M5a: `Cas` trait gains `list_digests` and `delete_blob`
+  default-implemented as empty / no-op so non-GC test backends
+  still compile. `InMemoryCas` and `RedbCas` both override.
+  `ActionCache` trait gains `list_entries` (same pattern);
+  `RedbActionCache` overrides.
+- M5a: six unit tests on `gc` — direct-digest extraction (output
+  + stdout + stderr), malformed-proto skip, plan correctness on
+  a 2-blob CAS with one cached output, sweep deletes the right
+  set, empty action cache → everything unreachable, sweep
+  idempotency.
+- Transitive reachability (walking `Directory` Merkle DAGs) is
+  deferred to a later milestone — that walk requires CAS reads
+  and wants its own scheduling. M5a's non-transitive
+  reachability covers output files (the bulk of blob volume).
+- Retention window + atime tracking deferred to M5b; M5a deletes
+  unreachable blobs immediately.

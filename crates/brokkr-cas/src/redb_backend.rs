@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use brokkr_common::Digest;
 use bytes::Bytes;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::error::CasError;
 use crate::traits::{Cas, UpdateResult};
@@ -103,6 +103,48 @@ impl Cas for RedbCas {
                 });
             }
             Ok(out)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    async fn list_digests(&self) -> Result<Vec<Digest>, CasError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<Digest>, CasError> {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(BLOBS)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                // redb stores `&str` keys as hex; the value's length
+                // is the blob size. Rebuild the Digest from those.
+                let hash = key.value().to_string();
+                let size = value.value().len() as i64;
+                if let Ok(d) = Digest::new(hash, size) {
+                    out.push(d);
+                }
+                // Malformed keys are impossible by construction
+                // (we only insert via Digest::hash()), so a bad
+                // entry would be a redb corruption — silently skip
+                // rather than abort the whole sweep.
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), CasError> {
+        let db = self.db.clone();
+        let key = digest.hash().to_string();
+        tokio::task::spawn_blocking(move || -> Result<(), CasError> {
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(BLOBS)?;
+                table.remove(key.as_str())?;
+            }
+            txn.commit()?;
+            Ok(())
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?

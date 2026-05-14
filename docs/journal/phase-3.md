@@ -272,3 +272,75 @@ debrief.
   inside async fns); ended up with no lifetimes annotated.
   The Pin-Box-Future return type that `async_trait` desugars
   to handles it.
+
+## M5a — `feat/phase3-gc`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** Non-transitive GC primitive in
+  `brokkr-cas::gc`. `plan(&cas, &action_cache)` walks every
+  cached `ActionResult`, extracts the digests inlined directly
+  (`output_files`, `stdout_digest`, `stderr_digest`,
+  `output_directories.tree_digest`,
+  `output_directories.root_directory_digest`), and returns
+  `local − reachable` as the candidate-deletion set. `sweep`
+  runs the plan and deletes; `sweep_with_plan` lets callers
+  dry-run and apply a custom retention filter between the two
+  steps. `Cas` trait gains `list_digests` + `delete_blob`;
+  `ActionCache` gains `list_entries`. Six unit tests.
+
+### Decisions
+
+- **Non-transitive reachability for M5a.** The plan's full
+  reachability walk expands `Directory` protos transitively,
+  but that walk needs CAS reads (the `Directory` proto's bytes
+  are themselves in CAS) and wants its own scheduling. M5a
+  ships the cheap part — the output_files / stdout / stderr
+  digests inlined in `ActionResult` cover the bulk of blob
+  volume. Marking the doc-comments so a future milestone
+  knows what to add.
+- **Action digests are NOT reachable.** The action_cache's
+  redb table only stores the hash hex, not the encoded Action
+  proto's size — so reconstructing the original `Digest`
+  isn't possible without a schema change. Rather than fudge
+  the size (would mis-match what CAS stored), M5a treats
+  Action / Command / Directory protos as re-uploadable
+  inputs. Clients already re-upload them via
+  `FindMissingBlobs` on cache miss; GC'ing them is a perf hit,
+  not a correctness violation. Documented as M5b's job.
+- **Retention window deferred.** Atime tracking would require
+  schema changes to redb; doing it well needs background work
+  on the warm tier's metadata. M5a deletes unreachable blobs
+  immediately. Callers that want retention plumb their own
+  filter via `sweep_with_plan`.
+- **Default trait methods, not breaking changes.** The new
+  `Cas::list_digests` / `delete_blob` and
+  `ActionCache::list_entries` are added with default
+  implementations returning the empty case. Backends that
+  don't support enumeration (a hypothetical write-only stub)
+  keep compiling. `InMemoryCas` / `RedbCas` /
+  `RedbActionCache` all override with real implementations.
+- **Defer the CLI surface.** No `brokk admin gc` subcommand in
+  M5a. The control-plane daemon loop and admin RPC will land
+  in M5b alongside peer repair — they're both pieces of the
+  same "background cluster maintenance" story.
+
+### What surprised me
+
+- **REAPI's `output_file_symlinks` is deprecated.** clippy
+  flagged the field access; the v2.1 spec moved everything to
+  `output_symlinks`. Either way, symlinks are paths not
+  digests, so they're moot for GC — removed the loop and
+  documented why.
+- **`redb` table iteration is gated behind a trait that
+  isn't imported by default.** `ReadOnlyTable::iter()` exists
+  but it's a `ReadableTable` method; the compiler error
+  helpfully pointed at the missing import. Same pattern as
+  the M4 `futures::future::join_all` finding — the rustc
+  ecosystem's "use the trait" hint is reliably useful when
+  the right method is shadowed by the wrong scope.
+- **Default-implementing a trait method as `Ok(Vec::new())`
+  shipped backwards-compatibly with zero callers updated.**
+  This is what trait default methods are for; I'd
+  forgotten how much friction-free trait extension Rust
+  gives you for free.

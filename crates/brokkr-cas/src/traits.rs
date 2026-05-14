@@ -41,4 +41,28 @@ pub trait Cas: Send + Sync + 'static {
         &self,
         digests: &[Digest],
     ) -> Result<Vec<Result<Bytes, CasError>>, CasError>;
+
+    /// Enumerate every digest currently held in the CAS. Used by GC
+    /// (M5) to compute `unreachable = local - reachable`. Default
+    /// implementation returns the empty set so backends that don't
+    /// support enumeration (e.g. write-only stubs) still compile;
+    /// real backends override.
+    ///
+    /// Implementations should stream where possible — Phase 3 ships
+    /// the eager `Vec` shape because backends only hold thousands
+    /// of blobs locally; a future iteration may return an async
+    /// stream when the bloom rebuild or GC walk grows.
+    async fn list_digests(&self) -> Result<Vec<Digest>, CasError> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a single blob. `Ok(())` whether the blob was present
+    /// or not — `delete` is idempotent. Backends that genuinely
+    /// can't delete (cold-tier S3 in archive mode, say) should
+    /// return [`CasError::Unsupported`] (M5b will add this
+    /// variant). Default implementation returns `Ok(())` to keep
+    /// non-GC test backends compiling.
+    async fn delete_blob(&self, _digest: &Digest) -> Result<(), CasError> {
+        Ok(())
+    }
 }
