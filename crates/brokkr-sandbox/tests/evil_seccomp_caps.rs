@@ -10,9 +10,9 @@
 //!   is `#[ignore]`d on M7 — we'd need argument-level `prctl` filtering
 //!   (TODO marked in `runner/seccomp.rs`) plus `PR_SET_TSC=PR_TSC_SIGSEGV`
 //!   to make it deterministic.
-//! - **EV-10** the runner sets `PR_SET_NO_NEW_PRIVS`. We assert this two
-//!   ways: `prctl(PR_GET_NO_NEW_PRIVS)` returns 1, and `exec`-ing a
-//!   setuid-root binary (`/usr/bin/su`) does not escalate `geteuid()`.
+//! - **EV-10** the runner sets `PR_SET_NO_NEW_PRIVS`. We assert this via
+//!   `prctl(PR_GET_NO_NEW_PRIVS)`, which should return 1 inside the
+//!   sandboxed process.
 //! - **EV-14** `/proc/self/status` shows `CapEff: 0000000000000000`
 //!   (and CapPrm/CapBnd/CapInh likewise) after the runner drops caps.
 //!
