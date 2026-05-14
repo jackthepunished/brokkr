@@ -21,6 +21,11 @@ pub enum CasError {
     /// Underlying `redb` storage error.
     #[error("redb error: {0}")]
     Redb(String),
+
+    /// Catch-all for errors that don't fit the structured variants
+    /// (proto decode failures, malformed tree entries, etc.).
+    #[error("{0}")]
+    Other(String),
 }
 
 impl From<redb::Error> for CasError {
