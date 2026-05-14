@@ -22,7 +22,7 @@ use std::io::{self, ErrorKind};
 
 use nix::libc;
 use seccompiler::{
-    apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCondition, SeccompFilter,
+    apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompFilter,
     SeccompRule, TargetArch,
 };
 
