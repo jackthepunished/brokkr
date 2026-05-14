@@ -16,6 +16,7 @@ brokkr-common.workspace = true
 brokkr-proto.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 prost.workspace = true
 redb.workspace = true
 sha2.workspace = true

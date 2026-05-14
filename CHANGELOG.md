@@ -234,3 +234,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly from a hand-rolled `Topology`.
 - `tokio-stream` gains the `sync` feature on `brokkr-control` for
   `WatchStream`.
+- M2: `brokkr-cas::bloom::Bloom` — hand-rolled bloom filter sized
+  from `(expected_items, fp_rate)` via the standard formulas
+  (`m = ⌈-n·ln p / (ln 2)²⌉`, `k = ⌈(m/n)·ln 2⌉`). Hashes are
+  derived from the digest's existing sha256 via the
+  Kirsch–Mitzenmacher construction (`h_i = h1 + i·h2` mod m), so
+  insert/check is plain bit-ops without re-hashing. Seven unit
+  tests including an empirical false-positive-rate check (10k
+  members at p=0.01, 100k probes, rate < 2% asserted) and a
+  sizing-formula spot check (1M @ 1% → ~9.6 Mbits, k=7).
+- M2: `brokkr-cas::BloomCas<C: Cas>` — decorator wrapping any
+  `Cas` backend. `find_missing_blobs` partitions inputs into
+  bloom-says-missing vs. bloom-says-maybe; only the latter
+  consults the underlying backend. `batch_update_blobs`
+  delegates and inserts into the bloom on success.
+  `batch_read_blobs` delegates unchanged (the bloom doesn't help
+  reads). `rebuild_from` reseeds the filter from an authoritative
+  digest source for the periodic-rebuild path. Six tests.
+- No new direct deps — bloom is built from the existing
+  `sha2` and standard library.
+- M3a: `brokkr-cas::tiered::TieredCas<W: Cas>` — composes an
+  in-memory size-bounded LRU "hot" tier in front of any `Cas`
+  backend (typically `RedbCas`). Reads serve from hot on hit;
+  hot misses fall through to warm and promote on success. Writes
+  populate warm authoritatively and hot eagerly (workers
+  frequently re-read what they just wrote). `find_missing_blobs`
+  delegates straight to warm — hot is a cache, not authoritative.
+- M3a: Hand-rolled `HotTier` LRU. Byte-bounded (not entry-bounded
+  — blob sizes vary too widely for a count to be useful). Hash
+  map for O(1) lookups + intrusive doubly-linked-list of `usize`
+  indices into a node pool, with a free-list for evicted slots.
+  All safe Rust. Blobs larger than the whole capacity are not
+  cached (avoids evicting the entire tier for one outsized
+  insert). Zero capacity disables hot caching entirely (useful
+  for tests).
+- M3a: Eleven unit tests on `HotTier` + `TieredCas` covering
+  empty get, put/get round-trip, LRU eviction, MRU touch,
+  oversized-blob skip, zero-capacity bypass, hot warmup on
+  write, warm-to-hot promotion on read, find-missing delegation,
+  and rejection of failed writes from the cache.
+- Cold tier (OpenDAL S3) is deferred to M3b — a follow-up PR.
+- M4: `brokkr-cas::replicated::ReplicatedCas<P: ReplicaPool>` —
+  quorum-write + read-fan-out across the `R` replicas selected
+  by the rendezvous ring. Writes succeed at `⌈R/2⌉ + 1` acks;
+  reads try replicas primary-first and return the first
+  success. `find_missing_blobs` queries the primary (with
+  failover to the next replica if the primary is unreachable).
+- M4: `ReplicaPool` trait + `StaticPool` impl. The pool maps
+  `node_id → Arc<dyn Cas>`; a future milestone will provide a
+  gRPC-backed pool, but M4 ships the logic and tests in-process
+  against pools of `InMemoryCas` instances.
+- M4: Seven `ReplicatedCas` tests — write fan-out lands on
+  exactly R replicas, read serves from first-available, read
+  returns NotFound when no replica has the blob, quorum holds
+  on one-replica-down with R=3, quorum fails when only 1/2
+  reachable, find-missing returns authoritative answer, empty
+  topology fails closed.
+- `futures` workspace dep added to `brokkr-cas` for
+  `future::join_all` on the replica fan-out.
+- M5a: `brokkr-cas::gc` — reference-counted GC for the CAS.
+  `plan(&cas, &action_cache)` walks every cached `ActionResult`,
+  extracts the digests inlined directly (output_files,
+  stdout/stderr, output_directories' tree / root digests), and
+  returns the set difference `local_digests − reachable` as the
+  candidate-deletion list. `sweep` runs `plan` and deletes every
+  unreachable digest; `sweep_with_plan` lets callers dry-run +
+  apply a custom retention filter between the two steps.
+- M5a: `Cas` trait gains `list_digests` and `delete_blob`
+  default-implemented as empty / no-op so non-GC test backends
+  still compile. `InMemoryCas` and `RedbCas` both override.
+  `ActionCache` trait gains `list_entries` (same pattern);
+  `RedbActionCache` overrides.
+- M5a: six unit tests on `gc` — direct-digest extraction (output
+  + stdout + stderr), malformed-proto skip, plan correctness on
+  a 2-blob CAS with one cached output, sweep deletes the right
+  set, empty action cache → everything unreachable, sweep
+  idempotency.
+- Transitive reachability (walking `Directory` Merkle DAGs) is
+  deferred to a later milestone — that walk requires CAS reads
+  and wants its own scheduling. M5a's non-transitive
+  reachability covers output files (the bulk of blob volume).
+- Retention window + atime tracking deferred to M5b; M5a deletes
+  unreachable blobs immediately.
+- M5b: `brokkr-cas::peer::repair_node(pool, topology, target)` —
+  reconciles one target node's local digest set with what HRW
+  says it should hold. Scans the universe of digests across all
+  reachable replicas, computes HRW assignment for each, pulls
+  bytes from peers for any the target is missing. Returns a
+  `RepairReport` summarising `expected` / `already_present` /
+  `repaired` / `unrepairable`. `repair_cluster` runs
+  `repair_node` against every node.
+- M5b: Five unit tests on `peer` — no-op when cluster is
+  consistent, restore-a-lost-blob, target-doesn't-get-blobs-it-
+  shouldn't-hold (HRW-aware), every-replica-lost-it edge case,
+  and `repair_cluster` idempotency.
+- M5b: Repair is built on top of M4's `ReplicaPool` abstraction;
+  in-process tests use `StaticPool<InMemoryCas>`. A future
+  milestone will wrap a gRPC pool (`CasPeer` clients) for
+  cross-process repair. The daemon loop / scheduler is also
+  deferred — `repair_node` is a one-shot primitive.
+- M6a: `brokkr-cas::tree::materialize_tree(cas, root_digest,
+  target_dir)` walks a REAPI Directory Merkle DAG and writes a
+  faithful copy of the input tree to disk. Files are fetched
+  from CAS lazily during the walk; symlinks become real
+  symlinks; the Unix executable bit is honoured. Returns
+  `MaterializationStats { files, dirs, symlinks, bytes }`.
+- M6a: `build_tree_into(cas, source_dir)` — symmetric helper
+  that packs a local directory tree into CAS (one `Directory`
+  per actual directory, one blob per actual file) and returns
+  the root digest. Used by the round-trip tests and useful for
+  workers that want to upload their workspace.
+- M6a: six unit tests cover empty trees, flat files, nested
+  trees, executable-bit preservation, symlink preservation, and
+  NotFound propagation on a bogus root digest.
+- M6a: `CasError::Other(String)` variant for non-`Io`/non-`Redb`
+  failures (proto decode, malformed tree entries). The tree
+  module raises it on encode/decode errors.
+- FUSE-based lazy materialisation deferred to M6b. M6a is the
+  pre-FUSE foundation: workers can use it today on Phase 3
+  clusters; M6b will replace it with a FUSE filesystem so trees
+  bigger than RAM mount in ~ms without copying every byte.
