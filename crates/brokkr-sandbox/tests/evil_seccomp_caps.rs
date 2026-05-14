@@ -204,7 +204,7 @@ async fn ev10_no_new_privs_is_set() {
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
          val = libc.prctl(39, 0, 0, 0, 0)\n\
-         sys.exit(0 if val == 1 else (val if val >= 0 else 2))\n";
+         sys.exit(0 if val == 1 else (1 if val >= 0 else 2))\n";
     let cfg = SandboxConfig {
         argv: vec!["/usr/bin/python3".into(), "-c".into(), script.into()],
         rootfs: minimal_linux_rootfs(),
