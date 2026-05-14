@@ -6,10 +6,12 @@
 
 #![deny(missing_docs)]
 
+pub mod membership;
 pub mod scheduler;
 pub mod services;
 pub mod worker_service;
 
+pub use membership::{Membership, MembershipServiceImpl};
 pub use scheduler::Scheduler;
 pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
 pub use worker_service::WorkerServiceImpl;
