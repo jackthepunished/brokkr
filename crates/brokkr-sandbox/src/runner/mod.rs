@@ -9,15 +9,24 @@
 //!   tmpfs rootfs assembled from [`crate::RootfsSpec`].
 //! - **M4**: PID namespace + an init that reaps zombies and mirrors
 //!   the action's exit status.
-//! - **M5** (this milestone): network namespace; the runner lands in a
-//!   fresh empty netns by default, with optional `lo`-up via
+//! - **M5**: network namespace; the runner lands in a fresh empty
+//!   netns by default, with optional `lo`-up via
 //!   [`crate::NetworkPolicy::Loopback`].
-//! - **M6–M8**: cgroup / seccomp / capability / determinism.
+//! - **M6**: cgroup v2 limits + wall-clock timeout + OOM detection,
+//!   wired host-side around the runner.
+//! - **M7**: default-deny seccomp-bpf filter + capability drop +
+//!   `PR_SET_NO_NEW_PRIVS`. Capabilities are drained from all five
+//!   sets and `no_new_privs` is set first; the seccomp filter is
+//!   the last thing installed before `execve` so the action runs
+//!   under the locked-down policy (mismatch → `EPERM`).
+//! - **M8**: determinism knobs.
 //!
 //! [`run_as_runner`] returns `!`: it always ends in either `execve` or
 //! `_exit`. Errors before exec are written to stderr and exit with code
 //! 127, matching the convention of `sh: command not found`.
 
+#[cfg(target_os = "linux")]
+mod caps;
 #[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
@@ -26,6 +35,8 @@ mod mount;
 mod netns;
 #[cfg(target_os = "linux")]
 mod pidns;
+#[cfg(target_os = "linux")]
+mod seccomp;
 #[cfg(target_os = "linux")]
 mod userns;
 

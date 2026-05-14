@@ -319,3 +319,86 @@ debrief.
   stdout/stderr off, spawn drains, wait separately) is exactly
   what `wait_with_output` does internally — we just had to inline
   it to keep a `&mut Child` for `kill()`.
+
+## M7 — `feat/phase2-seccomp-and-caps`
+
+- **Date:** 2026-05-10
+- **PR:** _(filled in after merge)_
+- **Outcome:** The runner now drops every capability not listed in
+  `SandboxConfig.retained_caps` (default: drop them all) across the
+  Bounding / Permitted / Effective / Inheritable / Ambient sets,
+  flips `PR_SET_NO_NEW_PRIVS=1`, and installs a default-deny
+  seccomp-bpf filter as the very last thing before `execve`. The
+  filter mismatch action is `EPERM` rather than SIGSYS, on the
+  premise that giving the action's libc a chance to surface a
+  diagnostic is worth more than the marginally stronger guarantee
+  of an instant kill. Five new evil tests (EV-02 mount, EV-03
+  keyctl, EV-04 ptrace, EV-10 NO_NEW_PRIVS, EV-14 CapEff zeroed)
+  pass on a stock Ubuntu/WSL2 kernel. EV-09 (RDTSC) is `#[ignore]`d
+  pending a `PR_SET_TSC` integration plus argument-level filtering
+  for `prctl` — seccomp alone can't gate userland-only instructions.
+
+### Decisions
+
+- **Hardening is gated on the namespace path.** When
+  `RootfsSpec::is_empty()`, we run the action with no isolation
+  (the M2 contract). On that path the runner doesn't have a user
+  namespace, so it doesn't have `CAP_SETPCAP`, so
+  `PR_CAPBSET_DROP` would EPERM out of the gate. Putting the
+  hardening behind the same gate as the rest of the namespace
+  setup keeps the M2 smoke / cgroup-only tests working without
+  having to teach them about caps. M2 callers that want
+  hardening should opt into a non-empty rootfs.
+- **Capset order: Effective → Permitted → Inheritable.** The
+  obvious order (Inheritable first) blew up immediately on the
+  M3 mount-namespace tests with `capset failure: EPERM`. Reading
+  the kernel source: `capset(2)` revalidates the *whole*
+  capability vector on every call, and rejects any state where
+  the new Effective isn't a subset of the new Permitted. Drop
+  Effective first (always legal — it can only shrink), and the
+  later shrinks of Permitted/Inheritable each see a vacuously
+  consistent vector. The first version in commit `d41c3ea` had
+  this wrong; the integration commit fixes the order with a
+  comment explaining why.
+- **No SIGSYS.** seccompiler can be configured to send SIGSYS on
+  mismatch, which aborts the action immediately with a
+  distinctive signal number. Tempting, but it makes "what
+  syscall did the action run that I forgot to allowlist?"
+  enormously harder to debug because there's no errno trail in
+  stderr. EPERM lets glibc's wrapper turn the failure into a
+  recognisable error string — at the cost that an attacker
+  knows the syscall was *seen and refused* rather than killed,
+  which is a fine trade-off for a build sandbox.
+- **The allowlist grew a lot in this milestone.** The scaffold's
+  list (commit `e193971`) covered process / fd / mmap / time /
+  futex but skipped most of the real workload surface. The mount
+  test failed first (`getdents`); the netns tests failed second
+  (whole `connect`/`setsockopt` family); a `cat` test would have
+  failed third (`readlink`). Better to discover this from real
+  workloads than from reading manpages — the allowlist is now
+  driven by what the M3-M5 evil tests actually need rather than
+  by intuition. Argument-level filtering for `prctl` and `ioctl`
+  is still deferred; a real worker should add it before exposing
+  the sandbox to untrusted code.
+
+### What surprised me
+
+- **Userns + seccomp without CAP_SETPCAP composition.** I'd
+  assumed an unprivileged process inside its own user namespace
+  could drop *its own* bounding-set caps freely — that's the
+  whole point of the namespace, you're root in there. Reality:
+  yes inside the userns, no on the M2 path where there's no
+  userns at all. Hence the `cfg.rootfs.is_empty()` gate.
+- **`/usr/bin/su` doesn't actually demonstrate
+  `PR_SET_NO_NEW_PRIVS` cleanly inside our userns** because the
+  caller is already root-mapped, so there's no privilege to
+  *gain*. The EV-10 test cheats slightly: it asserts the bit
+  via `prctl(PR_GET_NO_NEW_PRIVS)` directly. That's the
+  underlying invariant; the setuid-exec follow-on is interesting
+  on hosts running outside a userns but is awkward to express
+  from inside our test harness. Documented in the test file.
+- **Python's `ctypes.CDLL('libc.so.6', use_errno=True)` is the
+  cleanest way to issue raw syscalls from a sandboxed action**
+  without compiling a helper binary. We already depend on
+  `python3` for the M5/M6 tests, so the EV-02/03/04 tests reuse
+  the same skip macro and get errno via `ctypes.get_errno()`.
