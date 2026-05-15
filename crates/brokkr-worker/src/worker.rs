@@ -57,10 +57,12 @@ async fn build_channel(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel
                 .with_context(|| format!("reading client key {:?}", key_path))?;
             tls_config = tls_config.identity(Identity::from_pem(cert_pem, key_pem));
         }
-        builder = builder.tls_config(tls_config)
-            .context("configuring TLS")?;
+        builder = builder.tls_config(tls_config).context("configuring TLS")?;
     }
-    builder.connect().await.context("connecting to control plane")
+    builder
+        .connect()
+        .await
+        .context("connecting to control plane")
 }
 
 /// Run the worker. Returns when the control plane closes the stream or an

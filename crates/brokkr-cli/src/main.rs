@@ -158,7 +158,12 @@ pub fn init_project(force: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_subcmd(control: String, tls_ca: Option<PathBuf>, no_cache: bool, argv: Vec<String>) -> Result<()> {
+fn run_subcmd(
+    control: String,
+    tls_ca: Option<PathBuf>,
+    no_cache: bool,
+    argv: Vec<String>,
+) -> Result<()> {
     if argv.is_empty() {
         return Err(anyhow!("`brokk run` requires a command"));
     }

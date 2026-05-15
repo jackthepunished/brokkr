@@ -100,8 +100,7 @@ async fn main() -> Result<()> {
 
     let mut server = Server::builder();
     if let Some(tls_cfg) = tls_config {
-        server = server.tls_config(tls_cfg)
-            .context("configuring TLS")?;
+        server = server.tls_config(tls_cfg).context("configuring TLS")?;
     }
 
     server

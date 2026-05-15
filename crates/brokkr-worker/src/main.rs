@@ -63,20 +63,16 @@ fn main() -> ExitCode {
 
 async fn run_daemon(args: Args) -> Result<()> {
     let tls_config = match (&args.ca, &args.client_cert, &args.client_key) {
-        (Some(ca_path), Some(cert_path), Some(key_path)) => {
-            Some(TlsConfig {
-                ca_cert: ca_path.clone(),
-                client_cert: Some(cert_path.clone()),
-                client_key: Some(key_path.clone()),
-            })
-        }
-        (Some(ca_path), None, None) => {
-            Some(TlsConfig {
-                ca_cert: ca_path.clone(),
-                client_cert: None,
-                client_key: None,
-            })
-        }
+        (Some(ca_path), Some(cert_path), Some(key_path)) => Some(TlsConfig {
+            ca_cert: ca_path.clone(),
+            client_cert: Some(cert_path.clone()),
+            client_key: Some(key_path.clone()),
+        }),
+        (Some(ca_path), None, None) => Some(TlsConfig {
+            ca_cert: ca_path.clone(),
+            client_cert: None,
+            client_key: None,
+        }),
         _ => None,
     };
     let cfg = WorkerConfig {

@@ -48,11 +48,13 @@ async fn connect_tls(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel> 
             tls_config = tls_config.identity(Identity::from_pem(cert_pem, key_pem));
         }
 
-        builder = builder.tls_config(tls_config)
-            .context("configuring TLS")?;
+        builder = builder.tls_config(tls_config).context("configuring TLS")?;
     }
 
-    builder.connect().await.context("connecting to control plane")
+    builder
+        .connect()
+        .await
+        .context("connecting to control plane")
 }
 
 /// Client connection to a Brokkr control plane.
@@ -75,7 +77,10 @@ impl BrokkrClient {
 
     /// Connect with optional TLS configuration.
     #[tracing::instrument(name = "client::connect", skip(endpoint, tls))]
-    pub async fn connect_with_tls(endpoint: impl Into<String>, tls: Option<TlsConfig>) -> Result<Self> {
+    pub async fn connect_with_tls(
+        endpoint: impl Into<String>,
+        tls: Option<TlsConfig>,
+    ) -> Result<Self> {
         let endpoint = endpoint.into();
         let channel = connect_tls(&endpoint, tls).await?;
         Ok(Self {
