@@ -37,6 +37,7 @@ async fn connect_tls(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel> 
                 .with_context(|| format!("reading CA cert {:?}", tls_cfg.ca_cert))?,
         );
         let mut tls_config = ClientTlsConfig::new()
+            // TODO: make domain_name configurable for non-localhost deployments
             .domain_name("localhost")
             .ca_certificate(ca);
 
