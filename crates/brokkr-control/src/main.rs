@@ -17,7 +17,7 @@ use brokkr_proto::reapi_v2::{
     execution_server::ExecutionServer,
 };
 use clap::Parser;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +33,39 @@ struct Args {
     /// Directory holding the control plane's persistent state (CAS + action cache).
     #[arg(long, default_value = "./brokkr-data")]
     data_dir: PathBuf,
+
+    /// PEM-encoded server certificate (enables TLS).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM-encoded server private key (enables TLS).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// PEM-encoded CA certificate used to verify connecting client certificates (mTLS).
+    #[arg(long, requires_all = ["tls_cert", "tls_key"])]
+    tls_client_ca: Option<PathBuf>,
+}
+
+impl Args {
+    fn tls_config(&self) -> Result<Option<ServerTlsConfig>> {
+        let (Some(cert_path), Some(key_path)) = (&self.tls_cert, &self.tls_key) else {
+            return Ok(None);
+        };
+        let cert_pem = std::fs::read_to_string(cert_path)
+            .with_context(|| format!("reading TLS cert {:?}", cert_path))?;
+        let key_pem = std::fs::read_to_string(key_path)
+            .with_context(|| format!("reading TLS key {:?}", key_path))?;
+        let identity = Identity::from_pem(cert_pem, key_pem);
+
+        let mut cfg = ServerTlsConfig::new().identity(identity);
+        if let Some(ca_path) = &self.tls_client_ca {
+            let ca_pem = std::fs::read_to_string(ca_path)
+                .with_context(|| format!("reading client CA {:?}", ca_path))?;
+            cfg = cfg.client_ca_root(Certificate::from_pem(ca_pem));
+        }
+        Ok(Some(cfg))
+    }
 }
 
 #[tokio::main]
@@ -55,9 +88,23 @@ async fn main() -> Result<()> {
     );
     let scheduler = Scheduler::new(cas.clone(), action_cache.clone());
 
-    tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, "brokkr-control starting");
+    let tls_config = args.tls_config().context("loading TLS configuration")?;
+    let tls_configured = tls_config.is_some();
+    if tls_configured {
+        tracing::warn!("TLS ENABLED — mTLS required for production deployments");
+    } else {
+        tracing::warn!("TLS DISABLED — NOT FOR PRODUCTION USE");
+    }
 
-    Server::builder()
+    tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, tls = tls_configured, "brokkr-control starting");
+
+    let mut server = Server::builder();
+    if let Some(tls_cfg) = tls_config {
+        server = server.tls_config(tls_cfg)
+            .context("configuring TLS")?;
+    }
+
+    server
         .add_service(ContentAddressableStorageServer::new(CasService::new(cas)))
         .add_service(ActionCacheServer::new(ActionCacheService::new(
             action_cache,

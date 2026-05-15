@@ -1,6 +1,8 @@
 //! Worker control loop: register, open the bidi stream, then for each job
 //! received run the command and report the result.
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
@@ -13,9 +15,20 @@ use brokkr_proto::reapi_v2::{
     content_addressable_storage_client::ContentAddressableStorageClient,
 };
 use tokio::sync::mpsc;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use crate::runner::{proto_digest, run_command, RunOutcome};
+
+/// TLS configuration for worker-to-control-plane connections.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// CA certificate used to verify the server's certificate.
+    pub ca_cert: PathBuf,
+    /// Client certificate (for mTLS). None = server-only TLS.
+    pub client_cert: Option<PathBuf>,
+    /// Client private key (for mTLS). None = server-only TLS.
+    pub client_key: Option<PathBuf>,
+}
 
 /// Worker daemon configuration.
 #[derive(Debug, Clone)]
@@ -24,17 +37,37 @@ pub struct WorkerConfig {
     pub control_endpoint: String,
     /// Hostname to advertise (informational).
     pub hostname: String,
+    /// TLS configuration. None = plaintext.
+    pub tls: Option<TlsConfig>,
+}
+
+async fn build_channel(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel> {
+    let mut builder = Endpoint::from_shared(endpoint.trim_end_matches('/').to_string())
+        .with_context(|| format!("invalid endpoint {:?}", endpoint))?;
+    if let Some(tls_cfg) = tls {
+        let ca_pem = std::fs::read_to_string(&tls_cfg.ca_cert)
+            .with_context(|| format!("reading CA cert {:?}", tls_cfg.ca_cert))?;
+        let mut tls_config = ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(Certificate::from_pem(ca_pem));
+        if let (Some(cert_path), Some(key_path)) = (&tls_cfg.client_cert, &tls_cfg.client_key) {
+            let cert_pem = std::fs::read_to_string(cert_path)
+                .with_context(|| format!("reading client cert {:?}", cert_path))?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .with_context(|| format!("reading client key {:?}", key_path))?;
+            tls_config = tls_config.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+        builder = builder.tls_config(tls_config)
+            .context("configuring TLS")?;
+    }
+    builder.connect().await.context("connecting to control plane")
 }
 
 /// Run the worker. Returns when the control plane closes the stream or an
 /// unrecoverable error occurs.
 #[tracing::instrument(name = "worker::run", skip(cfg))]
 pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
-    let channel = Endpoint::from_shared(cfg.control_endpoint.clone())
-        .with_context(|| format!("invalid endpoint {:?}", cfg.control_endpoint))?
-        .connect()
-        .await
-        .context("connecting to control plane")?;
+    let channel = build_channel(&cfg.control_endpoint, cfg.tls.clone()).await?;
 
     let mut wsc = WorkerServiceClient::new(channel.clone());
     let cas = ContentAddressableStorageClient::new(channel);

@@ -1,6 +1,8 @@
 //! High-level Brokkr client. Wraps REAPI's CAS + Execution into a single
 //! "run this command" call.
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
 use brokkr_proto::reapi_v2::{
     self as rapi, action_cache_client::ActionCacheClient, batch_update_blobs_request as bur,
@@ -10,7 +12,48 @@ use brokkr_proto::reapi_v2::{
 use bytes::Bytes;
 use prost::Message;
 use sha2::{Digest as _, Sha256};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+/// TLS configuration for mTLS connections.
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// CA certificate used to verify the server's certificate.
+    pub ca_cert: PathBuf,
+    /// Client certificate to present to the server (for mTLS).
+    pub client_cert: Option<PathBuf>,
+    /// Client private key (for mTLS).
+    pub client_key: Option<PathBuf>,
+}
+
+/// Connect with TLS. Pass `tls: None` for plaintext (current default).
+async fn connect_tls(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let mut builder = Endpoint::from_shared(endpoint.to_string())
+        .with_context(|| format!("invalid endpoint {endpoint:?}"))?;
+
+    if let Some(tls_cfg) = tls {
+        let ca = Certificate::from_pem(
+            std::fs::read_to_string(&tls_cfg.ca_cert)
+                .with_context(|| format!("reading CA cert {:?}", tls_cfg.ca_cert))?,
+        );
+        let mut tls_config = ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(ca);
+
+        if let (Some(cert_path), Some(key_path)) = (&tls_cfg.client_cert, &tls_cfg.client_key) {
+            let cert_pem = std::fs::read_to_string(cert_path)
+                .with_context(|| format!("reading client cert {:?}", cert_path))?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .with_context(|| format!("reading client key {:?}", key_path))?;
+            tls_config = tls_config.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+
+        builder = builder.tls_config(tls_config)
+            .context("configuring TLS")?;
+    }
+
+    builder.connect().await.context("connecting to control plane")
+}
 
 /// Client connection to a Brokkr control plane.
 #[derive(Clone)]
@@ -23,15 +66,18 @@ pub struct BrokkrClient {
 
 impl BrokkrClient {
     /// Connect to the control plane at `endpoint` (e.g.
-    /// `http://127.0.0.1:7878`).
+    /// `http://127.0.0.1:7878`). Uses plaintext; for mTLS use
+    /// `BrokkrClient::connect_with_tls`.
     #[tracing::instrument(name = "client::connect", skip(endpoint))]
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+        Self::connect_with_tls(endpoint, None).await
+    }
+
+    /// Connect with optional TLS configuration.
+    #[tracing::instrument(name = "client::connect", skip(endpoint, tls))]
+    pub async fn connect_with_tls(endpoint: impl Into<String>, tls: Option<TlsConfig>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let channel = Endpoint::from_shared(endpoint.clone())
-            .with_context(|| format!("invalid endpoint {endpoint:?}"))?
-            .connect()
-            .await
-            .context("connecting to control plane")?;
+        let channel = connect_tls(&endpoint, tls).await?;
         Ok(Self {
             cas: ContentAddressableStorageClient::new(channel.clone()),
             exec: ExecutionClient::new(channel.clone()),

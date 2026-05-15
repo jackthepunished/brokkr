@@ -65,6 +65,7 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
         let cfg = WorkerConfig {
             control_endpoint: worker_endpoint,
             hostname: "test-worker".to_string(),
+            tls: None,
         };
         let _ = run_worker(cfg).await;
     });

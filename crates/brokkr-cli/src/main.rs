@@ -3,8 +3,10 @@
 //! Phase 1: `version`, stub `init`, and `run --command "..."` for the
 //! end-to-end happy path.
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
-use brokkr_sdk::{run_command, BrokkrClient};
+use brokkr_sdk::{run_command, BrokkrClient, TlsConfig};
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI entrypoint.
@@ -37,6 +39,10 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:7878")]
         control: String,
 
+        /// PEM-encoded CA certificate used to verify the control plane's TLS certificate.
+        #[arg(long)]
+        tls_ca: Option<PathBuf>,
+
         /// Skip the action cache lookup and force re-execution.
         #[arg(long)]
         no_cache: bool,
@@ -62,9 +68,10 @@ fn main() -> Result<()> {
         Command::Init { force } => init_project(force),
         Command::Run {
             control,
+            tls_ca,
             no_cache,
             argv,
-        } => run_subcmd(control, no_cache, argv),
+        } => run_subcmd(control, tls_ca, no_cache, argv),
     }
 }
 
@@ -151,13 +158,18 @@ pub fn init_project(force: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_subcmd(control: String, no_cache: bool, argv: Vec<String>) -> Result<()> {
+fn run_subcmd(control: String, tls_ca: Option<PathBuf>, no_cache: bool, argv: Vec<String>) -> Result<()> {
     if argv.is_empty() {
         return Err(anyhow!("`brokk run` requires a command"));
     }
     let rt = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     rt.block_on(async {
-        let mut client = BrokkrClient::connect(control).await?;
+        let tls = tls_ca.map(|ca| TlsConfig {
+            ca_cert: ca,
+            client_cert: None,
+            client_key: None,
+        });
+        let mut client = BrokkrClient::connect_with_tls(control, tls).await?;
         let outcome = run_command(&mut client, &argv, no_cache).await?;
         // Forward stdout/stderr verbatim to the user's terminal.
         use std::io::Write as _;

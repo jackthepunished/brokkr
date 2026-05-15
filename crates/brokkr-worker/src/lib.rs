@@ -10,4 +10,4 @@
 pub mod runner;
 pub mod worker;
 
-pub use worker::{run_worker, WorkerConfig};
+pub use worker::{run_worker, TlsConfig, WorkerConfig};

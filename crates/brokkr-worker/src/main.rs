@@ -1,10 +1,11 @@
 //! `brokkr-worker` daemon entrypoint.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use brokkr_sandbox::checks;
-use brokkr_worker::{run_worker, WorkerConfig};
+use brokkr_worker::{run_worker, TlsConfig, WorkerConfig};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -19,6 +20,18 @@ struct Args {
     /// allowed). See `docs/phase-2-plan.md` §10.3.
     #[arg(long)]
     check_host: bool,
+
+    /// PEM-encoded CA certificate used to verify the control plane's TLS certificate.
+    #[arg(long)]
+    ca: Option<PathBuf>,
+
+    /// PEM-encoded client certificate for mTLS (requires --client-key).
+    #[arg(long, requires = "client_key")]
+    client_cert: Option<PathBuf>,
+
+    /// PEM-encoded client private key for mTLS (requires --client-cert).
+    #[arg(long, requires = "client_cert")]
+    client_key: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -49,9 +62,27 @@ fn main() -> ExitCode {
 }
 
 async fn run_daemon(args: Args) -> Result<()> {
+    let tls_config = match (&args.ca, &args.client_cert, &args.client_key) {
+        (Some(ca_path), Some(cert_path), Some(key_path)) => {
+            Some(TlsConfig {
+                ca_cert: ca_path.clone(),
+                client_cert: Some(cert_path.clone()),
+                client_key: Some(key_path.clone()),
+            })
+        }
+        (Some(ca_path), None, None) => {
+            Some(TlsConfig {
+                ca_cert: ca_path.clone(),
+                client_cert: None,
+                client_key: None,
+            })
+        }
+        _ => None,
+    };
     let cfg = WorkerConfig {
         control_endpoint: args.control,
         hostname: hostname_or("worker".to_string()),
+        tls: tls_config,
     };
     run_worker(cfg).await
 }
