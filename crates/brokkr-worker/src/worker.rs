@@ -47,9 +47,7 @@ async fn build_channel(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel
     if let Some(tls_cfg) = tls {
         let ca_pem = std::fs::read_to_string(&tls_cfg.ca_cert)
             .with_context(|| format!("reading CA cert {:?}", tls_cfg.ca_cert))?;
-        let mut tls_config = ClientTlsConfig::new()
-            .domain_name("localhost") // TODO: make configurable for non-localhost deployments
-            .ca_certificate(Certificate::from_pem(ca_pem));
+        let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
         if let (Some(cert_path), Some(key_path)) = (&tls_cfg.client_cert, &tls_cfg.client_key) {
             let cert_pem = std::fs::read_to_string(cert_path)
                 .with_context(|| format!("reading client cert {:?}", cert_path))?;

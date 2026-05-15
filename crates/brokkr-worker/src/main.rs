@@ -62,6 +62,12 @@ fn main() -> ExitCode {
 }
 
 async fn run_daemon(args: Args) -> Result<()> {
+    // Reject partial TLS config: if client cert or key is provided without a CA,
+    // fail immediately rather than silently falling back to plaintext.
+    let has_client_creds = args.client_cert.is_some() || args.client_key.is_some();
+    if has_client_creds && args.ca.is_none() {
+        anyhow::bail!("--client-cert and --client-key require --ca to be provided");
+    }
     let tls_config = match (&args.ca, &args.client_cert, &args.client_key) {
         (Some(ca_path), Some(cert_path), Some(key_path)) => Some(TlsConfig {
             ca_cert: ca_path.clone(),

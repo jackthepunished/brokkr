@@ -1,16 +1,23 @@
 #!/bin/bash
 # Generate self-signed certificates for local mTLS testing of brokkr.
 # Creates: ca.crt, server.crt, server.key, client.crt, client.key
+# (ca.key is intentionally removed after signing for security)
 #
 # Usage: ./generate-certs.sh [--out-dir <path>]
 #   Certificates are written to the current directory by default.
 #
 set -euo pipefail
 
-OUT_DIR="${1:-.}"
+OUT_DIR="."
+if [[ "${1:-}" == "--out-dir" && -n "${2:-}" ]]; then
+    OUT_DIR="$2"
+elif [[ -n "${1:-}" ]]; then
+    OUT_DIR="$1"
+fi
 
 echo "Generating brokkr mTLS certificates in $OUT_DIR"
 
+mkdir -p "$OUT_DIR"
 pushd "$OUT_DIR" > /dev/null
 
 # 1. CA (self-signed RSA)

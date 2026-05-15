@@ -43,6 +43,14 @@ enum Command {
         #[arg(long)]
         tls_ca: Option<PathBuf>,
 
+        /// PEM-encoded client certificate for mTLS (requires --tls-client-key).
+        #[arg(long, requires = "tls_client_key")]
+        tls_client_cert: Option<PathBuf>,
+
+        /// PEM-encoded client private key for mTLS (requires --tls-client-cert).
+        #[arg(long, requires = "tls_client_cert")]
+        tls_client_key: Option<PathBuf>,
+
         /// Skip the action cache lookup and force re-execution.
         #[arg(long)]
         no_cache: bool,
@@ -69,9 +77,18 @@ fn main() -> Result<()> {
         Command::Run {
             control,
             tls_ca,
+            tls_client_cert,
+            tls_client_key,
             no_cache,
             argv,
-        } => run_subcmd(control, tls_ca, no_cache, argv),
+        } => run_subcmd(
+            control,
+            tls_ca,
+            tls_client_cert,
+            tls_client_key,
+            no_cache,
+            argv,
+        ),
     }
 }
 
@@ -161,18 +178,26 @@ pub fn init_project(force: bool) -> Result<()> {
 fn run_subcmd(
     control: String,
     tls_ca: Option<PathBuf>,
+    tls_client_cert: Option<PathBuf>,
+    tls_client_key: Option<PathBuf>,
     no_cache: bool,
     argv: Vec<String>,
 ) -> Result<()> {
     if argv.is_empty() {
         return Err(anyhow!("`brokk run` requires a command"));
     }
+    // Reject partial mTLS config: both cert and key must be present together.
+    let has_cert = tls_client_cert.is_some();
+    let has_key = tls_client_key.is_some();
+    if has_cert != has_key {
+        anyhow::bail!("both --tls-client-cert and --tls-client-key must be provided together");
+    }
     let rt = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     rt.block_on(async {
         let tls = tls_ca.map(|ca| TlsConfig {
             ca_cert: ca,
-            client_cert: None,
-            client_key: None,
+            client_cert: tls_client_cert,
+            client_key: tls_client_key,
         });
         let mut client = BrokkrClient::connect_with_tls(control, tls).await?;
         let outcome = run_command(&mut client, &argv, no_cache).await?;

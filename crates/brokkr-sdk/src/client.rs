@@ -12,6 +12,7 @@ use brokkr_proto::reapi_v2::{
 use bytes::Bytes;
 use prost::Message;
 use sha2::{Digest as _, Sha256};
+use thiserror::Error;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// TLS configuration for mTLS connections.
@@ -25,37 +26,59 @@ pub struct TlsConfig {
     pub client_key: Option<PathBuf>,
 }
 
+/// Errors that can occur when connecting to the control plane.
+#[derive(Debug, Error)]
+pub enum ClientError {
+    /// The endpoint URI is invalid.
+    #[error("invalid endpoint: {0}")]
+    InvalidEndpoint(String),
+    /// Failed to read a certificate or key file from disk.
+    #[error("reading TLS certificate: {0}")]
+    CertificateRead(#[from] std::io::Error),
+    /// TLS configuration is invalid (e.g., partial client identity).
+    #[error("TLS configuration: {0}")]
+    TlsConfig(String),
+    /// Transport-level connection error.
+    #[error("transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+}
+
 /// Connect with TLS. Pass `tls: None` for plaintext (current default).
-async fn connect_tls(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel> {
+async fn connect_tls(endpoint: &str, tls: Option<TlsConfig>) -> Result<Channel, ClientError> {
     let endpoint = endpoint.trim_end_matches('/');
     let mut builder = Endpoint::from_shared(endpoint.to_string())
-        .with_context(|| format!("invalid endpoint {endpoint:?}"))?;
+        .map_err(|e| ClientError::InvalidEndpoint(e.to_string()))?;
 
     if let Some(tls_cfg) = tls {
         let ca = Certificate::from_pem(
-            std::fs::read_to_string(&tls_cfg.ca_cert)
-                .with_context(|| format!("reading CA cert {:?}", tls_cfg.ca_cert))?,
+            std::fs::read_to_string(&tls_cfg.ca_cert).map_err(ClientError::CertificateRead)?,
         );
-        let mut tls_config = ClientTlsConfig::new()
-            // TODO: make domain_name configurable for non-localhost deployments
-            .domain_name("localhost")
-            .ca_certificate(ca);
+        let mut tls_config = ClientTlsConfig::new().ca_certificate(ca);
 
-        if let (Some(cert_path), Some(key_path)) = (&tls_cfg.client_cert, &tls_cfg.client_key) {
-            let cert_pem = std::fs::read_to_string(cert_path)
-                .with_context(|| format!("reading client cert {:?}", cert_path))?;
-            let key_pem = std::fs::read_to_string(key_path)
-                .with_context(|| format!("reading client key {:?}", key_path))?;
-            tls_config = tls_config.identity(Identity::from_pem(cert_pem, key_pem));
+        // Error if only one of client_cert/client_key is provided.
+        match (&tls_cfg.client_cert, &tls_cfg.client_key) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ClientError::TlsConfig(
+                    "both client_cert and client_key must be provided for client identity"
+                        .to_string(),
+                ));
+            }
+            (Some(cert_path), Some(key_path)) => {
+                let cert_pem =
+                    std::fs::read_to_string(cert_path).map_err(ClientError::CertificateRead)?;
+                let key_pem =
+                    std::fs::read_to_string(key_path).map_err(ClientError::CertificateRead)?;
+                tls_config = tls_config.identity(Identity::from_pem(cert_pem, key_pem));
+            }
+            (None, None) => {}
         }
 
-        builder = builder.tls_config(tls_config).context("configuring TLS")?;
+        builder = builder
+            .tls_config(tls_config)
+            .map_err(|e| ClientError::TlsConfig(e.to_string()))?;
     }
 
-    builder
-        .connect()
-        .await
-        .context("connecting to control plane")
+    builder.connect().await.map_err(ClientError::Transport)
 }
 
 /// Client connection to a Brokkr control plane.
@@ -72,7 +95,7 @@ impl BrokkrClient {
     /// `http://127.0.0.1:7878`). Uses plaintext; for mTLS use
     /// `BrokkrClient::connect_with_tls`.
     #[tracing::instrument(name = "client::connect", skip(endpoint))]
-    pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+    pub async fn connect(endpoint: impl Into<String>) -> Result<Self, ClientError> {
         Self::connect_with_tls(endpoint, None).await
     }
 
@@ -81,7 +104,7 @@ impl BrokkrClient {
     pub async fn connect_with_tls(
         endpoint: impl Into<String>,
         tls: Option<TlsConfig>,
-    ) -> Result<Self> {
+    ) -> Result<Self, ClientError> {
         let endpoint = endpoint.into();
         let channel = connect_tls(&endpoint, tls).await?;
         Ok(Self {
