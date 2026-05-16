@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
+  inside a single-arm `cfg` block which a newer clippy flagged as
+  `needless_return`; replaced with bare expressions so all four
+  arch arms keep the same shape.
+- `brokkr-sandbox::runner::seccomp::syscall_nr` referenced
+  `libc::SYS_fadvise64`, which `libc` does not expose on aarch64
+  Linux (the kernel calls the syscall `arm64_fadvise64_64`
+  internally and `libc` has no constant for it). The lookup is
+  now gated to `x86_64` / `riscv64`; on aarch64 the `fadvise64`
+  allowlist entry is silently dropped, which is the same fall-back
+  `syscall_nr` already does for arch-absent entries. Restores
+  `cargo test` on the aarch64-unknown-linux-gnu CI matrix entry.
+
 ### Added
 - Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,
   rustfmt/clippy/deny configuration, root README, CONTRIBUTING, LICENSE
