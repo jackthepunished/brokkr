@@ -56,41 +56,74 @@ impl<C: Cas> CasSvc for CasService<C> {
         let span = tracing::info_span!("cas::batch_update_blobs");
         let req = request.into_inner();
         let request_count = req.requests.len();
+
+        // Verify each entry's declared digest against its bytes *before*
+        // we hand the batch to the backend. The backend re-verifies (issue
+        // #70 defence-in-depth), but rejecting at the service boundary
+        // avoids a spawn_blocking redb txn for known-bad entries and gives
+        // the client per-entry feedback in the REAPI-required shape.
+        let mut responses: Vec<rapi::batch_update_blobs_response::Response> =
+            Vec::with_capacity(request_count);
         let mut blobs: Vec<(super::Digest, Bytes)> = Vec::with_capacity(request_count);
+        let mut accepted_indices: Vec<usize> = Vec::with_capacity(request_count);
         for r in req.requests {
             let d = r
                 .digest
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("missing digest"))?;
             let digest = proto_to_digest(d)?;
-            blobs.push((digest, Bytes::from(r.data)));
+            let data = Bytes::from(r.data);
+            match digest.verify(data.as_ref()) {
+                Ok(()) => {
+                    accepted_indices.push(responses.len());
+                    responses.push(rapi::batch_update_blobs_response::Response {
+                        digest: Some(digest_to_proto(&digest)),
+                        // Placeholder; replaced after backend write succeeds.
+                        status: None,
+                    });
+                    blobs.push((digest, data));
+                }
+                Err(e) => {
+                    responses.push(rapi::batch_update_blobs_response::Response {
+                        digest: Some(digest_to_proto(&digest)),
+                        status: Some(brokkr_proto::rpc::Status {
+                            // INVALID_ARGUMENT
+                            code: 3,
+                            message: format!("digest verification failed: {e}"),
+                            details: vec![],
+                        }),
+                    });
+                }
+            }
         }
+
         let results = self
             .backend
             .batch_update_blobs(blobs)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let _enter = span.enter();
-        tracing::info!(request_count);
-        let responses = results
-            .into_iter()
-            .map(|u| rapi::batch_update_blobs_response::Response {
-                digest: Some(digest_to_proto(&u.digest)),
-                status: Some(match u.status {
-                    Ok(()) => brokkr_proto::rpc::Status {
-                        code: 0,
-                        message: String::new(),
-                        details: vec![],
-                    },
-                    Err(msg) => brokkr_proto::rpc::Status {
-                        // INVALID_ARGUMENT
-                        code: 3,
-                        message: msg,
-                        details: vec![],
-                    },
-                }),
-            })
-            .collect();
+        tracing::info!(
+            request_count,
+            accepted = accepted_indices.len(),
+            rejected = request_count - accepted_indices.len(),
+        );
+        for (idx, u) in accepted_indices.into_iter().zip(results) {
+            responses[idx].status = Some(match u.status {
+                Ok(()) => brokkr_proto::rpc::Status {
+                    code: 0,
+                    message: String::new(),
+                    details: vec![],
+                },
+                Err(msg) => brokkr_proto::rpc::Status {
+                    // INVALID_ARGUMENT — backend re-verification failed
+                    // (size limit, partial write, etc.).
+                    code: 3,
+                    message: msg,
+                    details: vec![],
+                },
+            });
+        }
         Ok(Response::new(rapi::BatchUpdateBlobsResponse { responses }))
     }
 
