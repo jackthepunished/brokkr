@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowlist entry is silently dropped, which is the same fall-back
   `syscall_nr` already does for arch-absent entries. Restores
   `cargo test` on the aarch64-unknown-linux-gnu CI matrix entry.
+- `brokkr-control::worker_service::stream` inbound pump no longer
+  exits silently when the worker stream returns `Ok(None)` (clean
+  close), `Err` (transport / decode failure), or a message with no
+  payload. Each terminal state now logs at the appropriate level
+  (`info` / `error` / `warn`) so an operator can tell why the pump
+  stopped (issue #64).
 
 ### Added
 - Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,
