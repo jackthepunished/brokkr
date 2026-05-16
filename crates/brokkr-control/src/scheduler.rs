@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use brokkr_cas::{ActionCache, Cas};
@@ -13,7 +14,30 @@ use brokkr_common::{Digest, JobId};
 use brokkr_proto::brokkr_v1 as bv1;
 use brokkr_proto::reapi_v2 as rapi;
 use prost::Message;
+use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex};
+
+/// Default ceiling on how long [`Scheduler::execute`] waits for a worker to
+/// report a result. Issue #63 — without this the oneshot wait was unbounded
+/// and a stalled / crashed worker hung the gRPC caller forever. REAPI's
+/// `Action.timeout`, when set, overrides this on a per-action basis.
+pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Errors returned by [`Scheduler::execute`]. Typed (instead of `anyhow`) so
+/// the gRPC service can map `Timeout` to `DEADLINE_EXCEEDED` and everything
+/// else to `INTERNAL` without string-matching.
+#[derive(Error, Debug)]
+pub enum ExecutionError {
+    /// The worker did not report a result within the per-action / scheduler
+    /// timeout. Translates to gRPC `DEADLINE_EXCEEDED` (code 4).
+    #[error("worker did not report within {0:?}")]
+    Timeout(Duration),
+    /// Catch-all for failures during dispatch (CAS read, action-cache write,
+    /// worker reporting an error, etc.). Translates to gRPC `INTERNAL`
+    /// (code 13).
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 /// Outcome of a scheduled action execution.
 #[derive(Debug)]
@@ -31,11 +55,24 @@ pub struct Scheduler {
     waiters: Mutex<HashMap<JobId, oneshot::Sender<bv1::JobResult>>>,
     cas: Arc<dyn Cas>,
     action_cache: Arc<dyn ActionCache>,
+    default_execution_timeout: Duration,
 }
 
 impl Scheduler {
-    /// Construct a scheduler bound to the given storage backends.
+    /// Construct a scheduler bound to the given storage backends, using the
+    /// default execution timeout ([`DEFAULT_EXECUTION_TIMEOUT`]).
     pub fn new(cas: Arc<dyn Cas>, action_cache: Arc<dyn ActionCache>) -> Arc<Self> {
+        Self::with_execution_timeout(cas, action_cache, DEFAULT_EXECUTION_TIMEOUT)
+    }
+
+    /// Construct a scheduler with a custom default per-action timeout. The
+    /// REAPI `Action.timeout` field (when set on a per-action basis) still
+    /// overrides this default.
+    pub fn with_execution_timeout(
+        cas: Arc<dyn Cas>,
+        action_cache: Arc<dyn ActionCache>,
+        default_execution_timeout: Duration,
+    ) -> Arc<Self> {
         let (queue_tx, queue_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             queue_tx,
@@ -43,6 +80,7 @@ impl Scheduler {
             waiters: Mutex::new(HashMap::new()),
             cas,
             action_cache,
+            default_execution_timeout,
         })
     }
 
@@ -70,7 +108,7 @@ impl Scheduler {
         self: &Arc<Self>,
         action_digest: Digest,
         skip_cache_lookup: bool,
-    ) -> Result<ExecutionOutcome> {
+    ) -> Result<ExecutionOutcome, ExecutionError> {
         if !skip_cache_lookup {
             if let Some(cached) = self
                 .action_cache
@@ -106,6 +144,21 @@ impl Scheduler {
             .await
             .with_context(|| "fetching Command from CAS")?;
 
+        // REAPI `Action.timeout` overrides the scheduler default; treat
+        // missing / zero / negative as "use the default".
+        let effective_timeout = action
+            .timeout
+            .as_ref()
+            .and_then(|d| {
+                let s = d.seconds;
+                if s > 0 {
+                    Some(Duration::from_secs(s as u64))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(self.default_execution_timeout);
+
         let job_id = JobId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|e| anyhow!("invalid job id: {e}"))?;
         tracing::Span::current().record("job_id", job_id.as_str());
@@ -121,15 +174,35 @@ impl Scheduler {
             action: Some(action),
             command: Some(command),
         };
-        self.queue_tx
-            .send(job)
-            .map_err(|_| anyhow!("scheduler queue closed"))?;
+        if self.queue_tx.send(job).is_err() {
+            // Drop the now-orphaned waiter so the map doesn't grow.
+            self.waiters.lock().await.remove(&job_id);
+            return Err(anyhow!("scheduler queue closed").into());
+        }
 
-        let report = rx
-            .await
-            .map_err(|_| anyhow!("worker did not report result"))?;
+        let report = match tokio::time::timeout(effective_timeout, rx).await {
+            Ok(Ok(report)) => report,
+            Ok(Err(_)) => {
+                // Waiter dropped without a value — the entry is already gone
+                // from the map (consumed by `report`).
+                return Err(anyhow!("worker did not report result").into());
+            }
+            Err(_) => {
+                // Time elapsed. Reclaim the waiter slot before returning so
+                // the map doesn't accumulate stalled entries; a late report
+                // from the worker will then be discarded by `report` because
+                // the lookup misses.
+                self.waiters.lock().await.remove(&job_id);
+                tracing::warn!(
+                    job_id = job_id.as_str(),
+                    timeout_secs = effective_timeout.as_secs_f64(),
+                    "scheduler: worker did not report within timeout"
+                );
+                return Err(ExecutionError::Timeout(effective_timeout));
+            }
+        };
         if !report.error_message.is_empty() {
-            return Err(anyhow!("worker error: {}", report.error_message));
+            return Err(anyhow!("worker error: {}", report.error_message).into());
         }
         let result = report
             .result
@@ -177,7 +250,7 @@ impl Scheduler {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
 mod tests {
     use async_trait::async_trait;
     use brokkr_cas::{ActionCache, Cas, CasError};
@@ -294,6 +367,64 @@ mod tests {
             err.to_string().contains("fetching Action from CAS"),
             "expected 'fetching Action from CAS' in error, got: {err}"
         );
+    }
+
+    /// Issue #63 regression: `execute` must not hang forever when no worker
+    /// consumes the dispatched job. The scheduler is built with a small
+    /// timeout; we feed it a valid Action+Command pair via a real in-memory
+    /// CAS, never consume the job queue, and assert that `execute` returns
+    /// `ExecutionError::Timeout` within roughly the configured budget.
+    #[tokio::test]
+    async fn execute_returns_timeout_when_worker_never_reports() {
+        use std::time::Instant;
+
+        use brokkr_cas::{Cas as _, InMemoryCas};
+
+        let cas = Arc::new(InMemoryCas::new());
+        let ac = Arc::new(MockActionCache { force_error: false });
+
+        // Stage a minimal Action+Command pair so the scheduler gets past
+        // the CAS fetches and enqueues a real job.
+        let command = rapi::Command {
+            arguments: vec!["/bin/echo".to_string(), "hi".to_string()],
+            ..Default::default()
+        };
+        let command_bytes = command.encode_to_vec();
+        let command_digest = Digest::of(&command_bytes);
+        let action = rapi::Action {
+            command_digest: Some(rapi::Digest {
+                hash: command_digest.hash().to_string(),
+                size_bytes: command_digest.size_bytes(),
+            }),
+            ..Default::default()
+        };
+        let action_bytes = action.encode_to_vec();
+        let action_digest = Digest::of(&action_bytes);
+        cas.batch_update_blobs(vec![
+            (action_digest.clone(), Bytes::from(action_bytes)),
+            (command_digest, Bytes::from(command_bytes)),
+        ])
+        .await
+        .unwrap();
+
+        let timeout = Duration::from_millis(120);
+        let scheduler = Scheduler::with_execution_timeout(cas, ac, timeout);
+
+        let start = Instant::now();
+        let err = scheduler.execute(action_digest, true).await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        match err {
+            ExecutionError::Timeout(d) => assert_eq!(d, timeout),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed >= timeout && elapsed < timeout * 20,
+            "elapsed {elapsed:?} should be around the timeout {timeout:?}"
+        );
+
+        // Waiter slot must have been reclaimed so the map doesn't grow.
+        assert!(scheduler.waiters.lock().await.is_empty());
     }
 
     /// Verify `execute` propagates action cache get errors.
