@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use brokkr_common::Digest;
 use brokkr_proto::reapi_v2::ActionResult;
 use prost::Message;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::error::CasError;
 
@@ -32,6 +32,16 @@ pub trait ActionCache: Send + Sync + 'static {
         action_digest: &Digest,
         result: ActionResult,
     ) -> Result<(), CasError>;
+
+    /// Enumerate every cached `ActionResult`. Used by GC (M5) to
+    /// build the reachability set. Default implementation returns
+    /// empty so non-GC-aware backends still compile.
+    ///
+    /// Each entry is `(action_digest, ActionResult)`. Order is
+    /// implementation-defined.
+    async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
+        Ok(Vec::new())
+    }
 }
 
 /// `redb`-backed [`ActionCache`].
@@ -95,6 +105,41 @@ impl ActionCache for RedbActionCache {
             }
             txn.commit()?;
             Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(Digest, ActionResult)>, CasError> {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(ACTION_RESULTS)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let hash = key.value().to_string();
+                let bytes = value.value();
+                // Decode the stored ActionResult. The size we
+                // pass to `Digest::new` is the *encoded length*
+                // of the ActionResult; the action's digest is
+                // keyed on the encoded Action, not on the result.
+                // We construct the key digest via a size of zero
+                // (the only field that matters for keying is the
+                // hash hex) — but a Digest with `size_bytes=0`
+                // would fail other validation, so we use the
+                // value's byte length as a stand-in.
+                let action_digest = match Digest::new(hash, bytes.len() as i64) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let decoded = match ActionResult::decode(bytes) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                out.push((action_digest, decoded));
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?

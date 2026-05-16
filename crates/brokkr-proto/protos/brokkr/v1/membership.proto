@@ -1,0 +1,88 @@
+// Brokkr internal cluster-membership protocol (Phase 3 M1).
+//
+// The control plane is the source of truth for which CAS nodes exist
+// and the parameters of the rendezvous-hashed replica ring
+// (replication factor, ring secret). Clients and workers consume a
+// long-lived `WatchTopology` server-streamed RPC to keep their local
+// routing table in sync.
+//
+// Phase 3 keeps this read-only from the client side: a CAS node
+// registers itself with the control plane via the existing
+// AdminService (later milestone) or via a configuration entry. The
+// membership service only *publishes* the consolidated view.
+
+syntax = "proto3";
+
+package brokkr.v1;
+
+// One CAS node in the cluster.
+message CasNode {
+  // Stable node identifier (a UUID written to <data_dir>/node_id on
+  // first start, so address churn does not reshuffle the ring).
+  string node_id = 1;
+
+  // gRPC endpoint the node listens on, e.g. `http://10.0.0.1:7980`.
+  // Clients connect to this; the control plane never proxies CAS
+  // traffic.
+  string endpoint = 2;
+
+  // Liveness state, as observed by the control plane.
+  NodeStatus status = 3;
+
+  // Capacity reported by the node's most recent heartbeat. Zero means
+  // unknown. Informational in Phase 3 (the ring treats all nodes
+  // equally); Phase 4 may weight by capacity.
+  uint64 capacity_bytes = 4;
+
+  // Bytes currently in use, last reported. Informational.
+  uint64 used_bytes = 5;
+}
+
+enum NodeStatus {
+  // Default = treated as missing.
+  NODE_STATUS_UNSPECIFIED = 0;
+
+  // Reachable, recent heartbeat, ready for reads and writes.
+  NODE_STATUS_HEALTHY = 1;
+
+  // Recent heartbeats are late but the node has not yet expired.
+  // Clients still try it but mark its responses lower-priority.
+  NODE_STATUS_SUSPECT = 2;
+
+  // No heartbeats within the eviction window. Clients exclude it
+  // from replica selection.
+  NODE_STATUS_UNREACHABLE = 3;
+}
+
+// Snapshot of the cluster topology.
+message TopologyView {
+  // Monotonically-increasing generation number. Bumped on every
+  // change to the membership set or ring configuration; clients use
+  // it for cache invalidation and idempotent reapplication.
+  uint64 generation = 1;
+
+  // Every known CAS node, in arbitrary order.
+  repeated CasNode nodes = 2;
+
+  // Default replication factor. Per-blob overrides are not supported
+  // in Phase 3.
+  uint32 replication_factor = 3;
+
+  // Reserved for Phase 6+ ring-secret rotation. Empty in Phase 3.
+  bytes ring_secret = 4;
+}
+
+message WatchTopologyRequest {
+  // Empty in Phase 3. Future iterations may include a
+  // "since_generation" hint so reconnecting clients don't re-receive
+  // a snapshot they already have.
+}
+
+service MembershipService {
+  // Long-lived server-streaming RPC. The server sends one
+  // `TopologyView` immediately on connect, then a new one whenever
+  // the cluster topology changes. Clients reconnect on stream
+  // termination (the topology is small; full re-snapshots are
+  // cheap).
+  rpc WatchTopology(WatchTopologyRequest) returns (stream TopologyView);
+}
