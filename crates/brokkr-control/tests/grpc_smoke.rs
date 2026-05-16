@@ -128,6 +128,101 @@ async fn cas_roundtrip_and_find_missing() {
 }
 
 #[tokio::test]
+async fn batch_update_rejects_bytes_that_do_not_match_declared_digest() {
+    // Issue #70 — the gRPC CAS service must reject entries whose payload
+    // does not hash to the declared digest. Per REAPI the rejection is
+    // per-entry (status = INVALID_ARGUMENT) inside the success response,
+    // not a top-level Status error.
+    let (addr, _dir) = boot_server().await;
+    let mut cas = ContentAddressableStorageClient::new(client(&addr).await);
+
+    let good_payload = b"truthful blob";
+    let good_d = Digest::of(good_payload);
+    let good_proto = rapi::Digest {
+        hash: good_d.hash().to_string(),
+        size_bytes: good_d.size_bytes(),
+    };
+
+    // A digest that claims to be of `good_payload` but the body is
+    // actually different bytes — classic hash-collision-attack shape,
+    // useful for any client that builds digests incorrectly.
+    let lying_payload = b"actually different bytes";
+    let lying_d = rapi::Digest {
+        hash: good_d.hash().to_string(),
+        size_bytes: good_d.size_bytes(),
+    };
+
+    let upd = cas
+        .batch_update_blobs(rapi::BatchUpdateBlobsRequest {
+            instance_name: String::new(),
+            requests: vec![
+                rapi::batch_update_blobs_request::Request {
+                    digest: Some(good_proto.clone()),
+                    data: good_payload.to_vec(),
+                    compressor: 0,
+                },
+                rapi::batch_update_blobs_request::Request {
+                    digest: Some(lying_d.clone()),
+                    data: lying_payload.to_vec(),
+                    compressor: 0,
+                },
+            ],
+            digest_function: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(upd.responses.len(), 2);
+    assert_eq!(
+        upd.responses[0].status.as_ref().unwrap().code,
+        0,
+        "honest entry must be accepted"
+    );
+    assert_eq!(
+        upd.responses[1].status.as_ref().unwrap().code,
+        3,
+        "mismatched entry must be rejected with INVALID_ARGUMENT (code 3); got status {:?}",
+        upd.responses[1].status,
+    );
+
+    // The lying entry must not have been persisted under either the
+    // declared *or* the actual digest.
+    let actual_d_of_lie = Digest::of(lying_payload);
+    let actual_d_proto = rapi::Digest {
+        hash: actual_d_of_lie.hash().to_string(),
+        size_bytes: actual_d_of_lie.size_bytes(),
+    };
+    let missing = cas
+        .find_missing_blobs(rapi::FindMissingBlobsRequest {
+            instance_name: String::new(),
+            blob_digests: vec![actual_d_proto.clone()],
+            digest_function: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        missing.missing_blob_digests,
+        vec![actual_d_proto],
+        "rejected payload must not be silently stored under its real hash"
+    );
+
+    // The honest entry must be readable.
+    let read = cas
+        .batch_read_blobs(rapi::BatchReadBlobsRequest {
+            instance_name: String::new(),
+            digests: vec![good_proto],
+            acceptable_compressors: vec![],
+            digest_function: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.responses[0].data, good_payload);
+}
+
+#[tokio::test]
 async fn action_cache_miss_then_hit() {
     let (addr, _dir) = boot_server().await;
     let mut ac = ActionCacheClient::new(client(&addr).await);

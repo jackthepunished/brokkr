@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecutionError::Timeout(Duration)`, which the `Execution` service
   surfaces to clients as gRPC `DEADLINE_EXCEEDED` (code 4) so they
   can retry without parsing error strings (issue #63).
+- `brokkr-control` CAS service now verifies each `BatchUpdateBlobs`
+  entry's declared digest against its payload *at the service
+  boundary* and rejects mismatches with per-entry
+  `INVALID_ARGUMENT`. The backend has always re-verified before
+  storing (so no data corruption was ever possible) — the
+  service-layer check just avoids a `spawn_blocking` redb txn for
+  known-bad entries and gives the client an earlier, cheaper
+  rejection (issue #70).
 
 ### Changed
 - `Scheduler::execute` now returns `Result<ExecutionOutcome,
