@@ -59,9 +59,10 @@ pub trait Cas: Send + Sync + 'static {
     /// Remove a single blob. `Ok(())` whether the blob was present
     /// or not — `delete` is idempotent. Backends that genuinely
     /// can't delete (cold-tier S3 in archive mode, say) should
-    /// return [`CasError::Unsupported`] (M5b will add this
-    /// variant). Default implementation returns `Ok(())` to keep
-    /// non-GC test backends compiling.
+    /// return a `CasError::Other` describing the constraint until
+    /// a dedicated `Unsupported` variant lands. Default
+    /// implementation returns `Ok(())` to keep non-GC test backends
+    /// compiling.
     async fn delete_blob(&self, _digest: &Digest) -> Result<(), CasError> {
         Ok(())
     }

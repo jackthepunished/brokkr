@@ -212,6 +212,13 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "readlinkat" => Some(libc::SYS_readlinkat),
         "faccessat" => Some(libc::SYS_faccessat),
         "faccessat2" => Some(libc::SYS_faccessat2),
+        // `SYS_fadvise64` is exposed on x86_64 / riscv64 but not on
+        // aarch64 in `libc` (the aarch64 ABI calls the syscall
+        // `arm64_fadvise64_64` internally; the `libc` crate hasn't added
+        // a constant for it). Skip silently on arches that don't expose
+        // a usable constant — `resolve_or_skip` treats `None` from this
+        // helper as "syscall absent on this arch".
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         "fadvise64" => Some(libc::SYS_fadvise64),
         "fdatasync" => Some(libc::SYS_fdatasync),
         "fsync" => Some(libc::SYS_fsync),
@@ -372,19 +379,16 @@ fn syscall_nr(name: &str) -> Option<i64> {
 fn host_target_arch() -> io::Result<TargetArch> {
     #[cfg(target_arch = "x86_64")]
     {
-        return Ok(TargetArch::x86_64);
+        Ok(TargetArch::x86_64)
     }
-
     #[cfg(target_arch = "aarch64")]
     {
-        return Ok(TargetArch::aarch64);
+        Ok(TargetArch::aarch64)
     }
-
     #[cfg(target_arch = "riscv64")]
     {
-        return Ok(TargetArch::riscv64);
+        Ok(TargetArch::riscv64)
     }
-
     #[cfg(not(any(
         target_arch = "x86_64",
         target_arch = "aarch64",

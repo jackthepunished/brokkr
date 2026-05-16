@@ -28,8 +28,8 @@ use crate::ring::{replicas_for, RingNode};
 
 /// Snapshot of the cluster topology used by the router. Decoupled
 /// from the `brokkr.v1.TopologyView` proto so this module compiles
-/// without the proto crate (the topology proto can be converted to
-/// this via [`Topology::from_proto_nodes`] when needed).
+/// without the proto crate; callers (e.g. the worker) translate the
+/// proto into this type at the boundary.
 #[derive(Debug, Clone, Default)]
 pub struct Topology {
     /// Monotonic generation number; bumped on every change.
