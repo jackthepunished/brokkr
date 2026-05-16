@@ -26,6 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload. Each terminal state now logs at the appropriate level
   (`info` / `error` / `warn`) so an operator can tell why the pump
   stopped (issue #64).
+- `brokkr-control::Scheduler::execute` no longer waits forever for a
+  worker result. The oneshot wait is wrapped in `tokio::time::timeout`
+  honouring REAPI `Action.timeout` per-action and falling back to a
+  scheduler-wide default (30 minutes, override via
+  `Scheduler::with_execution_timeout`). On expiry the waiter slot is
+  reclaimed and the call returns the new typed
+  `ExecutionError::Timeout(Duration)`, which the `Execution` service
+  surfaces to clients as gRPC `DEADLINE_EXCEEDED` (code 4) so they
+  can retry without parsing error strings (issue #63).
+
+### Changed
+- `Scheduler::execute` now returns `Result<ExecutionOutcome,
+  ExecutionError>` (was `anyhow::Result<ExecutionOutcome>`); the
+  enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
 - Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,

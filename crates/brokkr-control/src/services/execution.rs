@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use super::proto_to_digest;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{ExecutionError, Scheduler};
 
 fn execute_response_to_any(resp: rapi::ExecuteResponse) -> prost_types::Any {
     let mut buf = Vec::with_capacity(resp.encoded_len());
@@ -79,18 +79,28 @@ impl ExecSvc for ExecutionService {
                             ..Default::default()
                         }
                     }
-                    Err(e) => brokkr_proto::longrunning::Operation {
-                        name: format!("operations/{}", uuid::Uuid::new_v4()),
-                        done: true,
-                        result: Some(brokkr_proto::longrunning::operation::Result::Error(
-                            brokkr_proto::rpc::Status {
-                                code: 13,
-                                message: e.to_string(),
-                                details: vec![],
-                            },
-                        )),
-                        ..Default::default()
-                    },
+                    Err(e) => {
+                        // DEADLINE_EXCEEDED for scheduler timeouts (issue
+                        // #63); INTERNAL for everything else. The choice of
+                        // code lets clients implement retry-on-timeout
+                        // policies without parsing the error string.
+                        let code = match &e {
+                            ExecutionError::Timeout(_) => 4,
+                            ExecutionError::Other(_) => 13,
+                        };
+                        brokkr_proto::longrunning::Operation {
+                            name: format!("operations/{}", uuid::Uuid::new_v4()),
+                            done: true,
+                            result: Some(brokkr_proto::longrunning::operation::Result::Error(
+                                brokkr_proto::rpc::Status {
+                                    code,
+                                    message: e.to_string(),
+                                    details: vec![],
+                                },
+                            )),
+                            ..Default::default()
+                        }
+                    }
                 };
                 let _ = tx.send(Ok(op)).await;
             }
