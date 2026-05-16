@@ -324,6 +324,7 @@ dependencies = [
  "hex",
  "prost",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

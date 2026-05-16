@@ -468,3 +468,84 @@ debrief.
   hostname change, no env injection. The worker has to explicitly
   pick `brokkr_defaults()` to get the locked-down behaviour. Means
   every existing test still passes without touching its config.
+
+## M9 — `feat/phase2-worker-integration-and-defaults`
+
+- **Date:** 2026-05-14
+- **PR:** _(filled in after merge)_
+- **Outcome:** `brokkr-worker` runs actions through `brokkr-sandbox`
+  by default. A new `Runner` enum (`Plain` vs
+  `Sandboxed(Box<SandboxRunner>)`) replaces the bare `run_command`
+  function; the CLI binary builds a `Sandboxed` runner unless
+  `--no-sandbox` is passed. `WorkerConfig.runner` defaults to
+  `Runner::Plain` so the existing Phase 1 in-process test fixtures
+  keep working without rebuilding the runner binary. Four new e2e
+  tests in `brokkr-worker/tests/sandbox_e2e.rs` exercise the
+  sandbox path; the existing Phase 1 control-plane tests stay
+  green on the Plain runner. Phase 2 definition-of-done assertions
+  hold: every evil-action test passes, AC-01-ish (echo + hostname
+  + /etc/shadow blocked) passes through the worker's runner
+  abstraction, AC-04 (byte-identical repeatability) is covered in
+  M8.
+
+### Decisions
+
+- **`WorkerConfig.runner` default is `Plain`.** The alternative
+  ("default to Sandboxed and force every test to pass a runner
+  binary path") would have broken `brokkr-control/tests/common.rs`
+  and `brokkr-control/tests/phase1_dod.rs` without buying
+  anything: those tests already exercise the worker → control
+  plane → CAS plumbing with the Plain runner, and the sandbox
+  path has its own dedicated e2e tests. The CLI binary, which
+  *is* the production entry point, defaults to Sandboxed.
+- **Mapping `ExitStatus` → `i32` follows shell convention.**
+  `Signaled { signal }` → `128 + signal`, `OutOfMemory` → `137`
+  (SIGKILL convention), `Timeout` → `124` (GNU timeout's exit
+  code). REAPI's `ActionResult.exit_code` is a single `int32`, so
+  we have to flatten somewhere — using the conventions GNU
+  coreutils / shells use means downstream tooling reads it the
+  way users already expect.
+- **`Runner` enum boxes the Sandboxed variant.** clippy's
+  `large_enum_variant` lint fired because `SandboxRunner` embeds
+  a `RootfsSpec` and three `Vec`s — boxing it keeps the enum
+  16 bytes on 64-bit and silences the lint. The cost is one
+  allocation per worker startup; negligible.
+- **CLI surface kept minimal.** `--no-sandbox`,
+  `--sandbox-runner`, `--sandbox-cgroup-root`,
+  `--sandbox-wall-clock-secs`, `--sandbox-memory-bytes`,
+  `--sandbox-pids-max`. Per-action `Platform`-property overrides
+  are deferred to a later milestone (they're a Phase 4 concern
+  per the plan: REAPI clients negotiating constraints).
+- **Host probe runs at worker startup.** A sandboxed worker that
+  starts but immediately fails every job is worse than a worker
+  that refuses to register. `host_check::run()` runs before we
+  build the `Runner`; on failure we print a useful error
+  pointing at `--check-host` and `--no-sandbox`.
+
+### What surprised me
+
+- **`CARGO_BIN_EXE_<name>` is per-crate, not workspace-wide.**
+  The integration tests in `brokkr-worker/tests/` cannot find
+  `brokkr-sandboxd` via the env var the way
+  `brokkr-sandbox/tests/` can. Workaround: resolve via
+  `std::env::current_exe().parent().parent().join(...)` — cargo
+  reliably places test binaries in `target/<profile>/deps/` and
+  the runner binary as a sibling at `target/<profile>/`.
+  Documented at the test helper since it's the kind of brittle
+  workaround that earns a comment.
+- **The Phase 1 e2e tests broke on the `Runner` field with a
+  clear `missing field "runner"` error.** Adding the field
+  without a default would have been a compile-time tax on every
+  caller. Putting `Default::default()` on `WorkerConfig`
+  (defaulting `runner` to `Plain`) feels right *and* matches
+  the test fixture's actual need; the CLI binary doesn't go
+  through `Default` so it isn't tempted to silently fall back
+  to Plain.
+- **Mapping `ExitStatus::Timeout` to 124 vs `Signaled(9)` to
+  137.** GNU timeout's manpage is the de-facto spec here; the
+  difference makes "the action took too long" vs "the action
+  was OOM-killed" distinguishable from an exit code alone, even
+  though the underlying `WaitStatus` is the same `SIGKILL`.
+  Phase 4's auxiliary metadata will carry the structured
+  `ExitStatus`; until then, encoding the failure mode in the
+  exit code is the cheapest signal.

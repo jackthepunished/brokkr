@@ -303,6 +303,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produce byte-identical stdout under `brokkr_defaults`). Same
   unprivileged-userns skip policy as the other namespace-path
   evil tests.
+- M9: `brokkr-worker` runs actions through the sandbox by default.
+  New `Runner` enum (`Plain` vs `Sandboxed(Box<SandboxRunner>)`)
+  in `brokkr-worker::runner`; `SandboxTemplate::brokkr_default()`
+  encodes the worker's defaults (minimal usrmerge rootfs, no
+  network, `DeterminismPolicy::brokkr_defaults()` for hostname /
+  TZ / env scrubbing, no resource limits). `run_command` accepts
+  `&Runner` and dispatches; signal-kill / OOM / wall-clock are
+  mapped to shell-convention exit codes (`128+sig`, `137`, `124`)
+  so the existing `ActionResult.exit_code` plumbing carries the
+  information.
+- M9: `WorkerConfig.runner` field. Default is `Runner::Plain` so
+  in-process test fixtures don't need the `brokkr-sandboxd`
+  binary; the CLI `brokkr-worker` builds a `Runner::Sandboxed`
+  unless `--no-sandbox` is passed.
+- M9: `brokkr-worker` CLI flags — `--no-sandbox` (Phase 1
+  fallback, logs a warning), `--sandbox-runner PATH`,
+  `--sandbox-cgroup-root PATH`, `--sandbox-wall-clock-secs N`,
+  `--sandbox-memory-bytes N`, `--sandbox-pids-max N`. The default
+  sandboxed mode probes the host (`host_check::run`) at startup
+  and refuses to start if the host can't run the sandbox; the
+  error message points at `--check-host` and `--no-sandbox`.
+- `brokkr-worker/tests/sandbox_e2e.rs` — four M9 tests:
+  `/bin/echo "hello world"` round-trips through the sandbox
+  runner; hostname inside is `brokkr-sandbox`; `/etc/shadow` is
+  not visible (rootfs allowlist works); the `Plain` runner is
+  still Phase-1 compatible. Resolves `brokkr-sandboxd` via
+  `current_exe()` since `CARGO_BIN_EXE_*` only sets for the
+  owning crate's tests. Same unprivileged-userns skip macro as
+  the other namespace-path tests.
 
 ## Phase 3 (in progress)
 

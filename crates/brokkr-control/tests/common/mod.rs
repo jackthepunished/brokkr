@@ -25,7 +25,7 @@ use brokkr_proto::reapi_v2::{
     content_addressable_storage_server::ContentAddressableStorageServer,
     execution_server::ExecutionServer,
 };
-use brokkr_worker::{run_worker, WorkerConfig};
+use brokkr_worker::{run_worker, Runner, WorkerConfig};
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 
@@ -62,9 +62,14 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
 
     let worker_endpoint = endpoint.clone();
     tokio::spawn(async move {
+        // Phase 1 fixtures intentionally use Runner::Plain — the
+        // sandbox path is exercised separately by the brokkr-worker
+        // sandbox-mode integration tests, which require the
+        // brokkr-sandboxd binary and an unprivileged userns.
         let cfg = WorkerConfig {
             control_endpoint: worker_endpoint,
             hostname: "test-worker".to_string(),
+            runner: Runner::Plain,
         };
         let _ = run_worker(cfg).await;
     });
