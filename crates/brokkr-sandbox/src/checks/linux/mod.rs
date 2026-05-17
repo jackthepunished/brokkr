@@ -8,6 +8,8 @@ mod brokkr_slice;
 #[cfg(target_os = "linux")]
 mod cgroup2;
 #[cfg(target_os = "linux")]
+mod fuse_device;
+#[cfg(target_os = "linux")]
 pub(crate) mod kernel_version;
 #[cfg(target_os = "linux")]
 pub(crate) mod memory_peak;
@@ -32,5 +34,6 @@ pub fn run_linux(kernel_release: Option<&str>) -> Vec<super::Outcome> {
         seccomp::check_seccomp(),
         memory_peak::check_memory_peak(kernel_release),
         setgroups::check_setgroups(),
+        fuse_device::check_fuse_device(),
     ]
 }
