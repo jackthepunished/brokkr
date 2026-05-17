@@ -335,6 +335,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Phase 3 (in progress)
 
+### M7 — three-node soak + Phase 3 wrap-up
+
+- M7: `crates/brokkr-cas/tests/three_node_soak.rs` — Phase 3's
+  release-gate soak test, per `docs/phase-3-plan.md` §7.3 +
+  §7.3.1. Drives a three-node `ReplicatedCas` (R=2) over a
+  `MutablePool` of `InMemoryCas` backends through a
+  put/get/find_missing mix, with one node restarted (swapped
+  for a fresh empty backend + `repair_node` to convergence)
+  every `BROKKR_SOAK_CHURN` ops. End-of-run asserts the four
+  §7.3.1 invariants: no data loss (byte-level readback of
+  every put), no orphans (final `repair_cluster` reports zero
+  repairs / zero unrepairable), quiescence (< 1 s for the
+  final cluster scan), and bounded per-node count
+  (`list_digests` matches HRW assignment per node).
+  `#[ignore]` by default. Default budget (25k ops / ~99
+  churns) runs in ~28 s on a workstation; release-gate
+  budget (`BROKKR_SOAK_OPS=1000000`, etc.) wired through env
+  vars for CI.
+- M7: `docs/phase-3-plan.md` §7.3.1 sub-plan added (backend
+  choice, default budget, op mix, churn loop, invariants,
+  out-of-scope list).
+- M7: `docs/journal/phase-3.md` — M7 retrospective + Phase 3
+  wrap-up (`### Phase 3 wrap-up (M0–M7)`) covering DoD
+  status, deferred items routed to Phase 4, and rough
+  Phase 3 numbers.
+- M7: new `brokkr-cas` dev-deps `rand = "0.8"` and
+  `parking_lot = "0.12"`. Both already transitively in the
+  workspace lockfile via existing crates; no new external
+  surface added to non-test builds.
+
+
 ### Added
 - `docs/phase-3-plan.md` — detailed Phase 3 implementation plan
   (failure model, rendezvous-hashing routing, tiered storage
