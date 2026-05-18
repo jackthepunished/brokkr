@@ -22,7 +22,8 @@ use std::io::{self, ErrorKind};
 
 use nix::libc;
 use seccompiler::{
-    apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+    apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+    SeccompFilter, SeccompRule, TargetArch,
 };
 
 /// Default syscall allowlist. Mirrors `docs/phase-2-plan.md` §5.6.
@@ -179,10 +180,6 @@ const DEFAULT_ALLOW: &[&str] = &[
     "sysinfo",
     "getrandom",
 ];
-
-// TODO(M7+): argument filter for prctl/ioctl per §5.6. For now both are
-// allowed unconditionally; argument-level filtering is where seccomp's
-// real complexity lives and was deliberately punted out of M7.
 
 /// Resolve a syscall name to its number on the current target arch.
 ///
@@ -433,8 +430,20 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
         }
     }
 
-    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
-        numbers.into_iter().map(|nr| (nr, Vec::new())).collect();
+    // Build per-syscall rules. Most syscalls get an empty rule vector
+    // (unconditional allow). prctl and ioctl get argument-filtered rules.
+    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = numbers
+        .into_iter()
+        .map(|nr| {
+            if nr == libc::SYS_prctl {
+                (nr, prctl_rules())
+            } else if nr == libc::SYS_ioctl {
+                (nr, ioctl_rules())
+            } else {
+                (nr, Vec::new())
+            }
+        })
+        .collect();
 
     let filter = SeccompFilter::new(
         rules,
@@ -451,6 +460,153 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
         .map_err(|e| io::Error::other(format!("seccomp: compile to BPF: {e}")))?;
 
     Ok(prog)
+}
+
+// ---------------------------------------------------------------------------
+// prctl argument filtering
+// ---------------------------------------------------------------------------
+
+/// Return a BPF rule set for the `prctl` syscall.
+///
+/// Each rule is evaluated in order; the first matching rule's action applies.
+/// Dangerous options are blocked (EPERM); safe options are allowed.
+/// A catch-all allow rule terminates the chain for anything not explicitly
+/// blocked.
+#[allow(clippy::expect_used, clippy::vec_init_then_push)]
+fn prctl_rules() -> Vec<SeccompRule> {
+    vec![
+        // Block: PR_SET_KEEPCAPS (31) — allows setuid binaries to retain caps
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            31,
+        )
+        .expect("valid condition")])
+        .expect("valid prctl rule"),
+        // Block: PR_CAPBSET_DROP (36) — permanently removes caps from process
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            36,
+        )
+        .expect("valid condition")])
+        .expect("valid prctl rule"),
+        // Block: PR_SET_TSC (10) — enables timing side-channel (RDTSC) control
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            10,
+        )
+        .expect("valid condition")])
+        .expect("valid prctl rule"),
+        // Block: PR_GET_TSC (11) — query CPU timestamp-config state.
+        // Even a read-only query is blocked because observing whether
+        // PR_SET_TSC was previously enabled could aid a timing
+        // side-channel attack (the value encodes CPU frequency state).
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            11,
+        )
+        .expect("valid condition")])
+        .expect("valid prctl rule"),
+        // Catch-all allow: anything not explicitly blocked above is permitted.
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0),
+            0,
+        )
+        .expect("valid condition")])
+        .expect("valid prctl rule"),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// ioctl argument filtering
+// ---------------------------------------------------------------------------
+
+/// Return a BPF rule set for the `ioctl` syscall.
+///
+/// The request code is in `arg1` (arg0 is the file descriptor).
+/// Terminal/device-manipulation calls are blocked; all others are allowed.
+#[allow(clippy::expect_used, clippy::vec_init_then_push)]
+fn ioctl_rules() -> Vec<SeccompRule> {
+    vec![
+        // Block TIOCSTI (0x5412) — simulates terminal input
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x5412,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+        // Block TIOCSWINSZ (0x5414) — set terminal window size
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x5414,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+        // Block TIOCGWINSZ (0x5413) — get terminal window size (info leak)
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x5413,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+        // Block TIOCSBRK (0x5427) — set break condition on terminal
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x5427,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+        // Block TIOCCBRK (0x5428) — clear break condition
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x5428,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+        // Block TIOCSPTLCK (0x4D60) — unlock pseudo-terminal device lock
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x4D60,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+        // Note: TIOCGSID (0x5429) is distinct from TIOCSBRK (0x5427) and
+        // TIOCCBRK (0x5428); it is not explicitly blocked here, but since
+        // the syscall's mismatch_action is Errno(EPERM), any ioctl request
+        // not explicitly matched above (including TIOCGSID) returns EPERM.
+        //
+        // Catch-all allow: any ioctl request not explicitly blocked above is
+        // permitted. MaskedEq(0) on arg1 always matches.
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0),
+            0,
+        )
+        .expect("valid condition")])
+        .expect("valid ioctl rule"),
+    ]
 }
 
 /// Install a default-deny seccomp filter on the calling thread.
