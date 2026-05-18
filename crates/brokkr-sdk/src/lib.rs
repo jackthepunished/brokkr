@@ -7,4 +7,4 @@
 
 pub mod client;
 
-pub use client::{run_command, BrokkrClient, RunOutcome};
+pub use client::{run_command, BrokkrClient, ClientError, RunOutcome, TlsConfig};
