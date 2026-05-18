@@ -3,6 +3,8 @@
 //! These tests verify that the SDK correctly surfaces server-reported
 //! errors from ExecuteResponse.status. See issue #61.
 
+#![allow(clippy::disallowed_methods, clippy::unwrap_used)]
+
 use brokkr_proto::google::rpc::Status as RpcStatus;
 use brokkr_proto::reapi_v2::ExecuteResponse;
 
@@ -22,7 +24,8 @@ fn execute_response_non_zero_status() {
     };
 
     // Sanity check: status is present and non-OK
-    let s = resp.status.as_ref().expect("status should be present");
+    assert!(resp.status.is_some(), "status should be present");
+    let s = resp.status.as_ref().unwrap();
     assert_eq!(s.code, 3);
     assert_eq!(s.message, "missing input blob");
 }
@@ -43,7 +46,11 @@ fn execute_response_ok_status() {
     };
 
     // Code 0 means OK — the SDK would proceed to check result
-    assert_eq!(resp.status.as_ref().map(|s| s.code).expect("status should be present"), 0);
+    let code = match resp.status.as_ref() {
+        Some(s) => s.code,
+        None => -1,
+    };
+    assert_eq!(code, 0);
 }
 
 /// Verify that ExecuteResponse with no status field is treated as OK.
