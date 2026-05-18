@@ -15,6 +15,22 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 
+/// Errors from [`check_status`].
+#[derive(Debug, Error)]
+pub enum ExecuteError {
+    /// Server returned a non-OK status.
+    #[error("execution failed: {message} (code={code})")]
+    Status {
+        /// The gRPC status code (non-zero).
+        code: i32,
+        /// The error message from the server.
+        message: String,
+    },
+    /// `ExecuteResponse` had no `ActionResult`.
+    #[error("ExecuteResponse missing ActionResult")]
+    MissingResult,
+}
+
 /// TLS configuration for a [`BrokkrClient`] connection.
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -153,6 +169,24 @@ pub struct RunOutcome {
     pub cache_hit: bool,
 }
 
+/// Check server-reported status before accessing result.
+/// Returns `Ok(ActionResult)` if status is OK or absent (owned copy).
+/// Returns `Err(ExecuteError)` if status.code != 0 or result is absent.
+pub fn check_status(resp: &rapi::ExecuteResponse) -> Result<rapi::ActionResult, ExecuteError> {
+    if let Some(status) = &resp.status {
+        if status.code != 0 {
+            return Err(ExecuteError::Status {
+                code: status.code,
+                message: status.message.clone(),
+            });
+        }
+    }
+    match resp.result.clone() {
+        Some(r) => Ok(r),
+        None => Err(ExecuteError::MissingResult),
+    }
+}
+
 /// Run `argv` on the cluster and return its result.
 ///
 /// Builds an `Action` (with empty input root + the given Command), uploads
@@ -283,9 +317,11 @@ pub async fn run_command(
             Some(brokkr_proto::longrunning::operation::Result::Response(any)) => {
                 let resp = rapi::ExecuteResponse::decode(any.value.as_slice())
                     .context("decoding ExecuteResponse")?;
-                let result = resp
-                    .result
-                    .ok_or_else(|| anyhow!("ExecuteResponse missing ActionResult"))?;
+                let status_code = resp.status.as_ref().map(|s| s.code).unwrap_or(0);
+                let result = check_status(&resp).map_err(|e| anyhow!("{e}"))?;
+                if status_code != 0 {
+                    tracing::Span::current().record("exec_status_code", status_code);
+                }
                 tracing::Span::current()
                     .record("cache_hit", resp.cached_result)
                     .record("exit_code", result.exit_code);
