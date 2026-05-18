@@ -1,68 +1,97 @@
-//! Tests for ExecuteResponse status handling.
+//! Tests for ExecuteResponse status handling via `check_status`.
 //!
-//! These tests verify that the SDK correctly surfaces server-reported
-//! errors from ExecuteResponse.status. See issue #61.
+//! These tests verify the pure `check_status` function that underpins
+//! `run_command`'s error-path behavior. See issue #61.
 
 #![allow(clippy::disallowed_methods, clippy::unwrap_used)]
 
 use brokkr_proto::google::rpc::Status as RpcStatus;
-use brokkr_proto::reapi_v2::ExecuteResponse;
+use brokkr_proto::reapi_v2::{ExecuteResponse, ActionResult};
 
-/// Verify that an ExecuteResponse with status.code != 0 is detected.
+use brokkr_sdk::client::check_status;
+
+/// ExecuteResponse with status.code != 0 returns Err((code, message)).
 #[test]
-fn execute_response_non_zero_status() {
-    let status = RpcStatus {
-        code: 3, // FAILED_PRECONDITION
-        message: "missing input blob".to_string(),
-        details: vec![],
-    };
+fn check_status_nonzero_code_returns_err() {
     let resp = ExecuteResponse {
-        status: Some(status),
+        status: Some(RpcStatus {
+            code: 3, // FAILED_PRECONDITION
+            message: "missing input blob".to_string(),
+            details: vec![],
+        }),
         result: None,
         cached_result: false,
         ..Default::default()
     };
 
-    // Sanity check: status is present and non-OK
-    assert!(resp.status.is_some(), "status should be present");
-    let s = resp.status.as_ref().unwrap();
-    assert_eq!(s.code, 3);
-    assert_eq!(s.message, "missing input blob");
+    let result = check_status(&resp);
+    assert!(result.is_err());
+    let (code, msg) = result.unwrap_err();
+    assert_eq!(code, 3);
+    assert_eq!(msg, "missing input blob");
 }
 
-/// Verify that ExecuteResponse with OK status (code == 0) passes the check.
+/// ExecuteResponse with status.code == 0 and result present returns Ok.
 #[test]
-fn execute_response_ok_status() {
-    let status = RpcStatus {
-        code: 0, // OK
-        message: String::new(),
-        details: vec![],
-    };
+fn check_status_zero_code_with_result_returns_ok() {
     let resp = ExecuteResponse {
-        status: Some(status),
-        result: None,
+        status: Some(RpcStatus {
+            code: 0,
+            message: String::new(),
+            details: vec![],
+        }),
+        result: Some(ActionResult {
+            exit_code: 0,
+            stdout_raw: b"hello".to_vec(),
+            stderr_raw: b"".to_vec(),
+            ..Default::default()
+        }),
         cached_result: false,
         ..Default::default()
     };
 
-    // Code 0 means OK — the SDK would proceed to check result
-    let code = match resp.status.as_ref() {
-        Some(s) => s.code,
-        None => -1,
-    };
-    assert_eq!(code, 0);
+    let result = check_status(&resp);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().exit_code, 0);
 }
 
-/// Verify that ExecuteResponse with no status field is treated as OK.
+/// ExecuteResponse with no status field is treated as OK (proceeds).
 #[test]
-fn execute_response_missing_status() {
-    let resp: ExecuteResponse = ExecuteResponse {
+fn check_status_none_treated_as_ok() {
+    let resp = ExecuteResponse {
         status: None,
+        result: Some(ActionResult {
+            exit_code: 42,
+            stdout_raw: b"".to_vec(),
+            stderr_raw: b"".to_vec(),
+            ..Default::default()
+        }),
+        cached_result: false,
+        ..Default::default()
+    };
+
+    let result = check_status(&resp);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().exit_code, 42);
+}
+
+/// ExecuteResponse with OK status but no result returns Err.
+#[test]
+fn check_status_result_none_returns_err() {
+    let resp = ExecuteResponse {
+        status: Some(RpcStatus {
+            code: 0,
+            message: String::new(),
+            details: vec![],
+        }),
         result: None,
         cached_result: false,
         ..Default::default()
     };
 
-    // Missing status means OK per REAPI spec
-    assert!(resp.status.is_none());
+    let result = check_status(&resp);
+    assert!(result.is_err());
+    let (code, msg) = result.unwrap_err();
+    assert_eq!(code, 0);
+    assert_eq!(msg, "ExecuteResponse missing ActionResult");
 }

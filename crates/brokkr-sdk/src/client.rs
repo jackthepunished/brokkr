@@ -153,6 +153,24 @@ pub struct RunOutcome {
     pub cache_hit: bool,
 }
 
+/// Check server-reported status before accessing result.
+/// Returns `Ok(ActionResult)` if status is OK or absent (owned copy).
+/// Returns `Err((code, message))` if status.code != 0.
+/// Check server-reported status before accessing result.
+/// Returns `Ok(ActionResult)` if status is OK or absent (owned copy).
+/// Returns `Err((code, message))` if status.code != 0.
+pub fn check_status(resp: &rapi::ExecuteResponse) -> Result<rapi::ActionResult, (i32, &str)> {
+    if let Some(status) = &resp.status {
+        if status.code != 0 {
+            return Err((status.code, status.message.as_str()));
+        }
+    }
+    match resp.result.clone() {
+        Some(r) => Ok(r),
+        None => Err((0, "ExecuteResponse missing ActionResult")),
+    }
+}
+
 /// Run `argv` on the cluster and return its result.
 ///
 /// Builds an `Action` (with empty input root + the given Command), uploads
@@ -283,21 +301,12 @@ pub async fn run_command(
             Some(brokkr_proto::longrunning::operation::Result::Response(any)) => {
                 let resp = rapi::ExecuteResponse::decode(any.value.as_slice())
                     .context("decoding ExecuteResponse")?;
-                // Check server-reported status before accessing result.
-                // Per REAPI spec, non-OK status means the action did not finish.
-                if let Some(status) = &resp.status {
-                    if status.code != 0 {
-                        tracing::Span::current().record("exec_status_code", status.code);
-                        return Err(anyhow!(
-                            "execution failed: {} (code={})",
-                            status.message,
-                            status.code
-                        ));
-                    }
+                let result = check_status(&resp)
+                    .map_err(|(code, msg)| anyhow!("execution failed: {} (code={})", msg, code))?;
+                let status_code = resp.status.as_ref().map(|s| s.code).unwrap_or(0);
+                if status_code != 0 {
+                    tracing::Span::current().record("exec_status_code", status_code);
                 }
-                let result = resp
-                    .result
-                    .ok_or_else(|| anyhow!("ExecuteResponse missing ActionResult"))?;
                 tracing::Span::current()
                     .record("cache_hit", resp.cached_result)
                     .record("exit_code", result.exit_code);
