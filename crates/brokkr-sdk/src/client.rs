@@ -287,6 +287,7 @@ pub async fn run_command(
                 // Per REAPI spec, non-OK status means the action did not finish.
                 if let Some(status) = &resp.status {
                     if status.code != 0 {
+                        tracing::Span::current().record("exec_status_code", status.code);
                         return Err(anyhow!(
                             "execution failed: {} (code={})",
                             status.message,
