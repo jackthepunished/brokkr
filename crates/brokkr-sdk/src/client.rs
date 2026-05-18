@@ -283,6 +283,17 @@ pub async fn run_command(
             Some(brokkr_proto::longrunning::operation::Result::Response(any)) => {
                 let resp = rapi::ExecuteResponse::decode(any.value.as_slice())
                     .context("decoding ExecuteResponse")?;
+                // Check server-reported status before accessing result.
+                // Per REAPI spec, non-OK status means the action did not finish.
+                if let Some(status) = &resp.status {
+                    if status.code != 0 {
+                        return Err(anyhow!(
+                            "execution failed: {} (code={})",
+                            status.message,
+                            status.code
+                        ));
+                    }
+                }
                 let result = resp
                     .result
                     .ok_or_else(|| anyhow!("ExecuteResponse missing ActionResult"))?;
