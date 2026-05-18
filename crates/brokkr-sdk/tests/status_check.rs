@@ -3,12 +3,12 @@
 //! These tests verify the pure `check_status` function that underpins
 //! `run_command`'s error-path behavior. See issue #61.
 
-#![allow(clippy::disallowed_methods, clippy::unwrap_used)]
+#![allow(clippy::disallowed_methods, clippy::unwrap_used, clippy::panic)]
 
 use brokkr_proto::google::rpc::Status as RpcStatus;
 use brokkr_proto::reapi_v2::{ActionResult, ExecuteResponse};
 
-use brokkr_sdk::client::check_status;
+use brokkr_sdk::client::{check_status, ExecuteError};
 
 /// ExecuteResponse with status.code != 0 returns Err((code, message)).
 #[test]
@@ -26,9 +26,11 @@ fn check_status_nonzero_code_returns_err() {
 
     let result = check_status(&resp);
     assert!(result.is_err());
-    let (code, msg) = result.unwrap_err();
+    let ExecuteError::Status { code, message } = result.unwrap_err() else {
+        panic!("expected Status variant");
+    };
     assert_eq!(code, 3);
-    assert_eq!(msg, "missing input blob");
+    assert_eq!(message, "missing input blob");
 }
 
 /// ExecuteResponse with status.code == 0 and result present returns Ok.
@@ -91,7 +93,6 @@ fn check_status_result_none_returns_err() {
 
     let result = check_status(&resp);
     assert!(result.is_err());
-    let (code, msg) = result.unwrap_err();
-    assert_eq!(code, 0);
-    assert_eq!(msg, "ExecuteResponse missing ActionResult");
+    let err = result.unwrap_err();
+    assert!(matches!(err, ExecuteError::MissingResult));
 }
