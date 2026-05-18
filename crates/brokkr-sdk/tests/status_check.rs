@@ -6,7 +6,7 @@
 #![allow(clippy::disallowed_methods, clippy::unwrap_used)]
 
 use brokkr_proto::google::rpc::Status as RpcStatus;
-use brokkr_proto::reapi_v2::{ExecuteResponse, ActionResult};
+use brokkr_proto::reapi_v2::{ActionResult, ExecuteResponse};
 
 use brokkr_sdk::client::check_status;
 
