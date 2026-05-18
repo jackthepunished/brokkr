@@ -1,6 +1,8 @@
 //! Worker control loop: register, open the bidi stream, then for each job
 //! received run the command and report the result.
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
@@ -17,6 +19,17 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::runner::{proto_digest, run_command, RunOutcome, Runner};
 
+/// TLS configuration for connecting to the control plane.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// CA certificate to verify the server certificate.
+    pub ca_cert: PathBuf,
+    /// Client certificate for client authentication (mTLS).
+    pub client_cert: Option<PathBuf>,
+    /// Client private key for client authentication (mTLS).
+    pub client_key: Option<PathBuf>,
+}
+
 /// Worker daemon configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -30,6 +43,8 @@ pub struct WorkerConfig {
     /// (`brokkr-worker`) overrides this to [`Runner::Sandboxed`]
     /// unless `--no-sandbox` is passed.
     pub runner: Runner,
+    /// TLS configuration for connecting to the control plane.
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for WorkerConfig {
@@ -38,19 +53,69 @@ impl Default for WorkerConfig {
             control_endpoint: "http://127.0.0.1:7878".to_string(),
             hostname: "worker".to_string(),
             runner: Runner::Plain,
+            tls: None,
         }
     }
+}
+
+/// Build a gRPC channel to the control plane, optionally with TLS.
+async fn build_channel(endpoint: String, tls: Option<&TlsConfig>) -> Result<Channel> {
+    let endpoint = Endpoint::from_shared(endpoint.clone())
+        .with_context(|| format!("invalid endpoint {:?}", endpoint))?;
+
+    let channel = match tls {
+        Some(tls_cfg) => {
+            use tonic::transport::ClientTlsConfig;
+
+            let ca_pem = tokio::fs::read(&tls_cfg.ca_cert)
+                .await
+                .context("reading CA certificate")?;
+            let tls_config = ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem));
+
+            let tls_config = match (&tls_cfg.client_cert, &tls_cfg.client_key) {
+                (Some(_), None) | (None, Some(_)) => {
+                    anyhow::bail!(
+                        "both client_cert and client_key must be provided together for mTLS; \
+                         got client_cert={:?}, client_key={:?}",
+                        tls_cfg.client_cert,
+                        tls_cfg.client_key
+                    );
+                }
+                (Some(cert_path), Some(key_path)) => {
+                    let cert_pem = tokio::fs::read(cert_path)
+                        .await
+                        .context("reading client certificate")?;
+                    let key_pem = tokio::fs::read(key_path)
+                        .await
+                        .context("reading client key")?;
+                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                    tls_config.identity(identity)
+                }
+                _ => tls_config,
+            };
+
+            endpoint
+                .tls_config(tls_config)
+                .context("TLS configuration")?
+                .connect()
+                .await
+                .context("connecting to control plane with TLS")?
+        }
+        None => endpoint
+            .connect()
+            .await
+            .context("connecting to control plane")?,
+    };
+
+    Ok(channel)
 }
 
 /// Run the worker. Returns when the control plane closes the stream or an
 /// unrecoverable error occurs.
 #[tracing::instrument(name = "worker::run", skip(cfg))]
 pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
-    let channel = Endpoint::from_shared(cfg.control_endpoint.clone())
-        .with_context(|| format!("invalid endpoint {:?}", cfg.control_endpoint))?
-        .connect()
-        .await
-        .context("connecting to control plane")?;
+    let channel = build_channel(cfg.control_endpoint.clone(), cfg.tls.as_ref()).await?;
 
     let mut wsc = WorkerServiceClient::new(channel.clone());
     let cas = ContentAddressableStorageClient::new(channel);
