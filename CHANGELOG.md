@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `RedbCas` and `RedbActionCache` now enforce a bounded concurrency
+  limit on `spawn_blocking` tasks (64 and 16 respectively, or
+  configurable via `open_with_limit`). Requests that would exceed
+  the limit return `CasError::ThroughputLimit` immediately instead
+  of queuing unboundedly and risking OS thread-pool exhaustion
+  under high load (issue #65 / H1).
+
 ### Added
 - Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,
   rustfmt/clippy/deny configuration, root README, CONTRIBUTING, LICENSE
