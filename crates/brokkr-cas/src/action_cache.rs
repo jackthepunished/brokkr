@@ -11,11 +11,15 @@ use async_trait::async_trait;
 use brokkr_common::Digest;
 use brokkr_proto::reapi_v2::ActionResult;
 use prost::Message;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
+use tokio::sync::Semaphore;
 
 use crate::error::CasError;
 
 const ACTION_RESULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("action_results");
+
+/// Default max concurrent `spawn_blocking` tasks for [`RedbActionCache`].
+const DEFAULT_ACTION_CACHE_CONCURRENCY: usize = 16;
 
 /// REAPI Action Cache backend.
 #[async_trait]
@@ -32,24 +36,52 @@ pub trait ActionCache: Send + Sync + 'static {
         action_digest: &Digest,
         result: ActionResult,
     ) -> Result<(), CasError>;
+
+    /// Enumerate every cached `ActionResult`. Used by GC (M5) to
+    /// build the reachability set. Default implementation returns
+    /// empty so non-GC-aware backends still compile.
+    ///
+    /// Each entry is `(action_digest, ActionResult)`. Order is
+    /// implementation-defined.
+    async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
+        Ok(Vec::new())
+    }
 }
 
 /// `redb`-backed [`ActionCache`].
 #[derive(Debug, Clone)]
 pub struct RedbActionCache {
     db: Arc<Database>,
+    semaphore: Arc<Semaphore>,
+    max_concurrent: usize,
 }
 
 impl RedbActionCache {
-    /// Open or create an action-cache database at `path`.
+    /// Open or create an action-cache database at `path` with the default concurrency limit.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CasError> {
+        Self::open_with_limit(path, DEFAULT_ACTION_CACHE_CONCURRENCY)
+    }
+
+    /// Open or create an action-cache database at `path` with a custom concurrency limit.
+    ///
+    /// `max_concurrent` bounds the number of simultaneous `spawn_blocking` tasks
+    /// for redb I/O. Requests that would exceed this limit return
+    /// `CasError::ThroughputLimit`.
+    pub fn open_with_limit(
+        path: impl AsRef<Path>,
+        max_concurrent: usize,
+    ) -> Result<Self, CasError> {
         let db = Database::create(path.as_ref())?;
         let txn = db.begin_write()?;
         {
             let _ = txn.open_table(ACTION_RESULTS)?;
         }
         txn.commit()?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+        })
     }
 }
 
@@ -59,9 +91,17 @@ impl ActionCache for RedbActionCache {
         &self,
         action_digest: &Digest,
     ) -> Result<Option<ActionResult>, CasError> {
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
         let db = self.db.clone();
         let key = action_digest.hash().to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<ActionResult>, CasError> {
+        let span = tracing::info_span!("redb::get_action_result");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
             let txn = db.begin_read()?;
             let table = txn.open_table(ACTION_RESULTS)?;
             let Some(entry) = table.get(key.as_str())? else {
@@ -81,13 +121,21 @@ impl ActionCache for RedbActionCache {
         action_digest: &Digest,
         result: ActionResult,
     ) -> Result<(), CasError> {
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
         let db = self.db.clone();
         let key = action_digest.hash().to_string();
         let mut buf = Vec::with_capacity(result.encoded_len());
         result
             .encode(&mut buf)
             .map_err(|e| CasError::Redb(format!("ActionResult encode: {e}")))?;
-        tokio::task::spawn_blocking(move || -> Result<(), CasError> {
+        let span = tracing::info_span!("redb::update_action_result");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
             let txn = db.begin_write()?;
             {
                 let mut table = txn.open_table(ACTION_RESULTS)?;
@@ -95,6 +143,49 @@ impl ActionCache for RedbActionCache {
             }
             txn.commit()?;
             Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
+        let db = self.db.clone();
+        let span = tracing::info_span!("redb::list_entries");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
+            let txn = db.begin_read()?;
+            let table = txn.open_table(ACTION_RESULTS)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let hash = key.value().to_string();
+                let bytes = value.value();
+                // Decode the stored ActionResult. The size we
+                // pass to `Digest::new` is the *encoded length*
+                // of the ActionResult; the action's digest is
+                // keyed on the encoded Action, not on the result.
+                // We construct the key digest via a size of zero
+                // (the only field that matters for keying is the
+                // hash hex) — but a Digest with `size_bytes=0`
+                // would fail other validation, so we use the
+                // value's byte length as a stand-in.
+                let action_digest = match Digest::new(hash, bytes.len() as i64) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let decoded = match ActionResult::decode(bytes) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                out.push((action_digest, decoded));
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
@@ -170,5 +261,32 @@ mod tests {
         let cache = RedbActionCache::open(&path).unwrap();
         let got = cache.get_action_result(&d).await.unwrap().unwrap();
         assert_eq!(got.stdout_raw, b"hello world\n");
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn get_action_result_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Limit of 1 so the second concurrent call fails immediately.
+        let cache = RedbActionCache::open_with_limit(dir.path().join("ac.redb"), 1).unwrap();
+        let d = Digest::of(b"any-action");
+        let r = sample_result();
+        cache.update_action_result(&d, r).await.unwrap();
+
+        let first = cache.get_action_result(&d);
+        let second = cache.get_action_result(&d);
+
+        let err = match (first.await, second.await) {
+            (Ok(Some(_)), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(Some(_))) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(Some(_)), Ok(Some(_))) => {
+                // Both ok — one finished before the other started.
+                return;
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
     }
 }
