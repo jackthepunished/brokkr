@@ -26,6 +26,14 @@ pub enum CasError {
     /// (proto decode failures, malformed tree entries, etc.).
     #[error("{0}")]
     Other(String),
+
+    /// The concurrent request limit was reached; the caller should
+    /// retry after backing off.
+    #[error("concurrent request limit exceeded (limit = {limit})")]
+    ThroughputLimit {
+        /// The configured concurrency limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl From<redb::Error> for CasError {
