@@ -387,6 +387,207 @@ filesystem from inside the sandbox.
 `-EIO` to the kernel and the action sees a read error. We surface
 this in the worker log and in the ActionResult's `stderr_raw`.
 
+#### 5.5.1 M6b — FUSE sub-plan
+
+M6a (committed in 407f88a) gave us the eager-copy fallback
+(`brokkr-cas::tree::materialize_tree`). M6b layers the FUSE
+filesystem on top so multi-GiB input trees mount in ~ms and
+only the bytes the action actually reads transfer from CAS.
+This sub-plan freezes the design choices that §5.5 left open.
+
+**Crate placement.** The FUSE filesystem lives in
+`crates/brokkr-worker/src/fuse.rs`, **not** in `brokkr-cas`.
+Rationale: `brokkr-cas` must stay portable (it compiles on
+macOS / Windows for the CLI), `fuser` is Linux-only at
+runtime, and the mount lifecycle is owned by the worker per
+action. The filesystem depends on `brokkr-cas` for the
+`Cas` trait and the `Directory` walk; no inverse dep.
+
+**Public surface.**
+
+```rust
+// brokkr-worker/src/fuse.rs
+
+/// A live FUSE mount for one action's input tree.
+/// Dropping the handle unmounts and joins the background
+/// fuser thread (with a bounded timeout, then `fusermount -uz`).
+pub struct InputMount {
+    mountpoint: PathBuf,
+    cache_dir:  PathBuf,
+    _bg: JoinHandle<()>,
+    // ... unmount sentinel ...
+}
+
+pub struct InputMountSpec {
+    pub root_digest: Digest,
+    pub mountpoint:  PathBuf,    // /var/lib/brokkr/work/<job>/inputs
+    pub cache_dir:   PathBuf,    // /var/lib/brokkr/work/<job>/cache
+}
+
+pub async fn mount(
+    cas: Arc<dyn Cas>,
+    spec: InputMountSpec,
+) -> Result<InputMount, MountError>;
+```
+
+`mount()` is `async` because it pre-fetches the full
+`Directory` Merkle DAG (small — only proto bytes, no file
+content) before returning, so the kernel's first `readdir`
+hits an in-memory tree. File content is fetched lazily.
+
+**Inode table.** Walking the DAG builds a `Vec<Inode>` keyed
+by `ino: u64` (starting at `FUSE_ROOT_ID = 1`). Each inode
+carries:
+
+```rust
+enum InodeKind {
+    Dir   { entries: HashMap<OsString, u64> /* name -> child ino */ },
+    File  { digest: Digest, size: u64, exec: bool,
+            cached: OnceCell<PathBuf> },
+    Link  { target: OsString },
+}
+```
+
+Symlink targets are returned verbatim from `readlink` (REAPI
+v2 §SymlinkNode). The DAG is finite and acyclic by
+construction (digests-as-IDs); no cycle detection.
+
+**Lazy fetch on `read`.** First `read` for a file inode
+fetches the whole blob from CAS into
+`<cache_dir>/<hex(digest)>`, then `mmap`s it. `OnceCell`
+serializes the fetch — concurrent kernel reads of the same
+inode wait on the first fetcher rather than racing N
+duplicate CAS round-trips. `read` then serves from the
+mmap. We `fadvise(WILLNEED)` after mmap and
+`fadvise(DONTNEED)` on `InputMount::drop` (§9 risk:
+"memory-mapped FUSE backing files can survive umount").
+
+**Tokio / fuser bridge.** `fuser::spawn_mount2` runs on a
+dedicated OS thread (it loops on the `/dev/fuse` fd
+synchronously). Lazy fetches inside FUSE callbacks need
+async CAS calls — we hold a `tokio::runtime::Handle` and use
+`handle.block_on(cas.get(&digest))` from the FUSE thread. A
+shared `Arc<dyn Cas>` and a bounded `Semaphore` (default 16)
+cap per-mount concurrent fetches so a runaway action can't
+starve the worker's runtime.
+
+**Mount lifecycle.** Owned by the worker, one mount per
+running action. The job-runner sequence becomes:
+
+```
+1. resolve action.input_root_digest
+2. let mount = fuse::mount(cas, spec).await?
+3. update RootfsSpec.ro_binds with mount.mountpoint -> /work/inputs
+4. run sandbox (existing Phase 2 path)
+5. drop(mount)   // unmount + cleanup happens here
+```
+
+The drop guard uses `fuser`'s `BackgroundSession::join()` with
+a 5 s timeout; on timeout we shell out to `fusermount -uz`
+(lazy unmount) and log a warning. The job dir is rm-rf'd
+afterwards.
+
+**Sandbox interaction.** The mount path is a regular
+filesystem from inside the sandbox — no FUSE awareness in
+`brokkr-sandbox`. The bind is `MS_BIND | MS_REC | MS_RDONLY`,
+same as any other ro input bind. The sandbox's mount
+namespace is created after the FUSE mount is live, so the
+FUSE fd belongs to the worker, not the sandbox.
+
+**Host probe.** `brokkr-sandbox::checks::linux` gains a
+`fuse_device` probe:
+
+| Outcome | Trigger |
+|---|---|
+| `Pass` | `/dev/fuse` exists, readable, writable. |
+| `Warn` | `/dev/fuse` exists but worker uid lacks rw (e.g. WSL default). Hint: `sudo chmod 666 /dev/fuse` or add user to `fuse` group. |
+| `Fail` | `/dev/fuse` missing (no `fuse` kernel module). Hint: `sudo modprobe fuse` (WSL2) or kernel rebuild. |
+
+This is surfaced through the existing `worker --check-host`
+flag — no new flag.
+
+**Failure shapes.** New `MountError` enum, `thiserror`:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum MountError {
+    #[error("FUSE device unavailable: {0}")]
+    Device(String),                       // -> /dev/fuse missing/eperm
+    #[error("mount syscall failed: {0}")]
+    Mount(std::io::Error),
+    #[error("input tree walk failed: {0}")]
+    Tree(#[from] brokkr_cas::CasError),
+    #[error("mountpoint not empty: {0}")]
+    Dirty(PathBuf),
+}
+```
+
+`-EIO` is returned to the kernel for any in-flight `read`
+failure, and the underlying `CasError` is logged with the
+mount's `tracing` span (`fuse.mount=<path>, action=<id>`).
+
+**Testing strategy.**
+
+- **Unit tests, no FUSE.** The inode table builder
+  (`Directory` proto → `Vec<Inode>`) is pure; tested in
+  isolation against five fixtures (empty / flat / nested /
+  exec-bit / symlink) shared with M6a.
+- **Integration test, `#[cfg(target_os = "linux")]` +
+  `#[ignore]` by default.** Mounts a synthetic 3-file tree
+  against `InMemoryCas`, opens & reads each file, asserts
+  byte equality, drops the handle, asserts the mountpoint is
+  empty. Gated on `/dev/fuse` accessibility (skip with a
+  log line otherwise — same shape as the existing sandbox
+  tests).
+- **Lazy-fetch assertion.** A wrapping `CountingCas` records
+  every `get(digest)`; the test reads two of three files
+  and asserts `get` was called exactly twice.
+- **Soak hook for M7.** The three-node soak adds a 5 GiB
+  synthetic tree and asserts mount time `< 100 ms` and
+  measured CAS bytes transferred ≈ bytes-read-by-action.
+
+**New deps.**
+
+- `fuser = "0.15"` — actively maintained pure-Rust FUSE
+  bindings, used by major projects (rust-fuse fork). License
+  MIT. Optional `unprivileged` feature off by default; we
+  use the privileged path.
+- `memmap2 = "0.9"` — already in the tree? If not, justify
+  as the obvious choice for `mmap` wrappers (BSD license,
+  widely vendored).
+
+**Out of scope for M6b** (explicit, to prevent creep):
+
+- Output-tree FUSE (upload-on-`close`). Outputs stay
+  materialised to local disk and walked by `build_tree_into`.
+- macOS / FUSE-T support. `#[cfg(target_os = "linux")]`
+  gates the entire module; non-Linux workers panic on
+  `mount()` with a clear error. Phase 6 can revisit.
+- Read-ahead / speculative prefetch (deferred per §1.2).
+- Per-file LRU eviction of the cache. The cache lives for
+  the lifetime of one action and is rm-rf'd on `Drop` — no
+  intra-action eviction.
+
+**Definition of done for M6b.**
+
+1. `fuse::mount(spec)` returns a live `InputMount` in
+   < 100 ms for a tree with up to 10k entries (DAG walk,
+   no file fetches).
+2. Reading a 1 MiB file through the mount produces exactly
+   one CAS `get` for that digest; re-reading the same file
+   produces zero further `get`s.
+3. Dropping the `InputMount` unmounts cleanly within 5 s on
+   the happy path; falls back to `fusermount -uz` and logs
+   on timeout.
+4. `worker --check-host` reports a `fuse_device` line and
+   exits non-zero on `Fail`.
+5. `cargo clippy --workspace --all-targets -- -D warnings`
+   clean; new tests green on Linux; non-Linux compile
+   succeeds (module is `cfg`-gated, with a stub returning
+   `MountError::Device("not linux")`).
+6. CHANGELOG `## Unreleased` entry; rustdoc on public
+   surface; tracing span on `mount()` and per-`read`.
+
 ### 5.6 Garbage collection
 
 **Reachability.** A blob is reachable if any of:
@@ -537,8 +738,9 @@ REAPI protos are unchanged — `ContentAddressableStorage` and
 | M3 | `feat/phase3-tiered-storage`                 | Hot / warm / cold tiers composed via `TieredStore`; OpenDAL behind a feature flag for the cold tier; tier-promotion tests. | ~800 |
 | M4 | `feat/phase3-replication`                    | Quorum write + read fan-out across replicas; partial-failure tests; the existing single-node CAS becomes a `R=1` special case. | ~700 |
 | M5 | `feat/phase3-peer-repair-and-gc`             | `CasPeer.Replicate` for async catch-up; `brokk admin gc` subcommand + control-plane GC daemon.       | ~700     |
-| M6 | `feat/phase3-fuse-input-materialization`     | FUSE input mount in the worker; lazy fetch; sandbox bind-in of the mount; integration test.        | ~800     |
-| M7 | `feat/phase3-three-node-soak-and-journal`    | Three-node soak test (M3 §7.3); Phase 3 journal retrospective; plan updates.                       | ~250     |
+| M6a | `feat/phase3-tree-materialization`          | Eager `materialize_tree` / `build_tree_into` in `brokkr-cas`: REAPI `Directory` ↔ on-disk tree, files/dirs/symlinks/exec-bit, six unit tests. Foundation for M6b. | ~450 |
+| M6b | `feat/phase3-fuse-input-materialization`    | FUSE input mount in the worker via `fuser`; lazy fetch on first `read(2)`; per-action mount lifecycle; `--check-host` FUSE probe; integration test.            | ~750 |
+| M7  | `feat/phase3-three-node-soak-and-journal`   | Three-node soak test (M3 §7.3); Phase 3 journal retrospective; plan updates.                       | ~250     |
 
 Total: ~4.4k lines including tests.
 

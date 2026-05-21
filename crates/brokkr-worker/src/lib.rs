@@ -7,6 +7,7 @@
 
 #![deny(missing_docs)]
 
+pub mod fuse;
 pub mod runner;
 pub mod worker;
 
