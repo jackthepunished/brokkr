@@ -28,7 +28,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # RPC / proto
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
@@ -67,6 +67,10 @@ tempfile = "3"
 
 # Linux primitives (sandbox)
 nix = { version = "0.29", default-features = false, features = ["fs", "hostname", "mount", "process", "sched", "signal", "user"] }
+
+# FUSE input materialisation (M6b, worker only, Linux only at runtime)
+fuser = "0.17"
+memmap2 = "0.9"
 
 # Internal crates
 brokkr-common = { path = "crates/brokkr-common", version = "0.1.0" }

@@ -7,6 +7,8 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
+unmaintained = "none"
+ignore = ["RUSTSEC-2026-0104"]
 
 [licenses]
 version = 2

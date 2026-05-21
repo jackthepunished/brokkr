@@ -63,6 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on Linux x86_64 and aarch64.
 - ADR 0001 — Rust everywhere.
 - `docs/journal/phase-0.md` — Phase 0 retrospective.
+- `brokkr-sandbox`: seccomp argument-level filtering for `prctl` and `ioctl`
+  (blocks `PR_SET_KEEPCAPS`, `PR_CAPBSET_DROP`, `PR_SET_TSC`, `PR_GET_TSC`,
+  and terminal/device `ioctl` calls: `TIOCSTI`, `TIOCSWINSZ`, `TIOCGWINSZ`,
+  `TIOCSBRK`, `TIOCCBRK`, `TIOCSPTLCK`). `SYS_fadvise64` removed from the
+  syscall allowlist (absent on aarch64). Tests for
+  `ev09_prctl_set_tsc_blocked`, `ev_prctl_keepcaps_blocked`,
+  `ev_prctl_capbset_drop_blocked`, `ev_prctl_get_tsc_blocked`,
+  `ev_ioctl_tiocsti_blocked`, `ev_ioctl_tiocgwinsz_blocked`,
+  `ev_ioctl_tiocswinsz_blocked`, and `ev_ioctl_tiocptlck_blocked`.
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
@@ -529,3 +538,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-FUSE foundation: workers can use it today on Phase 3
   clusters; M6b will replace it with a FUSE filesystem so trees
   bigger than RAM mount in ~ms without copying every byte.
+- M6b sub-plan written into `docs/phase-3-plan.md` §5.5.1 and
+  `docs/journal/phase-3.md`. Locks in crate placement
+  (`brokkr-worker/src/fuse.rs`), the tokio↔fuser bridge
+  (dedicated thread + `Handle::block_on` with a per-mount
+  `Semaphore`), the RAII `InputMount` lifecycle, the
+  `fuse_device` host probe surfaced via `worker --check-host`,
+  and the M6b definition-of-done.
+- M6b: `brokkr-worker::fuse` — FUSE-backed lazy input
+  materialisation, Linux-only. `fuse::inode::InodeTable`
+  builds a path-resolvable inode map from a REAPI `Directory`
+  Merkle DAG (one CAS read per directory proto, zero file
+  fetches). `fuse::mount::mount(cas, InputMountSpec)` spawns
+  a `fuser` background session that serves `lookup` /
+  `getattr` / `readdir` / `readlink` from the table and
+  fetches file content lazily on first `read(2)`. Per-mount
+  `Semaphore(16)` caps concurrent CAS fetches; per-inode
+  `tokio::sync::OnceCell<Arc<Mmap>>` coalesces concurrent
+  reads of the same file into a single fetch + `mmap`. The
+  `InputMount` RAII handle unmounts on drop with a 5 s
+  `umount_and_join` timeout and a `fusermount -uz` fallback;
+  the per-action cache directory is rm-rf'd after the
+  unmount completes.
+- M6b: `/dev/fuse accessible` probe added to
+  `brokkr-sandbox::checks::linux` and surfaced through the
+  existing `brokkr-worker --check-host`. Three outcomes
+  (`Pass` / `Warn` for present-but-not-rw / `Fail` for
+  missing); does not break sandbox functionality when a
+  worker won't use FUSE.
+- M6b: seven inode-table unit tests (empty / flat / nested /
+  exec-bit / symlink / NotFound / non-dir-parent) and one
+  integration test (`tests/fuse_lazy_fetch.rs`,
+  `#[ignore]` by default) that mounts a 3-file CAS-backed
+  tree, reads two of the three files, and asserts exactly
+  two file-content fetches reached CAS.
+- M6b: new workspace deps `fuser = "0.17"` and `memmap2 = "0.9"`,
+  scoped to `cfg(target_os = "linux")` on `brokkr-worker`.
+  Non-Linux hosts get a compile-time stub
+  (`fuse::mount::MountError::Unsupported`) so the CLI/SDK
+  build stays portable.

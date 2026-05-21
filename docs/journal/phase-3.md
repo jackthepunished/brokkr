@@ -467,6 +467,120 @@ debrief.
   remove the target directory; the worker manages its
   workspace lifecycle.)
 
+## M6b — `feat/phase3-fuse-input-materialization`
+
+- **Date:** 2026-05-17
+- **PR:** _(filled in after merge)_
+- **Outcome:** FUSE-backed lazy input mount shipped in
+  `brokkr-worker::fuse`. `fuse::inode::InodeTable` walks a
+  REAPI `Directory` Merkle DAG into an inode-indexed,
+  path-resolvable map (one CAS read per directory proto, zero
+  file fetches). `fuse::mount::mount(cas, InputMountSpec)`
+  spawns a `fuser` background session that serves `lookup` /
+  `getattr` / `readdir` / `readlink` from RAM and fetches file
+  content lazily on first `read(2)`. Per-mount `Semaphore(16)`
+  caps concurrent CAS fetches; per-inode
+  `tokio::sync::OnceCell<Arc<Mmap>>` coalesces concurrent
+  reads of the same file into a single fetch + mmap. The
+  `InputMount` RAII handle unmounts on drop with a 5 s
+  `umount_and_join` timeout and a `fusermount -uz` fallback;
+  the cache directory is rm-rf'd after the unmount completes.
+  Seven inode-table unit tests; one `#[ignore]`-by-default
+  integration test that mounts a 3-file CAS-backed tree and
+  asserts exactly two CAS fetches when only two files are
+  opened. New `/dev/fuse accessible` host probe surfaced
+  through the existing `worker --check-host`.
+
+### Decisions locked in before coding
+
+- **Crate placement:** `brokkr-worker/src/fuse.rs`. Keeps
+  `brokkr-cas` portable (CLI builds on macOS/Windows); the
+  FUSE thread lives with the runtime that owns the action
+  lifecycle anyway. `brokkr-cas` is consumed via the `Cas`
+  trait only — no inverse dep.
+- **Tokio ↔ fuser bridge:** dedicated OS thread runs
+  `fuser::spawn_mount2`; in-callback async fetches use
+  `Handle::block_on` with a per-mount bounded `Semaphore`.
+  Rejected: a fully-sync CAS façade (would force every CAS
+  caller to grow a sync method), or `tokio::task::spawn` per
+  callback (kernel waits on a sync return — we'd have to
+  block-park anyway).
+- **Mount ownership:** `InputMount` is an RAII handle in the
+  job runner. Drop unmounts with a 5 s join then
+  `fusermount -uz` fallback. The job dir is rm-rf'd by the
+  worker after drop, not by the mount itself — keeps the
+  mount module from depending on workspace layout.
+- **Host probe lives in `brokkr-sandbox::checks::linux`** as
+  `fuse_device`. Three outcomes: `Pass` / `Warn` (WSL
+  permission case) / `Fail` (no `/dev/fuse`). Surfaced via
+  the existing `worker --check-host` flag — no new CLI
+  surface.
+- **Concurrency cap default:** 16 concurrent CAS fetches per
+  mount. Justification: typical action opens hundreds of
+  files but only a handful are large; we want a runaway
+  action with `for f in *.o; do cat $f & done` to throttle,
+  not the worker.
+- **Cache scope:** per-action `cache_dir`, rm-rf'd on drop.
+  No intra-action eviction — the action is the natural unit.
+
+### What surprised me
+
+- **`BackgroundSession::join()` alone hangs forever.** The
+  obvious shape was "drop the handle → call `join()` to wait
+  for the bg thread → done." It deadlocks. fuser's bg loop
+  only exits when its `/dev/fuse` fd is closed by the
+  unmount; the unmount only fires from
+  `BackgroundSession::Drop`'s `UmountOnDrop`. Calling `join`
+  consumes the BackgroundSession but leaves the inner
+  `UmountOnDrop` un-dropped until `join` returns — which
+  never happens because the loop is still reading.
+  `umount_and_join()` is the right primitive: it explicitly
+  `take`s the Mount cookie and umounts before joining. Even
+  with that, on a busy or misbehaving mount the call can
+  hang, so the Drop wraps the whole sequence in a 5 s
+  timeout via a helper thread + `mpsc::recv_timeout`, with
+  `fusermount -uz` as the lazy-detach fallback. That matches
+  what the M6b plan promised and survives the kernel
+  deciding to be slow.
+- **The fuser 0.17 trait signatures use wrapper newtypes
+  (`INodeNo`, `FileHandle`, `OpenFlags`, `LockOwner`,
+  `Errno`), not raw `u64` / `i32`.** Eyeballing the docs
+  example was misleading because the rendered HTML hides the
+  newtype boundaries. `cargo build`'s "expected signature"
+  diagnostic was the fastest way to converge — once one
+  callback matched, the rest fell into place by pattern.
+- **`fuser::Config` is `#[non_exhaustive]`,** so the
+  `Config { mount_options, ..Default::default() }` shape
+  doesn't compile cross-crate. Had to spell it out as
+  `Config::default()` + field assignment. Minor but
+  surprising — the rustdoc doesn't flag the attribute
+  obviously.
+- **Mounting on WSL2 worked first try.** `/dev/fuse` is
+  `crw-rw-rw-` on the WSL2 image I'm using; the
+  `fuse_device` probe reports `Pass` and `spawn_mount2`
+  succeeds without root. The `Warn` branch is there for
+  hardened distros where the device is 0600 root:root —
+  haven't been able to hit that path locally yet, will
+  exercise it via CI matrix later.
+- **The `clippy.toml` `disallowed_methods` rule fires inside
+  `#[cfg(test)]` modules** unless explicitly allowed. The
+  M5b/M6a tests already had the right four-attribute incantation
+  (`clippy::unwrap_used, clippy::expect_used,
+  clippy::disallowed_methods, clippy::panic`); copy-pasted
+  it here. Worth a meta-note: the project's lint set is
+  strict enough that any test module that uses `unwrap` /
+  `panic!` needs the full block.
+- **mmap of cache files survives the unmount in the right
+  direction.** I was worried the cache mmaps (which point at
+  files in a separate directory, not on the FUSE mount)
+  might keep the FUSE thread alive. They don't — the FUSE
+  thread holds `BrokkrFs` which holds the `Arc<Mmap>` slots,
+  and the whole `BrokkrFs` goes away when the bg thread
+  exits. The Drop's "unmount first, then rm-rf the cache"
+  ordering is still right because the kernel might be
+  servicing a final `read` callback that's mid-mmap when
+  unmount lands.
+
 ## M7 — `feat/phase3-soak-and-journal`
 
 - **Date:** 2026-05-17

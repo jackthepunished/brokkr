@@ -291,10 +291,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_run_produces_eight_outcomes() {
+    fn linux_run_produces_all_outcomes() {
         let report = run();
         assert_eq!(report.os, "linux");
-        assert_eq!(report.outcomes.len(), 8);
+        // Eight Phase-2 sandbox probes + the M6b `/dev/fuse` probe.
+        assert_eq!(report.outcomes.len(), 9);
+        assert!(report
+            .outcomes
+            .iter()
+            .any(|o| o.name == "/dev/fuse accessible"));
     }
 
     #[cfg(not(target_os = "linux"))]

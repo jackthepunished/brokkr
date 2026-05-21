@@ -70,6 +70,7 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
             control_endpoint: worker_endpoint,
             hostname: "test-worker".to_string(),
             runner: Runner::Plain,
+            tls: None,
         };
         let _ = run_worker(cfg).await;
     });

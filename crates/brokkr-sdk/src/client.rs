@@ -1,6 +1,8 @@
 //! High-level Brokkr client. Wraps REAPI's CAS + Execution into a single
 //! "run this command" call.
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
 use brokkr_proto::reapi_v2::{
     self as rapi, action_cache_client::ActionCacheClient, batch_update_blobs_request as bur,
@@ -10,7 +12,52 @@ use brokkr_proto::reapi_v2::{
 use bytes::Bytes;
 use prost::Message;
 use sha2::{Digest as _, Sha256};
+use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
+
+/// Errors from [`check_status`].
+#[derive(Debug, Error)]
+pub enum ExecuteError {
+    /// Server returned a non-OK status.
+    #[error("execution failed: {message} (code={code})")]
+    Status {
+        /// The gRPC status code (non-zero).
+        code: i32,
+        /// The error message from the server.
+        message: String,
+    },
+    /// `ExecuteResponse` had no `ActionResult`.
+    #[error("ExecuteResponse missing ActionResult")]
+    MissingResult,
+}
+
+/// TLS configuration for a [`BrokkrClient`] connection.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// CA certificate to verify the server certificate.
+    pub ca_cert: PathBuf,
+    /// Client certificate for client authentication (mTLS).
+    pub client_cert: Option<PathBuf>,
+    /// Client private key for client authentication (mTLS).
+    pub client_key: Option<PathBuf>,
+}
+
+/// Errors that can occur when connecting a [`BrokkrClient`].
+#[derive(Debug, Error)]
+pub enum ClientError {
+    /// The endpoint URL is invalid.
+    #[error("invalid endpoint: {0}")]
+    InvalidEndpoint(String),
+    /// Reading a certificate or key file failed.
+    #[error("reading TLS certificate: {0}")]
+    CertificateRead(#[from] std::io::Error),
+    /// TLS configuration is invalid.
+    #[error("TLS configuration: {0}")]
+    TlsConfig(String),
+    /// Transport-level error connecting to the server.
+    #[error("transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+}
 
 /// Client connection to a Brokkr control plane.
 #[derive(Clone)]
@@ -25,19 +72,88 @@ impl BrokkrClient {
     /// Connect to the control plane at `endpoint` (e.g.
     /// `http://127.0.0.1:7878`).
     #[tracing::instrument(name = "client::connect", skip(endpoint))]
-    pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+    pub async fn connect(endpoint: impl Into<String>) -> Result<Self, ClientError> {
         let endpoint = endpoint.into();
         let channel = Endpoint::from_shared(endpoint.clone())
-            .with_context(|| format!("invalid endpoint {endpoint:?}"))?
+            .map_err(|e| {
+                ClientError::InvalidEndpoint(format!("invalid endpoint {endpoint:?}: {e}"))
+            })?
             .connect()
             .await
-            .context("connecting to control plane")?;
+            .map_err(ClientError::Transport)?;
         Ok(Self {
             cas: ContentAddressableStorageClient::new(channel.clone()),
             exec: ExecutionClient::new(channel.clone()),
             ac: ActionCacheClient::new(channel),
         })
     }
+
+    /// Connect to the control plane at `endpoint` with mTLS authentication.
+    #[tracing::instrument(name = "client::connect_with_tls", skip(endpoint, tls_cfg))]
+    pub async fn connect_with_tls(
+        endpoint: impl Into<String>,
+        tls_cfg: TlsConfig,
+    ) -> Result<Self, ClientError> {
+        let channel = connect_tls(endpoint, &tls_cfg).await?;
+        Ok(Self {
+            cas: ContentAddressableStorageClient::new(channel.clone()),
+            exec: ExecutionClient::new(channel.clone()),
+            ac: ActionCacheClient::new(channel),
+        })
+    }
+}
+
+/// Establish a TLS channel to the control plane.
+async fn connect_tls(
+    endpoint: impl Into<String>,
+    tls_cfg: &TlsConfig,
+) -> Result<Channel, ClientError> {
+    use tonic::transport::ClientTlsConfig;
+
+    let endpoint = endpoint.into();
+
+    // Reject partial client identity: one of cert/key without the other.
+    match (&tls_cfg.client_cert, &tls_cfg.client_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ClientError::TlsConfig(
+                "both client_cert and client_key must be provided for client identity".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    let endpoint = Endpoint::from_shared(endpoint.clone())
+        .map_err(|e| ClientError::InvalidEndpoint(format!("invalid endpoint {endpoint:?}: {e}")))?;
+
+    let ca_pem = tokio::fs::read(&tls_cfg.ca_cert)
+        .await
+        .map_err(ClientError::CertificateRead)?;
+    let tls_config =
+        ClientTlsConfig::new().ca_certificate(tonic::transport::Certificate::from_pem(ca_pem));
+
+    // If client identity is provided, add it to the TLS config.
+    let tls_config = match (&tls_cfg.client_cert, &tls_cfg.client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = tokio::fs::read(cert_path)
+                .await
+                .map_err(ClientError::CertificateRead)?;
+            let key_pem = tokio::fs::read(key_path)
+                .await
+                .map_err(ClientError::CertificateRead)?;
+            let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+            tls_config.identity(identity)
+        }
+        _ => tls_config,
+    };
+
+    let channel = endpoint
+        .tls_config(tls_config)
+        .map_err(ClientError::Transport)?
+        .connect()
+        .await
+        .map_err(ClientError::Transport)?;
+
+    Ok(channel)
 }
 
 /// Outcome of [`run_command`].
@@ -51,6 +167,24 @@ pub struct RunOutcome {
     pub stderr: Bytes,
     /// True if the action was served from the action cache without re-running.
     pub cache_hit: bool,
+}
+
+/// Check server-reported status before accessing result.
+/// Returns `Ok(ActionResult)` if status is OK or absent (owned copy).
+/// Returns `Err(ExecuteError)` if status.code != 0 or result is absent.
+pub fn check_status(resp: &rapi::ExecuteResponse) -> Result<rapi::ActionResult, ExecuteError> {
+    if let Some(status) = &resp.status {
+        if status.code != 0 {
+            return Err(ExecuteError::Status {
+                code: status.code,
+                message: status.message.clone(),
+            });
+        }
+    }
+    match resp.result.clone() {
+        Some(r) => Ok(r),
+        None => Err(ExecuteError::MissingResult),
+    }
 }
 
 /// Run `argv` on the cluster and return its result.
@@ -183,9 +317,11 @@ pub async fn run_command(
             Some(brokkr_proto::longrunning::operation::Result::Response(any)) => {
                 let resp = rapi::ExecuteResponse::decode(any.value.as_slice())
                     .context("decoding ExecuteResponse")?;
-                let result = resp
-                    .result
-                    .ok_or_else(|| anyhow!("ExecuteResponse missing ActionResult"))?;
+                let status_code = resp.status.as_ref().map(|s| s.code).unwrap_or(0);
+                let result = check_status(&resp).map_err(|e| anyhow!("{e}"))?;
+                if status_code != 0 {
+                    tracing::Span::current().record("exec_status_code", status_code);
+                }
                 tracing::Span::current()
                     .record("cache_hit", resp.cached_result)
                     .record("exit_code", result.exit_code);

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, Result};
 use brokkr_sandbox::{checks, ResourceLimits, Sandbox};
-use brokkr_worker::{run_worker, Runner, SandboxRunner, SandboxTemplate, WorkerConfig};
+use brokkr_worker::{run_worker, Runner, SandboxRunner, SandboxTemplate, TlsConfig, WorkerConfig};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,18 @@ struct Args {
     /// Default per-action `pids.max`. `0` = unlimited.
     #[arg(long)]
     sandbox_pids_max: Option<u64>,
+
+    /// CA certificate for verifying the control plane server certificate.
+    #[arg(long)]
+    ca: Option<PathBuf>,
+
+    /// Client certificate for mTLS authentication (requires --client-key).
+    #[arg(long, requires = "client_key")]
+    client_cert: Option<PathBuf>,
+
+    /// Client private key for mTLS authentication (requires --client-cert).
+    #[arg(long, requires = "client_cert")]
+    client_key: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -83,11 +95,24 @@ fn main() -> ExitCode {
 }
 
 async fn run_daemon(args: Args) -> Result<()> {
+    let has_client_creds = args.client_cert.is_some() || args.client_key.is_some();
+    if has_client_creds && args.ca.is_none() {
+        anyhow::bail!("--client-cert and --client-key require --ca to be provided");
+    }
     let runner = build_runner(&args)?;
+    let tls = match (&args.ca, &args.client_cert, &args.client_key) {
+        (Some(ca), cert, key) => Some(TlsConfig {
+            ca_cert: ca.clone(),
+            client_cert: cert.clone(),
+            client_key: key.clone(),
+        }),
+        _ => None,
+    };
     let cfg = WorkerConfig {
         control_endpoint: args.control,
         hostname: hostname_or("worker".to_string()),
         runner,
+        tls,
     };
     run_worker(cfg).await
 }

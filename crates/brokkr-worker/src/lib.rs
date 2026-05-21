@@ -7,8 +7,9 @@
 
 #![deny(missing_docs)]
 
+pub mod fuse;
 pub mod runner;
 pub mod worker;
 
 pub use runner::{default_rootfs, Runner, SandboxRunner, SandboxTemplate};
-pub use worker::{run_worker, WorkerConfig};
+pub use worker::{run_worker, TlsConfig, WorkerConfig};

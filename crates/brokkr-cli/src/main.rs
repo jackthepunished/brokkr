@@ -4,7 +4,7 @@
 //! end-to-end happy path.
 
 use anyhow::{anyhow, Context, Result};
-use brokkr_sdk::{run_command, BrokkrClient};
+use brokkr_sdk::{run_command, BrokkrClient, TlsConfig};
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI entrypoint.
@@ -41,6 +41,18 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
+        /// CA certificate for verifying the control plane server certificate.
+        #[arg(long)]
+        tls_ca: Option<String>,
+
+        /// Client certificate for mTLS authentication (requires --tls-client-key).
+        #[arg(long, requires = "tls_client_key")]
+        tls_client_cert: Option<String>,
+
+        /// Client private key for mTLS authentication (requires --tls-client-cert).
+        #[arg(long, requires = "tls_client_cert")]
+        tls_client_key: Option<String>,
+
         /// The command to run, including arguments. Pass via repeated
         /// positional args: `brokk run -- echo hello world`.
         #[arg(trailing_var_arg = true, required = true)]
@@ -63,8 +75,18 @@ fn main() -> Result<()> {
         Command::Run {
             control,
             no_cache,
+            tls_ca,
+            tls_client_cert,
+            tls_client_key,
             argv,
-        } => run_subcmd(control, no_cache, argv),
+        } => run_subcmd(
+            control,
+            no_cache,
+            tls_ca,
+            tls_client_cert,
+            tls_client_key,
+            argv,
+        ),
     }
 }
 
@@ -151,13 +173,40 @@ pub fn init_project(force: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_subcmd(control: String, no_cache: bool, argv: Vec<String>) -> Result<()> {
+fn run_subcmd(
+    control: String,
+    no_cache: bool,
+    tls_ca: Option<String>,
+    tls_client_cert: Option<String>,
+    tls_client_key: Option<String>,
+    argv: Vec<String>,
+) -> Result<()> {
     if argv.is_empty() {
         return Err(anyhow!("`brokk run` requires a command"));
     }
+
+    // Runtime validation: partial mTLS identity is an error.
+    let has_cert = tls_client_cert.is_some();
+    let has_key = tls_client_key.is_some();
+    if has_cert != has_key {
+        anyhow::bail!("both --tls-client-cert and --tls-client-key must be provided together");
+    }
+    if (has_cert || has_key) && tls_ca.is_none() {
+        anyhow::bail!("--tls-client-cert and --tls-client-key require --tls-ca to be provided");
+    }
+
+    let tls = tls_ca.map(|ca| TlsConfig {
+        ca_cert: std::path::PathBuf::from(ca),
+        client_cert: tls_client_cert.map(std::path::PathBuf::from),
+        client_key: tls_client_key.map(std::path::PathBuf::from),
+    });
+
     let rt = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     rt.block_on(async {
-        let mut client = BrokkrClient::connect(control).await?;
+        let mut client = match &tls {
+            Some(tls_cfg) => BrokkrClient::connect_with_tls(control, tls_cfg.clone()).await?,
+            None => BrokkrClient::connect(control).await?,
+        };
         let outcome = run_command(&mut client, &argv, no_cache).await?;
         // Forward stdout/stderr verbatim to the user's terminal.
         use std::io::Write as _;
