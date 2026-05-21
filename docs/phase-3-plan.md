@@ -719,6 +719,103 @@ REAPI protos are unchanged — `ContentAddressableStorage` and
 - 1M random blob operations across a 3-node cluster, with one node
   restarting every 30 seconds. No data loss, no orphaned blobs.
 
+#### 7.3.1 M7 — soak sub-plan
+
+The soak runs as a `#[ignore]`-gated integration test under
+`crates/brokkr-cas/tests/three_node_soak.rs`. Process model is
+**in-process** — `R=2` `ReplicatedCas` over a `StaticPool` of
+three `InMemoryCas` (or `RedbCas` with `tempfile::tempdir()` —
+chosen below) nodes plus the existing `repair_node` primitive.
+No second binary, no Docker, no localhost gRPC — those belong to
+Phase 4's conformance suite. This soak's job is to stress the
+distributed CAS *semantics* (write quorum, read fan-out, peer
+repair after node loss) under continuous churn for a defined
+budget.
+
+**Backend choice.** `InMemoryCas`. The soak measures consistency,
+not durability — wiping a node's state via
+`mem::replace(&mut node, InMemoryCas::new())` is exactly the
+"crash + cold restart" the plan calls out. Disk-backed `RedbCas`
+would add filesystem variance without changing what we're
+checking; defer to a Phase 4 conformance pass with `RedbCas`
+when there's a real cluster binary.
+
+**Default budget.** 25k operations and one restart every 250 ops
+(≈ once per 2 s at the expected throughput) — small enough to
+finish in under a minute on `cargo test --ignored` so devs can
+run it locally, large enough to give peer-repair multiple churn
+cycles to converge. The plan's 1M-op / 1-hour scenario stays
+available via env vars (`BROKKR_SOAK_OPS`, `BROKKR_SOAK_CHURN`,
+`BROKKR_SOAK_DURATION_S`) so CI can scale up; the test prints
+the effective values at start so a failed run's log self-documents.
+
+**Operation mix.** Three operations sampled with replacement:
+
+| Op | Weight | Effect |
+|---|---|---|
+| `put` | 0.45 | New random 64–1024 B blob into `ReplicatedCas`; expect quorum success. Track in a "live" `HashSet<Digest>`. |
+| `get` | 0.45 | Pick a random live digest, read via `ReplicatedCas`; expect success and byte equality. |
+| `find_missing` | 0.10 | Mixed bag of live + non-live digests; expect exactly the non-live set back. |
+
+A small seeded `StdRng` controls reproducibility; the seed is
+printed at test start.
+
+**Churn loop.** A background task picks a random non-primary
+replica every `BROKKR_SOAK_CHURN` ops, swaps it with a fresh
+empty `InMemoryCas` (simulating a cold restart), and then waits
+for `repair_node` against that node to converge. Only one node
+at a time is in the "restarting" state — invariant: the cluster
+always has ≥ `R-1` healthy replicas of every blob (matching the
+plan's tolerance of "one node down at a time").
+
+**Invariants checked at the end** (and continuously where
+cheap):
+
+1. **No data loss.** Every digest in the live set reads
+   successfully via `ReplicatedCas::batch_read_blobs` and matches
+   the original bytes.
+2. **No orphans.** `repair_cluster` after the soak ends reports
+   zero `unrepairable` blobs and zero new repairs (idempotent).
+3. **Peer-repair quiescence.** After the last operation, a final
+   `repair_cluster` pass takes < 1 s — proves the cluster has
+   already self-healed during the soak.
+4. **Bounded blob count per node.** Every node's `list_digests`
+   length matches the digests responsible for it under HRW
+   (`replicas_for(digest, R)`) — no "phantom" entries from
+   replay or double-writes.
+
+**Why this isn't the soak the plan §11 calls out (yet).** The
+plan promises a "1M-op, 1-hour, rolling-restart" run for the
+phase's definition of done. That stays available via the env
+vars (`BROKKR_SOAK_OPS=1000000`,
+`BROKKR_SOAK_DURATION_S=3600`) and is intended for the release
+gate in CI. The committed test uses the default 25k-op budget
+so `cargo test -- --ignored` is a viable pre-merge check.
+
+**Out of scope for M7.**
+
+- A real two-binary cluster bootstrapped by an init script —
+  there's no `brokkr-cas` server binary yet (the CAS is library
+  code consumed by control). That's Phase 4 conformance work.
+- Partial-network-partition simulation (jepsen-style) —
+  explicitly out per §7.4.
+- Adversarial test where the soak triggers a corrupted-byte
+  return — the M3 plan calls out bit-rot detection on read
+  (digest verify) but auto-repair is deferred to Phase 6 per
+  §9 "Deferred".
+
+**Files this milestone touches.**
+
+- `crates/brokkr-cas/tests/three_node_soak.rs` — new, the soak
+  itself (~200 lines).
+- `docs/phase-3-plan.md` — this sub-plan (§7.3.1) and §11
+  definition-of-done item 5 cross-reference.
+- `docs/journal/phase-3.md` — M7 retrospective.
+- `CHANGELOG.md` — Phase 3 Unreleased.
+
+New dev-deps: `rand = "0.8"` is already in the lockfile
+transitively; gate behind `[dev-dependencies]`.
+
 ### 7.4 What we do NOT test in Phase 3
 
 - Jepsen-style consensus violations under arbitrary partitions —

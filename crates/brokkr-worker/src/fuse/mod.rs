@@ -16,7 +16,7 @@
 //! * [`mount`] (Linux only): the `fuser::Filesystem` implementation,
 //!   the [`mount::InputMount`] RAII handle, and the public
 //!   [`mount::mount`] entry point. Compiles to a stub on non-Linux
-//!   that returns [`mount::MountError::Unsupported`].
+//!   that always returns a [`mount::MountError`].
 //!
 //! ## Lifetime
 //!
