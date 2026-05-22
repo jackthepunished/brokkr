@@ -37,6 +37,9 @@ use super::seccomp::install as install_seccomp;
 use super::userns::{setup_namespaces, UidGidMap};
 use super::{die, errno_message};
 
+/// PR_SET_TSC argument that causes the CPU to raise SIGSEGV on any rdtsc/rdtscp instruction.
+const PR_TSC_SIGSEGV: nix::libc::c_ulong = 1;
+
 /// File descriptor on which the host writes the JSON-encoded
 /// `SandboxConfig`. Hard-coded by convention on both sides; see
 /// `docs/phase-2-plan.md` §3.3.
@@ -133,6 +136,20 @@ fn chdir_and_exec(cfg: &SandboxConfig) -> ! {
     if !cfg.rootfs.is_empty() {
         if let Err(e) = drop_all_except(&cfg.retained_caps) {
             die("drop capabilities", &e.to_string());
+        }
+        // M9: disable the timestamp counter so any rdtsc/rdtscp instruction
+        // raises SIGSEGV. Done after dropping caps (so it can't be undone by
+        // the action) but before installing seccomp (so we are still
+        // privileged enough to call prctl).
+        #[allow(unsafe_code)]
+        {
+            let rc = unsafe { nix::libc::prctl(nix::libc::PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0) };
+            if rc != 0 {
+                die(
+                    "prctl(PR_SET_TSC)",
+                    &std::io::Error::last_os_error().to_string(),
+                );
+            }
         }
         if let Err(e) = install_seccomp(&cfg.extra_seccomp_allow) {
             die("install seccomp", &e.to_string());
