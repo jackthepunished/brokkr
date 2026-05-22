@@ -276,7 +276,7 @@ mod tests {
         let first = cache.get_action_result(&d);
         let second = cache.get_action_result(&d);
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(Some(_)), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Err(e), Ok(Some(_))) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Ok(Some(_)), Ok(Some(_))) => {
@@ -300,7 +300,7 @@ mod tests {
         let first = cache.update_action_result(&d, sample_result());
         let second = cache.update_action_result(&d, sample_result());
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(()), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Err(e), Ok(())) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Ok(_a), Ok(_b)) => {
@@ -331,7 +331,7 @@ mod tests {
         let first = cache.list_entries();
         let second = cache.list_entries();
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(_), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Err(e), Ok(_)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Ok(_a), Ok(_b)) => {

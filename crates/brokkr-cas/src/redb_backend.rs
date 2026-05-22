@@ -370,8 +370,7 @@ mod tests {
         let first = cas.find_missing_blobs(binding);
         let second = cas.find_missing_blobs(binding);
 
-        // One must succeed, the other must get ThroughputLimit.
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(m), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => {
                 assert_eq!(m, vec![d]);
                 e
@@ -407,7 +406,7 @@ mod tests {
         let first = cas.batch_update_blobs(vec![(d1.clone(), b1)]);
         let second = cas.batch_update_blobs(vec![(d2.clone(), b2)]);
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(r), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => {
                 assert!(r[0].status.is_ok());
                 e
@@ -443,7 +442,7 @@ mod tests {
         let first = cas.batch_read_blobs(&binding);
         let second = cas.batch_read_blobs(&binding);
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(r), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => {
                 assert!(r[0].as_ref().is_ok());
                 e
@@ -476,7 +475,7 @@ mod tests {
         let first = cas.list_digests();
         let second = cas.list_digests();
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(_), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Err(e), Ok(_)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Ok(a), Ok(b)) => {
@@ -505,7 +504,7 @@ mod tests {
         let first = cas.delete_blob(&d);
         let second = cas.delete_blob(&d);
 
-        let err = match (first.await, second.await) {
+        let err = match tokio::join!(first, second) {
             (Ok(()), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Err(e), Ok(())) if matches!(e, CasError::ThroughputLimit { .. }) => e,
             (Ok(()), Ok(())) => {
