@@ -3,6 +3,7 @@
 //! Single-node, embedded, ACID. Phase 1 storage default for the dev control
 //! plane. Phase 3 replaces this with a sharded, replicated CAS.
 
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,11 +23,21 @@ const DEFAULT_REDB_CAS_CONCURRENCY: usize = 64;
 const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("blobs");
 
 /// On-disk CAS backed by a `redb` database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedbCas {
     db: Arc<Database>,
     semaphore: Arc<Semaphore>,
     max_concurrent: usize,
+}
+
+impl fmt::Debug for RedbCas {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedbCas")
+            .field("db", &self.db)
+            .field("semaphore", &"<Semaphore>")
+            .field("max_concurrent", &self.max_concurrent)
+            .finish()
+    }
 }
 
 impl RedbCas {
@@ -373,6 +384,132 @@ mod tests {
                 // Both succeeded under race; the limit is 1 but the first may
                 // have finished before the second started.
                 assert!(a == vec![d.clone()] || b == vec![d.clone()]);
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn batch_update_blobs_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = RedbCas::open_with_limit(dir.path().join("cas.redb"), 1).unwrap();
+        let (d1, b1) = blob(b"one");
+        let (d2, b2) = blob(b"two");
+
+        let first = cas.batch_update_blobs(vec![(d1.clone(), b1)]);
+        let second = cas.batch_update_blobs(vec![(d2.clone(), b2)]);
+
+        let err = match (first.await, second.await) {
+            (Ok(r), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => {
+                assert!(r[0].status.is_ok());
+                e
+            }
+            (Err(e), Ok(r)) if matches!(e, CasError::ThroughputLimit { .. }) => {
+                assert!(r[0].status.is_ok());
+                e
+            }
+            (Ok(a), Ok(b)) => {
+                // Both ok — one finished before the other started.
+                assert!(a[0].status.is_ok() || b[0].status.is_ok());
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn batch_read_blobs_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = RedbCas::open_with_limit(dir.path().join("cas.redb"), 1).unwrap();
+        let (d, b) = blob(b"read me");
+        cas.batch_update_blobs(vec![(d.clone(), b)]).await.unwrap();
+
+        let binding = [d.clone()];
+        let first = cas.batch_read_blobs(&binding);
+        let second = cas.batch_read_blobs(&binding);
+
+        let err = match (first.await, second.await) {
+            (Ok(r), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => {
+                assert!(r[0].as_ref().is_ok());
+                e
+            }
+            (Err(e), Ok(r)) if matches!(e, CasError::ThroughputLimit { .. }) => {
+                assert!(r[0].as_ref().is_ok());
+                e
+            }
+            (Ok(a), Ok(b)) => {
+                // Both ok — one finished before the other started.
+                assert!(a[0].as_ref().is_ok() || b[0].as_ref().is_ok());
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn list_digests_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = RedbCas::open_with_limit(dir.path().join("cas.redb"), 1).unwrap();
+
+        let first = cas.list_digests();
+        let second = cas.list_digests();
+
+        let err = match (first.await, second.await) {
+            (Ok(_), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(_)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(a), Ok(b)) => {
+                // Both ok — one finished before the other started.
+                assert!(a.is_empty() || b.is_empty());
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn delete_blob_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = RedbCas::open_with_limit(dir.path().join("cas.redb"), 1).unwrap();
+        let (d, b) = blob(b"delete me");
+        cas.batch_update_blobs(vec![(d.clone(), b)]).await.unwrap();
+
+        let first = cas.delete_blob(&d);
+        let second = cas.delete_blob(&d);
+
+        let err = match (first.await, second.await) {
+            (Ok(()), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(())) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(()), Ok(())) => {
+                // Both ok — one finished before the other started.
                 return;
             }
             (Err(a), Err(b)) => {

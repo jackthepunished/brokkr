@@ -289,4 +289,62 @@ mod tests {
         };
         assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
     }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn update_action_result_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RedbActionCache::open_with_limit(dir.path().join("ac.redb"), 1).unwrap();
+        let d = Digest::of(b"any-action");
+
+        let first = cache.update_action_result(&d, sample_result());
+        let second = cache.update_action_result(&d, sample_result());
+
+        let err = match (first.await, second.await) {
+            (Ok(()), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(())) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(_a), Ok(_b)) => {
+                // Both ok — one finished before the other started.
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn list_entries_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RedbActionCache::open_with_limit(dir.path().join("ac.redb"), 1).unwrap();
+        let d = Digest::of(b"any-action");
+        cache
+            .update_action_result(&d, sample_result())
+            .await
+            .unwrap();
+
+        let first = cache.list_entries();
+        let second = cache.list_entries();
+
+        let err = match (first.await, second.await) {
+            (Ok(_), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(_)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(_a), Ok(_b)) => {
+                // Both ok — one finished before the other started.
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
 }
