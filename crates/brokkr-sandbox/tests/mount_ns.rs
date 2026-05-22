@@ -131,6 +131,34 @@ async fn ev01_cat_etc_shadow_fails() {
 }
 
 #[tokio::test]
+async fn ev01_cat_etc_passwd_fails() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // /etc/passwd doesn't exist inside the sandbox (empty tmpfs at /etc).
+    // The action should get ENOENT, not exit 0.
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/cat".to_string(), "/etc/passwd".into()],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = match sandbox.run(cfg).await {
+        Ok(o) => o,
+        Err(e) => panic!("sandbox.run failed: {e:#}"),
+    };
+    assert_ne!(
+        outcome.exit_status,
+        ExitStatus::Exited(0),
+        "/etc/passwd should not exist inside the sandbox"
+    );
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert!(
+        stderr.contains("No such file") || stderr.contains("cannot open"),
+        "expected ENOENT; got: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn ls_root_shows_only_expected_entries() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());

@@ -421,9 +421,33 @@ async fn ev_ioctl_tiocptlck_blocked() {
 
 #[cfg(target_arch = "x86_64")]
 #[tokio::test]
-#[ignore = "TODO(M7+): EV-09 needs prctl(PR_SET_TSC) wiring; seccomp can't gate rdtsc on its own"]
 async fn ev09_rdtsc_blocked() {
-    // Body intentionally empty — re-enable once PR_SET_TSC is wired.
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // rdtsc instruction → SIGSEGV (signal 11, exit code 139 = 128 + 11)
+    // when PR_TSC_SIGSEGV is active.
+    let cfg = SandboxConfig {
+        argv: vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            "import mmap, ctypes, struct; \
+             code = mmap.mmap(-1, 4096, prot=7, flags=34); \
+             code.write(struct.pack('15B', 0x0f, 0x01, 0xf9, 0xc3)); \
+             func = ctypes.CFUNCTYPE(ctypes.c_ulong)(ctypes.addressof(code)); \
+             func()"
+                .into(),
+        ],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    // SIGSEGV = signal 11, exit code = 128 + 11 = 139
+    assert!(
+        outcome.exit_status.signaled() && outcome.exit_status.code() == Some(139),
+        "rdtsc should cause SIGSEGV (exit 139); got {:?}",
+        outcome.exit_status
+    );
 }
 
 #[tokio::test]
