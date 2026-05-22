@@ -12,10 +12,14 @@ use brokkr_common::Digest;
 use brokkr_proto::reapi_v2::ActionResult;
 use prost::Message;
 use redb::{Database, ReadableTable, TableDefinition};
+use tokio::sync::Semaphore;
 
 use crate::error::CasError;
 
 const ACTION_RESULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("action_results");
+
+/// Default max concurrent `spawn_blocking` tasks for [`RedbActionCache`].
+const DEFAULT_ACTION_CACHE_CONCURRENCY: usize = 16;
 
 /// REAPI Action Cache backend.
 #[async_trait]
@@ -48,18 +52,36 @@ pub trait ActionCache: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct RedbActionCache {
     db: Arc<Database>,
+    semaphore: Arc<Semaphore>,
+    max_concurrent: usize,
 }
 
 impl RedbActionCache {
-    /// Open or create an action-cache database at `path`.
+    /// Open or create an action-cache database at `path` with the default concurrency limit.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CasError> {
+        Self::open_with_limit(path, DEFAULT_ACTION_CACHE_CONCURRENCY)
+    }
+
+    /// Open or create an action-cache database at `path` with a custom concurrency limit.
+    ///
+    /// `max_concurrent` bounds the number of simultaneous `spawn_blocking` tasks
+    /// for redb I/O. Requests that would exceed this limit return
+    /// `CasError::ThroughputLimit`.
+    pub fn open_with_limit(
+        path: impl AsRef<Path>,
+        max_concurrent: usize,
+    ) -> Result<Self, CasError> {
         let db = Database::create(path.as_ref())?;
         let txn = db.begin_write()?;
         {
             let _ = txn.open_table(ACTION_RESULTS)?;
         }
         txn.commit()?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+        })
     }
 }
 
@@ -69,9 +91,17 @@ impl ActionCache for RedbActionCache {
         &self,
         action_digest: &Digest,
     ) -> Result<Option<ActionResult>, CasError> {
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
         let db = self.db.clone();
         let key = action_digest.hash().to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<ActionResult>, CasError> {
+        let span = tracing::info_span!("redb::get_action_result");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
             let txn = db.begin_read()?;
             let table = txn.open_table(ACTION_RESULTS)?;
             let Some(entry) = table.get(key.as_str())? else {
@@ -91,13 +121,21 @@ impl ActionCache for RedbActionCache {
         action_digest: &Digest,
         result: ActionResult,
     ) -> Result<(), CasError> {
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
         let db = self.db.clone();
         let key = action_digest.hash().to_string();
         let mut buf = Vec::with_capacity(result.encoded_len());
         result
             .encode(&mut buf)
             .map_err(|e| CasError::Redb(format!("ActionResult encode: {e}")))?;
-        tokio::task::spawn_blocking(move || -> Result<(), CasError> {
+        let span = tracing::info_span!("redb::update_action_result");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
             let txn = db.begin_write()?;
             {
                 let mut table = txn.open_table(ACTION_RESULTS)?;
@@ -111,8 +149,16 @@ impl ActionCache for RedbActionCache {
     }
 
     async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<(Digest, ActionResult)>, CasError> {
+        let span = tracing::info_span!("redb::list_entries");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
             let txn = db.begin_read()?;
             let table = txn.open_table(ACTION_RESULTS)?;
             let mut out = Vec::new();
@@ -215,5 +261,90 @@ mod tests {
         let cache = RedbActionCache::open(&path).unwrap();
         let got = cache.get_action_result(&d).await.unwrap().unwrap();
         assert_eq!(got.stdout_raw, b"hello world\n");
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn get_action_result_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Limit of 1 so the second concurrent call fails immediately.
+        let cache = RedbActionCache::open_with_limit(dir.path().join("ac.redb"), 1).unwrap();
+        let d = Digest::of(b"any-action");
+        let r = sample_result();
+        cache.update_action_result(&d, r).await.unwrap();
+
+        let first = cache.get_action_result(&d);
+        let second = cache.get_action_result(&d);
+
+        let err = match tokio::join!(first, second) {
+            (Ok(Some(_)), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(Some(_))) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(Some(_)), Ok(Some(_))) => {
+                // Both ok — one finished before the other started.
+                return;
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn update_action_result_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RedbActionCache::open_with_limit(dir.path().join("ac.redb"), 1).unwrap();
+        let d = Digest::of(b"any-action");
+
+        let first = cache.update_action_result(&d, sample_result());
+        let second = cache.update_action_result(&d, sample_result());
+
+        let err = match tokio::join!(first, second) {
+            (Ok(()), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(())) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(_a), Ok(_b)) => {
+                // Both ok — one finished before the other started.
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+
+    /// Test that exceeding the concurrency limit returns `ThroughputLimit`.
+    #[tokio::test]
+    async fn list_entries_throughput_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RedbActionCache::open_with_limit(dir.path().join("ac.redb"), 1).unwrap();
+        let d = Digest::of(b"any-action");
+        cache
+            .update_action_result(&d, sample_result())
+            .await
+            .unwrap();
+
+        let first = cache.list_entries();
+        let second = cache.list_entries();
+
+        let err = match tokio::join!(first, second) {
+            (Ok(_), Err(e)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Err(e), Ok(_)) if matches!(e, CasError::ThroughputLimit { .. }) => e,
+            (Ok(_a), Ok(_b)) => {
+                // Both ok — one finished before the other started.
+                return;
+            }
+            (Err(a), Err(b)) => {
+                panic!("both failed: {a:?}, {b:?}");
+            }
+            other => {
+                panic!("unexpected: {other:?}");
+            }
+        };
+        assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
     }
 }
