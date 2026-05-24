@@ -4,12 +4,8 @@
 //! - **EV-02** action calls `mount(2)` directly → EPERM (seccomp).
 //! - **EV-03** action calls `keyctl(2)` directly → EPERM (seccomp).
 //! - **EV-04** action calls `ptrace(PTRACE_TRACEME)` → EPERM (seccomp).
-//! - **EV-09** RDTSC. The plan ("SIGSYS or EPERM, CPU dependent") notes
-//!   this requires a kernel/CPU willing to honour `PR_SET_TSC`. seccomp
-//!   does not gate userland-only instructions like `rdtsc`, so this case
-//!   is `#[ignore]`d on M7 — we'd need argument-level `prctl` filtering
-//!   (TODO marked in `runner/seccomp.rs`) plus `PR_SET_TSC=PR_TSC_SIGSEGV`
-//!   to make it deterministic.
+//! - **EV-09** RDTSC. The runner calls `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)`
+//!   before exec so any `rdtsc`/`rdtscp` instruction raises SIGSEGV.
 //! - **EV-10** the runner sets `PR_SET_NO_NEW_PRIVS`. We assert this via
 //!   `prctl(PR_GET_NO_NEW_PRIVS)`, which should return 1 inside the
 //!   sandboxed process.
@@ -421,9 +417,33 @@ async fn ev_ioctl_tiocptlck_blocked() {
 
 #[cfg(target_arch = "x86_64")]
 #[tokio::test]
-#[ignore = "TODO(M7+): EV-09 needs prctl(PR_SET_TSC) wiring; seccomp can't gate rdtsc on its own"]
 async fn ev09_rdtsc_blocked() {
-    // Body intentionally empty — re-enable once PR_SET_TSC is wired.
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // rdtsc instruction → SIGSEGV (signal 11, exit code 139 = 128 + 11)
+    // when PR_TSC_SIGSEGV is active.
+    let cfg = SandboxConfig {
+        argv: vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            "import mmap, ctypes, struct; \
+             code = mmap.mmap(-1, 4096, prot=7, flags=34); \
+             code.write(struct.pack('15B', 0x0f, 0x01, 0xf9, 0xc3)); \
+             func = ctypes.CFUNCTYPE(ctypes.c_ulong)(ctypes.addressof(code)); \
+             func()"
+                .into(),
+        ],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    // SIGSEGV = signal 11, exit code = 128 + 11 = 139
+    assert!(
+        outcome.exit_status.signaled() && outcome.exit_status.code() == Some(139),
+        "rdtsc should cause SIGSEGV (exit 139); got {:?}",
+        outcome.exit_status
+    );
 }
 
 #[tokio::test]

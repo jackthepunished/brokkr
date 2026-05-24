@@ -40,6 +40,31 @@ pub enum ExitStatus {
     Timeout,
 }
 
+impl ExitStatus {
+    /// Returns true if the action was killed by a signal.
+    pub fn signaled(&self) -> bool {
+        matches!(self, ExitStatus::Signaled { .. })
+    }
+
+    /// Returns the exit code that shell conventions prescribe:
+    /// - `Exited(n)` → `n`
+    /// - `Signaled { signal }` → `128 + signal`
+    /// - `OutOfMemory` → `137` (SIGKILL)
+    /// - `Timeout` → `137` (SIGKILL)
+    pub fn code(&self) -> Option<i32> {
+        match self {
+            ExitStatus::Exited(n) => Some(*n),
+            ExitStatus::Signaled { signal } => Some(128 + signal),
+            ExitStatus::OutOfMemory | ExitStatus::Timeout => Some(137),
+        }
+    }
+
+    /// Returns true if the action exited with code 0.
+    pub fn is_success(&self) -> bool {
+        self.code() == Some(0)
+    }
+}
+
 /// Cgroup-derived resource counters for one action. M2 returns zeros; M6
 /// reads `cpu.stat`, `memory.peak`, `io.stat`, `pids.peak` after the action
 /// exits and populates these fields.

@@ -129,6 +129,31 @@ async fn ev08_public_address_unreachable() {
 }
 
 #[tokio::test]
+async fn ev08_nslookup_blocked() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    // nslookup to a non-existent nameserver (10.255.255.1) in an isolated
+    // netns (no loopback, no upstream) should fail — either NXDOMAIN,
+    // SERVFAIL, or connection refused. We just assert non-zero exit.
+    let cfg = SandboxConfig {
+        argv: vec![
+            "/usr/bin/nslookup".into(),
+            "google.com".into(),
+            "10.255.255.1".into(),
+        ],
+        rootfs: minimal_linux_rootfs(),
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let outcome = sandbox.run(cfg).await.unwrap();
+    assert!(
+        !outcome.exit_status.is_success(),
+        "nslookup should fail in isolated netns; got {:?}",
+        outcome.exit_status
+    );
+}
+
+#[tokio::test]
 async fn loopback_down_makes_127_0_0_1_unreachable() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());
