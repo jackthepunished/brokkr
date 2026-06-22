@@ -568,7 +568,7 @@ M7:
 |---|---|---|
 | 1 | 3-node CAS cluster boots < 30s | n/a — no server binary; in-process fixture brings up the equivalent in ms (M1, M4, M7) |
 | 2 | Killing any single CAS node doesn't interrupt builds | ✅ exercised by the M7 soak (99 churn cycles, zero data loss) |
-| 3 | 5 GiB tree mounts via FUSE in < 100 ms; only-read bytes transfer | ✅ M6b — perf bound asserted on the integration test path; the 5 GiB number falls out of the inode-table walk being one CAS read per directory |
+| 3 | 5 GiB tree mounts via FUSE in < 100 ms; only-read bytes transfer | ❌ deferred — M6a ships eager tree materialisation (`brokkr-cas::tree`), which copies every byte up-front. FUSE-based lazy materialisation (M6b) was **not** implemented; no `fuse` module, no `fuser`/`memmap2` deps. Routed to Phase 4 |
 | 4 | `brokk admin gc` evicts unreachable + stale blobs | partial — M5a ships the GC primitive (`brokkr-cas::gc`); the `brokk admin gc` CLI subcommand is queued for Phase 4 along with the control-plane daemon |
 | 5 | M7 soak runs 1h with no loss | ✅ default-budget passes in 28 s; release-gate budget (`BROKKR_SOAK_OPS=1000000 BROKKR_SOAK_DURATION_S=3600`) is wired for CI |
 | 6 | `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green | ✅ verified each milestone, including M7 |
@@ -590,21 +590,28 @@ get lost):
 - **Cross-process / two-binary cluster boot.** Needs a
   `brokkr-cas` server binary that doesn't exist yet; that's
   Phase 4 too.
+- **M6b FUSE lazy materialisation.** Only M6a's eager
+  `tree::materialize_tree` shipped. The FUSE filesystem that
+  mounts multi-GiB trees in ~ms and fetches only the bytes the
+  action reads (DoD item #3) was never built. Picks up in Phase 4
+  alongside the worker materialisation path.
 
 **Phase 3 in numbers** (rough):
 
-- 8 milestones shipped (M0 plan, M1 membership/ring, M2
+- 9 milestones shipped (M0 plan, M1 membership/ring, M2
   bloom, M3a tiered, M4 replicated, M5a GC, M5b peer-repair,
-  M6a tree, M6b FUSE, M7 soak). M6 split into M6a+M6b
-  during execution; everything else hit the original
-  milestone scope.
+  M6a tree, M7 soak). M3 split into M3a (hot+warm) + M3b
+  (cold/S3, deferred); M6 split into M6a (eager tree) + M6b
+  (FUSE, deferred). Both deferred halves are routed to Phase 4.
 - ~4 kLOC new code + tests in `brokkr-cas` and
   `brokkr-worker`, broadly matching the §8 estimate.
 - Zero existing tests broken; Phase 1 + 2 suites still green
   end-to-end.
-- No new external deps that weren't on the plan: `fuser`,
-  `memmap2`, `parking_lot` (dev), `rand` (dev). `OpenDAL`
-  punted with the cold tier.
+- No new external non-dev deps: `parking_lot` (dev) and
+  `rand` (dev) are the only additions, both test-only.
+  `OpenDAL` punted with the cold tier (M3b); `fuser` /
+  `memmap2` punted with FUSE (M6b) — neither is in the
+  manifests or lockfile.
 
 **What's next.** Phase 4 — REAPI conformance + Bazel
 client interop + per-tenant accounting, per `docs/plan.md`
