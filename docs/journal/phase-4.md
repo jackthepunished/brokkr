@@ -207,3 +207,52 @@ milestone:** §16 task 2 — constraint matching (match an Action's
 `Platform` requirements against `WorkerCapabilities.labels`; hard vs.
 soft constraints), as a new branch off `origin/main` once #98 merges
 (else stacked).
+
+## I5 — platform constraint matching (§16 task 2, matcher)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Outcome:** `brokkr-control::matching` — the eligibility primitive the
+  scheduler will use to pick workers. `labels_satisfy_platform` /
+  `worker_satisfies` implement REAPI matching (every required
+  `Property{name,value}` must be advertised; empty platform matches all),
+  and `eligible_workers(registry, now, platform)` yields the live workers
+  that also satisfy the constraints. First increment of task 2; #98
+  (task 1) merged, so this is a fresh branch off `main`. Six unit tests;
+  `brokkr-control` fmt/clippy/test green (31 lib tests).
+
+### Decisions
+
+- **Matcher lives outside `registry`.** The registry stays proto-free (a
+  plain liveness/capability store); the proto-aware matching is its own
+  module that depends on both `registry` and `brokkr-proto`. Same
+  decoupling Phase 3 drew between `brokkr-cas::ring` and the proto — it
+  keeps the registry's unit tests free of proto fixtures and avoids
+  leaking `i32`-encoded proto enums into the capability model.
+- **Hard constraints only; soft is deferred (needs an ADR).** Plan §16
+  asks for hard vs. soft constraints, but REAPI's `Platform` has no soft
+  notion — modelling "preferred" needs a Brokkr-specific convention
+  (e.g. a reserved property-name prefix, or a `brokkr.v1` extension).
+  Rather than invent wire semantics inline, I5 ships REAPI-faithful hard
+  matching and flags soft as a follow-up ADR. Documented in the module.
+- **Single-valued labels ⇒ duplicate-name requirements are
+  unsatisfiable.** `WorkerCapabilities.labels` is `BTreeMap<_,_>` (one
+  value per name). A platform requiring `os=linux` *and* `os=windows`
+  can't be met by any single worker — the correct outcome for
+  single-valued attributes. Multi-valued worker capabilities (a worker
+  advertising several values for one name) would need a richer model;
+  deferred until a workload needs it, with a test pinning the current
+  behaviour.
+- **`eligible_workers` composes `healthy()` + the matcher.** Eligibility
+  = live AND satisfies-constraints. Returning an iterator (not a Vec)
+  keeps it allocation-free for the scheduler's pick path.
+
+### Next increment (I6)
+
+Teach the scheduler to use `eligible_workers`. The current scheduler is
+single-worker (one queue, one stream); I6 introduces capability-aware
+*selection* — extract the action's `Platform` (from `Command.platform` /
+`Action.platform`) and pick an eligible worker — as the data-model step
+toward multi-worker dispatch. Full multi-worker fan-out (multiple
+concurrent streams) is a later increment; I6 should be the smallest step
+that makes selection constraint-aware without rewriting dispatch.

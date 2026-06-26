@@ -628,3 +628,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the control plane advertised at registration; on `known=false` it logs
   and stops (full re-register is `TODO(brokkr-410)`). Closes plan §16
   task 1 (worker registry + capabilities + heartbeat eviction).
+- `brokkr-control::matching` — platform constraint matching (plan §16
+  task 2). `labels_satisfy_platform` / `worker_satisfies` implement REAPI
+  semantics: a worker satisfies a `Platform` iff it advertises every
+  required `Property{name,value}` (empty platform matches everyone).
+  `eligible_workers(registry, now, platform)` yields the live workers
+  (via `WorkerRegistry::healthy`) that also satisfy the constraints —
+  the candidate set the scheduler will dispatch to. Kept proto-aware and
+  separate from the proto-free `registry` module (mirrors the Phase 3
+  `ring`/proto decoupling). Hard-constraint matching only; soft/preferred
+  constraints need a Brokkr convention (future ADR) since REAPI's
+  `Platform` has no soft notion. Six unit tests.

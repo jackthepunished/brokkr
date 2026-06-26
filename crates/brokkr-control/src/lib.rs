@@ -6,12 +6,14 @@
 
 #![deny(missing_docs)]
 
+pub mod matching;
 pub mod membership;
 pub mod registry;
 pub mod scheduler;
 pub mod services;
 pub mod worker_service;
 
+pub use matching::{eligible_workers, labels_satisfy_platform, worker_satisfies};
 pub use membership::{Membership, MembershipServiceImpl};
 pub use registry::{
     HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
