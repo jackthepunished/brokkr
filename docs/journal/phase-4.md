@@ -67,8 +67,57 @@ are the next increments.
 ### Environment note
 
 The dev host is Windows; `brokkr-sandbox`/`brokkr-worker` are Linux-only,
-so the whole workspace is built and tested under WSL2 Ubuntu (cargo
-1.85) with a Linux-native `CARGO_TARGET_DIR`. `cargo fmt --check`,
-`cargo clippy --workspace --all-targets -D warnings`, and
-`cargo test --workspace` are all green there (sandbox evil-action tests
-skip cleanly without privileged user namespaces, as in Phase 2/3).
+so the workspace is built and tested under WSL2 Ubuntu (cargo 1.85) with
+a Linux-native `CARGO_TARGET_DIR`. Verification is **per changed crate**
+(`brokkr-control`: fmt + `clippy --all-targets -D warnings` + test all
+green), relying on the project's real Linux CI for the rest: a full
+`cargo test --workspace` is *not* green on this WSL2 host — ~6
+`brokkr-sandbox` seccomp arg-filter tests (`PR_SET_TSC`/ioctl/RDTSC)
+can't trap under the virtualized kernel, and a few upstream
+`brokkr-worker` files trip rustfmt's CRLF check. Neither is touched by
+this work. (Lesson carried from PR #96: confirm reality on `origin/main`,
+not just the working tree.)
+
+## I2 — register persists into the registry (§16 task 1, wiring)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Outcome:** `WorkerServiceImpl.register` now writes into a shared
+  `WorkerRegistry` instead of throwing the worker's identity away. It
+  records hostname + labels as `WorkerCapabilities`, and advertises a
+  `heartbeat_seconds` taken from the registry's policy interval (5 s)
+  rather than the old hardcoded 30 — closing the gap where the server
+  told workers to heartbeat every 30 s but the eviction policy expected
+  every 5 s. Two handler tests; `brokkr-control` fmt/clippy/test green.
+
+### Decisions
+
+- **`SharedWorkerRegistry = Arc<Mutex<WorkerRegistry>>`.** The registry
+  is now mutated from a request handler and (soon) a background tick, so
+  it needs shared ownership + interior mutability. An async
+  `tokio::sync::Mutex` is right because the critical section is tiny
+  (insert / read policy) and never held across an `.await` other than
+  the lock itself. `with_registry` + `registry()` expose the handle so
+  the next increments (heartbeat RPC, eviction loop) and tests share one
+  source of truth; `new(scheduler)` keeps its single-arg shape so
+  `main.rs` and the Phase 1 fixture are untouched.
+- **Advertise the policy interval, not a magic number.** Tying
+  `heartbeat_seconds` to `policy().interval` means the value the worker
+  is told and the value the eviction deadline assumes can't drift apart.
+- **`#[tracing::instrument]` over a manual `span.enter()`.** The handler
+  now `.await`s the registry lock; holding an `Entered` guard across an
+  await is the classic tracing footgun. `instrument` wraps the whole
+  future correctly and records the assigned `worker_id` field.
+- **Worker id still server-minted (UUID).** Registration identity stays
+  server-assigned; the heartbeat RPC (next) will let a worker prove
+  liveness with that id and get a re-register signal on
+  `UnknownWorker`.
+
+### Next increment
+
+Heartbeat RPC: add `Heartbeat` to `brokkr.v1.worker.proto`
+(`HeartbeatRequest { worker_id }` → `HeartbeatResponse { known }`),
+handle it via `registry.record_heartbeat`, and have the worker call it
+on the advertised cadence. Then a background eviction tick that calls
+`evict_stale` on an interval. (Proto change → first increment of Phase 4
+that regenerates `brokkr-proto`.)

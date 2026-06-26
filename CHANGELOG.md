@@ -593,3 +593,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed `RegistryError::UnknownWorker`. Ten unit tests. The
   heartbeat RPC + scheduler worker-selection wiring are the next
   increments; this lands the transport-agnostic data model first.
+- `brokkr-control::WorkerServiceImpl` now persists registrations into
+  a shared `WorkerRegistry` (`SharedWorkerRegistry =
+  Arc<Mutex<WorkerRegistry>>`): `register` records the worker's
+  hostname + labels as `WorkerCapabilities` (previously discarded) and
+  advertises `heartbeat_seconds` derived from the registry's policy
+  interval (5 s) instead of a hardcoded 30, so a worker that honours
+  the cadence is never evicted while healthy. New `with_registry`
+  constructor + `registry()` accessor share the handle with the
+  (forthcoming) heartbeat RPC and eviction tick. `register` gains a
+  `#[tracing::instrument]` span recording the assigned `worker_id`.
+  Two handler tests (capabilities persisted; distinct id per
+  registration).
