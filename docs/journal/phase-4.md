@@ -303,3 +303,39 @@ capabilities. I7: have `brokkr-worker` advertise `os` / `arch` (and
 configurable labels) at registration so constrained actions can actually
 be scheduled. Actions with no platform requirements are unaffected (empty
 platform matches any healthy worker).
+
+## I7 — worker advertises os/arch capabilities (§16 task 2 — CLOSED)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-worker`
+- **Outcome:** `run_worker` now registers with `os` / `arch` labels from
+  `std::env::consts`, so the matcher + admission control chain works
+  end-to-end: worker advertises capabilities → control plane stores them
+  → constrained actions are matched and either placed or rejected with
+  `NoEligibleWorker`. One unit test on the label helper;
+  `brokkr-worker` green.
+
+### Decisions
+
+- **Auto-detect, no config-surface change.** Populated the labels
+  directly in `run_worker` via a small `default_capability_labels()`
+  helper rather than adding a `labels` field to `WorkerConfig`. Keeps the
+  two struct-literal construction sites (the CLI binary and the in-process
+  test fixture) untouched, and `os`/`arch` are the labels actions most
+  commonly constrain on. Configurable / richer capabilities (installed
+  tools, GPU, RAM — plan §6.3 / §8 `WorkerCapability`) are deferred to a
+  later increment when a workload needs them.
+- **Extracted a testable helper.** `run_worker` itself needs a live
+  server to exercise, so the label logic is a standalone fn with a unit
+  test; the flow into the registry is already covered by the control-plane
+  handler test `register_persists_capabilities_into_registry`.
+
+### §16 task 2 status
+
+Done across I5–I7: matcher (`brokkr-control::matching`) → admission
+control in the scheduler → worker capability advertisement. All on
+PR #99. Hard-constraint matching is complete end-to-end. **Deferred:**
+soft/preferred constraints (needs a Brokkr convention — future ADR);
+richer worker capabilities; per-worker *routing* (multi-worker dispatch)
+and scheduling strategies are §16 task 3, the next milestone — that's the
+multi-worker redesign the I6 decision deferred.

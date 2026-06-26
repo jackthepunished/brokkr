@@ -652,6 +652,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `brokkr-control` binary now builds one shared registry feeding the
   scheduler (reads), the worker service (writes), and the eviction reaper.
   Three scheduler tests (reject on no worker, reject on label mismatch,
-  pass-through with a matching worker). NOTE: the CLI worker still
-  registers with empty labels, so constrained actions can't be scheduled
-  until the worker advertises its capabilities (next increment).
+  pass-through with a matching worker).
+- `brokkr-worker` now advertises platform capabilities at registration:
+  `os` and `arch` labels from the build target (`std::env::consts`), so
+  the control plane's constraint matcher can actually place
+  platform-constrained actions on it. Completes the §16 task 2
+  constraint-matching path end-to-end (worker advertises → matcher →
+  admission control). Richer / configurable capabilities (installed
+  tools, GPU, RAM) are a later increment. One unit test.
