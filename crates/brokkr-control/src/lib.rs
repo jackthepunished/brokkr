@@ -18,4 +18,4 @@ pub use registry::{
 };
 pub use scheduler::Scheduler;
 pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
-pub use worker_service::WorkerServiceImpl;
+pub use worker_service::{spawn_eviction_task, SharedWorkerRegistry, WorkerServiceImpl};

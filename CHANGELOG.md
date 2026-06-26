@@ -614,3 +614,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register, unknown → not known, missing id → invalid argument). The
   worker-side heartbeat sender and the background eviction tick are the
   next increment.
+- `brokkr-control::spawn_eviction_task` — background liveness reaper that
+  sweeps the shared `WorkerRegistry` once per heartbeat interval and
+  evicts workers past the deadline (`interval * max_missed`). Wired into
+  the `brokkr-control` binary; a zero interval disables it rather than
+  panicking. The eviction decision is `WorkerRegistry::evict_stale`
+  (unit-tested with an injected clock), so the wrapper is just the
+  periodic driver. New deterministic test
+  `eviction_is_observable_via_heartbeat`: register → evict → a
+  subsequent `Heartbeat` reports `known=false`.
+- `brokkr-worker`: the worker now runs a background heartbeat loop,
+  pinging `WorkerService.Heartbeat` on the `heartbeat_seconds` cadence
+  the control plane advertised at registration; on `known=false` it logs
+  and stops (full re-register is `TODO(brokkr-410)`). Closes plan §16
+  task 1 (worker registry + capabilities + heartbeat eviction).

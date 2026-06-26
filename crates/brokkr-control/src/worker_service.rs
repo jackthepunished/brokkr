@@ -2,7 +2,7 @@
 //! job-dispatch stream. Phase 1 only supports a single worker at a time.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
@@ -13,6 +13,7 @@ use brokkr_proto::brokkr_v1::{
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use crate::registry::{WorkerCapabilities, WorkerRegistry};
 use crate::scheduler::Scheduler;
@@ -47,11 +48,50 @@ impl WorkerServiceImpl {
         }
     }
 
-    /// The shared worker registry handle. Used by the (forthcoming) heartbeat
-    /// handler, the eviction tick, and tests.
+    /// The shared worker registry handle. Used by the heartbeat handler, the
+    /// eviction tick, and tests.
     pub fn registry(&self) -> SharedWorkerRegistry {
         self.registry.clone()
     }
+}
+
+/// Spawn the background liveness reaper: every registry-policy interval it
+/// evicts workers that have missed too many heartbeats.
+///
+/// This is just the periodic driver — the eviction *decision* lives in
+/// [`WorkerRegistry::evict_stale`] (unit-tested with an injected clock). Wire
+/// this into the control-plane binary; hold the returned handle for the
+/// server's lifetime (dropping/aborting it stops the reaper).
+pub fn spawn_eviction_task(registry: SharedWorkerRegistry) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(
+        async move {
+            // Tick at the heartbeat interval; the deadline (interval *
+            // max_missed) is enforced inside `evict_stale`, so checking once
+            // per interval bounds eviction lag to one interval.
+            let interval = registry.lock().await.policy().interval;
+            // `tokio::time::interval` panics on a zero period; a zero-interval
+            // policy disables the reaper rather than crashing the server.
+            if interval == Duration::ZERO {
+                tracing::warn!("eviction reaper disabled (heartbeat interval is zero)");
+                return;
+            }
+            let mut ticker = tokio::time::interval(interval);
+            // Drop the immediate first tick so freshly-registered workers get
+            // a full interval before the first sweep.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let evicted = {
+                    let mut reg = registry.lock().await;
+                    reg.evict_stale(Instant::now())
+                };
+                if !evicted.is_empty() {
+                    tracing::info!(count = evicted.len(), "evicted stale workers");
+                }
+            }
+        }
+        .in_current_span(),
+    )
 }
 
 #[tonic::async_trait]
@@ -343,5 +383,37 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// End-to-end through the RPC surface, deterministically (no timers):
+    /// register → evict via the shared registry with an injected future
+    /// instant → a subsequent heartbeat reports `known=false`. Proves the
+    /// register handler, the registry, and the heartbeat handler all share one
+    /// source of truth and that eviction is observable to the worker.
+    #[tokio::test]
+    async fn eviction_is_observable_via_heartbeat() {
+        let svc = service();
+        let id = svc
+            .register(Request::new(RegisterWorkerRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+
+        // Force eviction by sweeping with an instant well past the deadline.
+        let deadline = svc.registry().lock().await.policy().deadline();
+        let future = Instant::now() + deadline + Duration::from_secs(1);
+        let evicted = svc.registry().lock().await.evict_stale(future);
+        assert_eq!(evicted.len(), 1);
+
+        let resp = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                worker_id: Some(id),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.known, "evicted worker should be told to re-register");
     }
 }

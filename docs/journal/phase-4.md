@@ -162,3 +162,48 @@ side: a background eviction task (`tokio::time::interval` →
 `evict_stale`) wired into the `brokkr-control` binary. Target: an
 end-to-end test where a worker that stops heartbeating is evicted after
 the deadline. This closes §16 task 1.
+
+## I4 — eviction tick + worker heartbeat loop (§16 task 1 — CLOSED)
+
+- **Date:** 2026-06-27
+- **Affected crates:** `brokkr-control`, `brokkr-worker`
+- **Outcome:** Liveness loop is now closed end-to-end.
+  `spawn_eviction_task` drives `WorkerRegistry::evict_stale` once per
+  heartbeat interval and is wired into the control-plane binary; the
+  worker runs a background loop pinging `WorkerService.Heartbeat` on the
+  advertised cadence. A worker that keeps heartbeating stays registered;
+  one that stops is evicted after `interval * max_missed`, and its next
+  heartbeat returns `known=false`. `brokkr-control` (25 lib tests) +
+  `brokkr-worker` green; the existing end-to-end fixture now exercises
+  live heartbeats through the real server.
+
+### Decisions
+
+- **Reaper reads the policy interval, ticks once per interval.** Eviction
+  lag is bounded to one interval; the *deadline* enforcement stays in
+  `evict_stale`. A zero interval disables the reaper instead of panicking
+  (`tokio::time::interval` rejects a zero period).
+- **`known=false` ⇒ stop, don't silently spin.** The worker's heartbeat
+  loop breaks on `known=false` and logs; full re-registration (re-open
+  the job stream under a new id) is left as `TODO(brokkr-410)` — it's a
+  reconnect-state-machine change that deserves its own increment rather
+  than being smuggled into the heartbeat loop.
+- **No `tokio` `test-util` dependency.** A paused-clock test of the
+  spawned reaper would need `tokio`'s `test-util` feature (not in
+  `full`). Rather than add a dep mid-loop, the spawn wrapper is covered
+  by (a) `evict_stale`'s injected-clock unit tests and (b) the
+  deterministic `eviction_is_observable_via_heartbeat` composition test
+  that drives register → evict → heartbeat through the RPC handlers with
+  no timers. The wrapper itself is ~15 lines of obvious glue.
+- **Heartbeat task aborted on stream exit.** The worker holds the
+  `JoinHandle` and aborts it when the job stream closes, so the heartbeat
+  loop never outlives the worker session.
+
+### §16 task 1 status
+
+Done across I1–I4: registry data model → register wiring → `Heartbeat`
+RPC → eviction tick + worker heartbeat loop. All on PR #98. **Next
+milestone:** §16 task 2 — constraint matching (match an Action's
+`Platform` requirements against `WorkerCapabilities.labels`; hard vs.
+soft constraints), as a new branch off `origin/main` once #98 merges
+(else stacked).
