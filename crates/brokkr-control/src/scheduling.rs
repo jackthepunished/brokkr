@@ -8,10 +8,11 @@
 //! in isolation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1 as bv1;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 /// Read-only view of per-worker load, handed to a [`Strategy`] so policies can
 /// prefer (or avoid) busy workers without depending on `ConnectedWorkers`.
@@ -145,6 +146,10 @@ impl LoadView for ConnectedWorkers {
         self.workers.get(worker).map(|c| c.inflight).unwrap_or(0)
     }
 }
+
+/// Shared, mutex-guarded [`ConnectedWorkers`] handle. The scheduler reads it to
+/// route jobs and track load; `WorkerService.Stream` writes connect/disconnect.
+pub type SharedConnectedWorkers = Arc<Mutex<ConnectedWorkers>>;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]

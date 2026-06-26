@@ -387,3 +387,58 @@ single `take_receiver`; `Scheduler::execute` routes via
 matcher → `Strategy::choose` → that worker's channel, tracking in-flight
 counts; results decrement in-flight. Plus an integration test with two
 connected workers proving jobs spread and constraints route correctly.
+
+## I9 — multi-worker dispatch wiring (§16 task 3)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Outcome:** The dispatch core is rewritten for per-worker routing. The
+  single shared queue (`Scheduler::take_receiver`) is gone;
+  `WorkerService.Stream` registers a per-worker channel in the shared
+  `ConnectedWorkers` keyed by the `Hello` worker id, and
+  `Scheduler::execute` routes each action to a `Strategy`-chosen eligible
+  connected worker, tracking in-flight load. 43 lib tests green; the
+  real-gRPC `end_to_end` test still passes (proving the new
+  Hello→connect→route→report path), plus a two-worker spread test.
+
+### Decisions
+
+- **Scheduler owns `ConnectedWorkers`; the worker service borrows it.**
+  `WorkerServiceImpl::new(scheduler)` reads `scheduler.connected_workers()`,
+  so the binary and the fixtures don't have to wire a third shared handle —
+  one accessor keeps the scheduler and stream pointed at the same map.
+- **Worker id comes from `Hello`, registration happens in the pump.** The
+  stream handler must return the outbound stream synchronously, but the
+  worker id is only known once the first inbound message arrives. So the
+  spawned pump reads `Hello`, *then* registers the per-worker channel and
+  spawns the outbound forwarder. A first message that isn't a valid
+  `Hello` closes the stream.
+- **In-flight inc/dec straddles the wait, owned by `execute`.** Increment
+  under the same `connected` lock as selection (so concurrent submits
+  can't both pick the one idle worker); decrement once after the result
+  *or* timeout resolves (an inner `async` block funnels every early
+  return through one decrement). The inbound pump does **not** touch
+  in-flight — keeps the accounting single-owner and race-free.
+- **Lock order: registry then connected, never both held.** `execute`
+  snapshots registry-eligible ids (releasing the registry lock) before
+  taking the `connected` lock, so the two mutexes are never held at once
+  — no lock-ordering deadlock against `register` (registry only) or the
+  stream (connected only).
+- **Fail-fast when no eligible connected worker.** No global pending
+  queue yet (ADR 0008 → task 4), so a submit with nothing to run on
+  returns `NoEligibleWorker` immediately. The in-process fixtures connect
+  their worker well within the existing readiness window, so the
+  real-gRPC e2e stays deterministic.
+- **Disconnect drops in-flight jobs to timeout.** When a worker's stream
+  ends, it's removed from `ConnectedWorkers`; its in-flight jobs' waiters
+  time out via the scheduler timeout. Lease-based reassignment to another
+  worker is task 4.
+
+### §16 task 3 status
+
+I8 (foundation) + I9 (wiring) deliver multi-worker dispatch with the
+`SimpleFifo` strategy on PR #100. **Next:** `BinPacking` and
+`LocalityAware` strategies (I10), then §16 task 4 (job leases,
+tenants/quotas, fair scheduling — where the global queue + lease-based
+reassignment land). A full two-process / two-worker gRPC integration test
+is also worth adding once a second strategy gives it more to assert.
