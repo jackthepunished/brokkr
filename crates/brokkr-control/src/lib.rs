@@ -10,6 +10,7 @@ pub mod matching;
 pub mod membership;
 pub mod registry;
 pub mod scheduler;
+pub mod scheduling;
 pub mod services;
 pub mod worker_service;
 
@@ -19,5 +20,6 @@ pub use registry::{
     HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
 };
 pub use scheduler::Scheduler;
+pub use scheduling::{ConnectedWorkers, LoadView, SimpleFifo, Strategy};
 pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
 pub use worker_service::{spawn_eviction_task, SharedWorkerRegistry, WorkerServiceImpl};

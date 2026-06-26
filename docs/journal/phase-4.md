@@ -339,3 +339,51 @@ soft/preferred constraints (needs a Brokkr convention — future ADR);
 richer worker capabilities; per-worker *routing* (multi-worker dispatch)
 and scheduling strategies are §16 task 3, the next milestone — that's the
 multi-worker redesign the I6 decision deferred.
+
+## I8 — multi-worker scheduling foundation (§16 task 3, ADR 0008)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control` (+ ADR 0008)
+- **Decision taken with the owner:** dispatch model = **per-worker queues
+  with submit-time routing** (vs. a central dispatcher, or a
+  strategy-only first step). Recorded in
+  `docs/architecture/0008-multi-worker-scheduling.md`.
+- **Outcome:** `brokkr-control::scheduling` — the policy + connection
+  data model for multi-worker dispatch, with no dispatch plumbing yet so
+  it's fully unit-testable: a `Strategy` trait + `LoadView`, a
+  `SimpleFifo` strategy (least-loaded candidate, deterministic id
+  tie-break), and `ConnectedWorkers` (per-worker job channel + in-flight
+  count, distinct from `WorkerRegistry`). Eight unit tests;
+  `brokkr-control` green.
+
+### Decisions
+
+- **Per-worker queues, route at submit (ADR 0008).** On `execute` the
+  scheduler will compute eligible candidates (matcher ∩ connected), let
+  the `Strategy` pick one, and send the job to that worker's channel.
+  Chosen over a central pending-queue dispatcher (deferred to task 4,
+  where leases + fair scheduling want a global queue) and over a
+  pull/work-stealing model (rejected — fights server-side matching + the
+  push bidi stream).
+- **`ConnectedWorkers` ≠ `WorkerRegistry`.** Connection (stream open) and
+  liveness/capability (registered + heartbeating) are separate lifecycles;
+  the scheduler consults both. Keeping them in separate types avoids
+  conflating "known" with "reachable right now".
+- **`SimpleFifo` = least-loaded, not literally first.** "First available
+  worker" with no capacity cap would always pick `candidates[0]` and never
+  spread load. Least-loaded (stateless, deterministic tie-break) is the
+  simplest strategy that actually balances; documented in ADR 0008 that
+  per-worker FIFO ordering is preserved by each worker's own channel.
+- **Foundation split from wiring.** I8 lands the trait + registry +
+  strategy with unit tests; I9 does the riskier scheduler/worker-service
+  rewrite (replace the single `take_receiver` queue with per-worker
+  channels + routing). Both land on the task-3 PR.
+
+### Next increment (I9)
+
+Wire it in: `WorkerService.Stream` registers a per-worker channel in
+`ConnectedWorkers` on connect (and removes on disconnect) instead of the
+single `take_receiver`; `Scheduler::execute` routes via
+matcher → `Strategy::choose` → that worker's channel, tracking in-flight
+counts; results decrement in-flight. Plus an integration test with two
+connected workers proving jobs spread and constraints route correctly.

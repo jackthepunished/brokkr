@@ -660,3 +660,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constraint-matching path end-to-end (worker advertises → matcher →
   admission control). Richer / configurable capabilities (installed
   tools, GPU, RAM) are a later increment. One unit test.
+- ADR 0008 — multi-worker scheduling: per-worker job queues with
+  submit-time routing + a pluggable selection `Strategy` (chosen over a
+  central dispatcher / pull model). `docs/architecture/0008-multi-worker-scheduling.md`.
+- `brokkr-control::scheduling` (plan §16 task 3 foundation): the
+  `Strategy` trait + `LoadView` and a `SimpleFifo` strategy
+  (least-loaded candidate, deterministic id tie-break), plus
+  `ConnectedWorkers` — a registry of workers with a live stream, each
+  with its own job channel and in-flight count (distinct from
+  `WorkerRegistry`, which tracks liveness/capabilities). Pure
+  data-model + policy; the scheduler/worker-service wiring that routes
+  jobs through it is the next increment. Eight unit tests.
