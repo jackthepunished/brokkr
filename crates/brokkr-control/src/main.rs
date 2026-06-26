@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use brokkr_cas::{RedbActionCache, RedbCas};
+use brokkr_control::registry::WorkerRegistry;
 use brokkr_control::{
     spawn_eviction_task, ActionCacheService, CapabilitiesService, CasService, ExecutionService,
-    Scheduler, WorkerServiceImpl,
+    Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
 };
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
@@ -99,7 +100,14 @@ async fn main() -> Result<()> {
         RedbActionCache::open(args.data_dir.join("action_cache.redb"))
             .context("opening action cache database")?,
     );
-    let scheduler = Scheduler::new(cas.clone(), action_cache.clone());
+    // One shared worker registry, three users: the scheduler reads it for
+    // platform-constraint admission control, the worker service writes
+    // registrations / heartbeats into it, and the eviction reaper prunes
+    // stale entries.
+    let worker_registry: SharedWorkerRegistry =
+        Arc::new(tokio::sync::Mutex::new(WorkerRegistry::default()));
+    let scheduler =
+        Scheduler::with_worker_registry(cas.clone(), action_cache.clone(), worker_registry.clone());
 
     let tls_cfg = args.tls_config()?;
     match &tls_cfg {
@@ -113,11 +121,12 @@ async fn main() -> Result<()> {
 
     tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, "brokkr-control starting");
 
-    let worker_service = WorkerServiceImpl::new(scheduler.clone());
+    let worker_service =
+        WorkerServiceImpl::with_registry(scheduler.clone(), worker_registry.clone());
     // Background liveness reaper: evict workers that stop heartbeating. Held
     // for the server's lifetime; aborting it on shutdown is implicit (process
     // exit). The eviction decision lives in `WorkerRegistry::evict_stale`.
-    let _eviction = spawn_eviction_task(worker_service.registry());
+    let _eviction = spawn_eviction_task(worker_registry.clone());
 
     let mut server = Server::builder();
     if let Some(tls_cfg) = tls_cfg {

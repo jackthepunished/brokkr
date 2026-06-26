@@ -207,3 +207,135 @@ milestone:** §16 task 2 — constraint matching (match an Action's
 `Platform` requirements against `WorkerCapabilities.labels`; hard vs.
 soft constraints), as a new branch off `origin/main` once #98 merges
 (else stacked).
+
+## I5 — platform constraint matching (§16 task 2, matcher)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Outcome:** `brokkr-control::matching` — the eligibility primitive the
+  scheduler will use to pick workers. `labels_satisfy_platform` /
+  `worker_satisfies` implement REAPI matching (every required
+  `Property{name,value}` must be advertised; empty platform matches all),
+  and `eligible_workers(registry, now, platform)` yields the live workers
+  that also satisfy the constraints. First increment of task 2; #98
+  (task 1) merged, so this is a fresh branch off `main`. Six unit tests;
+  `brokkr-control` fmt/clippy/test green (31 lib tests).
+
+### Decisions
+
+- **Matcher lives outside `registry`.** The registry stays proto-free (a
+  plain liveness/capability store); the proto-aware matching is its own
+  module that depends on both `registry` and `brokkr-proto`. Same
+  decoupling Phase 3 drew between `brokkr-cas::ring` and the proto — it
+  keeps the registry's unit tests free of proto fixtures and avoids
+  leaking `i32`-encoded proto enums into the capability model.
+- **Hard constraints only; soft is deferred (needs an ADR).** Plan §16
+  asks for hard vs. soft constraints, but REAPI's `Platform` has no soft
+  notion — modelling "preferred" needs a Brokkr-specific convention
+  (e.g. a reserved property-name prefix, or a `brokkr.v1` extension).
+  Rather than invent wire semantics inline, I5 ships REAPI-faithful hard
+  matching and flags soft as a follow-up ADR. Documented in the module.
+- **Single-valued labels ⇒ duplicate-name requirements are
+  unsatisfiable.** `WorkerCapabilities.labels` is `BTreeMap<_,_>` (one
+  value per name). A platform requiring `os=linux` *and* `os=windows`
+  can't be met by any single worker — the correct outcome for
+  single-valued attributes. Multi-valued worker capabilities (a worker
+  advertising several values for one name) would need a richer model;
+  deferred until a workload needs it, with a test pinning the current
+  behaviour.
+- **`eligible_workers` composes `healthy()` + the matcher.** Eligibility
+  = live AND satisfies-constraints. Returning an iterator (not a Vec)
+  keeps it allocation-free for the scheduler's pick path.
+
+### Next increment (I6)
+
+Teach the scheduler to use `eligible_workers`. The current scheduler is
+single-worker (one queue, one stream); I6 introduces capability-aware
+*selection* — extract the action's `Platform` (from `Command.platform` /
+`Action.platform`) and pick an eligible worker — as the data-model step
+toward multi-worker dispatch. Full multi-worker fan-out (multiple
+concurrent streams) is a later increment; I6 should be the smallest step
+that makes selection constraint-aware without rewriting dispatch.
+
+## I6 — constraint-aware admission control (§16 task 2)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Decision taken with the owner:** "admission control first" (vs. a
+  full multi-worker dispatch redesign or pausing). So I6 uses the matcher
+  to *reject* un-runnable actions without restructuring dispatch.
+- **Outcome:** `Scheduler::execute` now consults a shared `WorkerRegistry`
+  (when wired in) and returns the typed `ExecutionError::NoEligibleWorker`
+  → gRPC `FAILED_PRECONDITION` if no live worker satisfies the action's
+  platform, instead of enqueuing a job that no worker can claim. The
+  binary builds one registry shared by the scheduler (reads), the worker
+  service (writes), and the eviction reaper. Three scheduler tests;
+  `brokkr-control` green (34 lib tests).
+
+### Decisions
+
+- **Admission, not routing.** Delivery stays single-queue/single-worker;
+  the matcher only gates *admission*. This is the smallest step that puts
+  the matcher to work and gives clients a fast, correct
+  `FAILED_PRECONDITION` instead of a 30-minute timeout. Real per-worker
+  routing + scheduling strategies (task 3) is the redesign that follows.
+- **Opt-in via constructor, off by default.** `new` /
+  `with_execution_timeout` leave the registry `None` (admission skipped),
+  so the Phase-1 in-process fixtures and unit tests are unchanged; the
+  binary opts in with `with_worker_registry`. Avoids a flag-day behaviour
+  change in tests while making production fail-fast.
+- **Check after the cache lookup, before enqueue.** A cache hit needs no
+  worker, so admission runs only on the dispatch path, after the
+  Action/Command are fetched (we need the platform) and before the job is
+  queued.
+- **Deprecated `Command.platform` fallback, scoped allow.** REAPI v2.2
+  moved platform to `Action.platform`; older clients still set
+  `Command.platform`. We accept both with a one-line `#[allow(deprecated)]`
+  rather than dropping v2.0 compatibility.
+
+### Known gap → next increment (I7)
+
+Admission control is now live in the binary, but the CLI worker still
+registers with **empty labels** (`run_worker` sends
+`labels: Default::default()`). So an action with any platform constraint
+will be rejected in production until the worker advertises its real
+capabilities. I7: have `brokkr-worker` advertise `os` / `arch` (and
+configurable labels) at registration so constrained actions can actually
+be scheduled. Actions with no platform requirements are unaffected (empty
+platform matches any healthy worker).
+
+## I7 — worker advertises os/arch capabilities (§16 task 2 — CLOSED)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-worker`
+- **Outcome:** `run_worker` now registers with `os` / `arch` labels from
+  `std::env::consts`, so the matcher + admission control chain works
+  end-to-end: worker advertises capabilities → control plane stores them
+  → constrained actions are matched and either placed or rejected with
+  `NoEligibleWorker`. One unit test on the label helper;
+  `brokkr-worker` green.
+
+### Decisions
+
+- **Auto-detect, no config-surface change.** Populated the labels
+  directly in `run_worker` via a small `default_capability_labels()`
+  helper rather than adding a `labels` field to `WorkerConfig`. Keeps the
+  two struct-literal construction sites (the CLI binary and the in-process
+  test fixture) untouched, and `os`/`arch` are the labels actions most
+  commonly constrain on. Configurable / richer capabilities (installed
+  tools, GPU, RAM — plan §6.3 / §8 `WorkerCapability`) are deferred to a
+  later increment when a workload needs them.
+- **Extracted a testable helper.** `run_worker` itself needs a live
+  server to exercise, so the label logic is a standalone fn with a unit
+  test; the flow into the registry is already covered by the control-plane
+  handler test `register_persists_capabilities_into_registry`.
+
+### §16 task 2 status
+
+Done across I5–I7: matcher (`brokkr-control::matching`) → admission
+control in the scheduler → worker capability advertisement. All on
+PR #99. Hard-constraint matching is complete end-to-end. **Deferred:**
+soft/preferred constraints (needs a Brokkr convention — future ADR);
+richer worker capabilities; per-worker *routing* (multi-worker dispatch)
+and scheduling strategies are §16 task 3, the next milestone — that's the
+multi-worker redesign the I6 decision deferred.

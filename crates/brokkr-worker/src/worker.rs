@@ -113,6 +113,17 @@ async fn build_channel(endpoint: String, tls: Option<&TlsConfig>) -> Result<Chan
     Ok(channel)
 }
 
+/// The platform-capability labels a worker advertises at registration so the
+/// control plane's constraint matcher can place actions on it: `os` and `arch`
+/// from the build target. Richer / configurable capabilities (installed tools,
+/// GPU, RAM) are a later increment.
+fn default_capability_labels() -> std::collections::HashMap<String, String> {
+    let mut labels = std::collections::HashMap::new();
+    labels.insert("os".to_string(), std::env::consts::OS.to_string());
+    labels.insert("arch".to_string(), std::env::consts::ARCH.to_string());
+    labels
+}
+
 /// Run the worker. Returns when the control plane closes the stream or an
 /// unrecoverable error occurs.
 #[tracing::instrument(name = "worker::run", skip(cfg))]
@@ -125,7 +136,7 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
     let reg = wsc
         .register(RegisterWorkerRequest {
             hostname: cfg.hostname.clone(),
-            labels: Default::default(),
+            labels: default_capability_labels(),
         })
         .await?
         .into_inner();
@@ -278,4 +289,26 @@ async fn handle_job(
         exit_code,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_labels_include_os_and_arch() {
+        let labels = default_capability_labels();
+        assert_eq!(
+            labels.get("os").map(String::as_str),
+            Some(std::env::consts::OS)
+        );
+        assert_eq!(
+            labels.get("arch").map(String::as_str),
+            Some(std::env::consts::ARCH)
+        );
+        // On the supported worker target these are non-empty.
+        assert!(!labels.get("os").unwrap().is_empty());
+        assert!(!labels.get("arch").unwrap().is_empty());
+    }
 }

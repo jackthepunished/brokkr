@@ -628,3 +628,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the control plane advertised at registration; on `known=false` it logs
   and stops (full re-register is `TODO(brokkr-410)`). Closes plan §16
   task 1 (worker registry + capabilities + heartbeat eviction).
+- `brokkr-control::matching` — platform constraint matching (plan §16
+  task 2). `labels_satisfy_platform` / `worker_satisfies` implement REAPI
+  semantics: a worker satisfies a `Platform` iff it advertises every
+  required `Property{name,value}` (empty platform matches everyone).
+  `eligible_workers(registry, now, platform)` yields the live workers
+  (via `WorkerRegistry::healthy`) that also satisfy the constraints —
+  the candidate set the scheduler will dispatch to. Kept proto-aware and
+  separate from the proto-free `registry` module (mirrors the Phase 3
+  `ring`/proto decoupling). Hard-constraint matching only; soft/preferred
+  constraints need a Brokkr convention (future ADR) since REAPI's
+  `Platform` has no soft notion. Six unit tests.
+- `brokkr-control::Scheduler` platform-constraint **admission control**:
+  `execute` now rejects an action up front with the new typed
+  `ExecutionError::NoEligibleWorker` (gRPC `FAILED_PRECONDITION`, code 9)
+  when no live worker satisfies the action's `Platform`
+  (`Action.platform`, falling back to the deprecated `Command.platform`),
+  instead of enqueuing a job no worker can claim (which would only
+  surface as a timeout). New constructors `Scheduler::with_worker_registry`
+  / `with_registry_and_timeout` thread in the shared `WorkerRegistry`;
+  the existing `new` / `with_execution_timeout` keep admission control off
+  (registry `None`), preserving prior behaviour for fixtures. The
+  `brokkr-control` binary now builds one shared registry feeding the
+  scheduler (reads), the worker service (writes), and the eviction reaper.
+  Three scheduler tests (reject on no worker, reject on label mismatch,
+  pass-through with a matching worker).
+- `brokkr-worker` now advertises platform capabilities at registration:
+  `os` and `arch` labels from the build target (`std::env::consts`), so
+  the control plane's constraint matcher can actually place
+  platform-constrained actions on it. Completes the §16 task 2
+  constraint-matching path end-to-end (worker advertises → matcher →
+  admission control). Richer / configurable capabilities (installed
+  tools, GPU, RAM) are a later increment. One unit test.
