@@ -1,5 +1,8 @@
 //! `brokkr.v1.WorkerService` server: registers workers and runs the bidi
-//! job-dispatch stream. Phase 1 only supports a single worker at a time.
+//! job-dispatch stream. Each connected worker is registered in the scheduler's
+//! [`ConnectedWorkers`](crate::scheduling::ConnectedWorkers) (keyed by the
+//! `worker_id` from its `Hello`) with its own job channel, so the scheduler can
+//! route jobs to a specific worker (ADR 0008).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -175,74 +178,108 @@ impl WorkerService for WorkerServiceImpl {
         let _guard = span.enter();
         let mut inbound = request.into_inner();
         let scheduler = self.scheduler.clone();
-        let mut job_rx = scheduler
-            .take_receiver()
-            .await
-            .ok_or_else(|| Status::resource_exhausted("worker stream already claimed"))?;
+        let connected = scheduler.connected_workers();
 
-        let (out_tx, out_rx) = mpsc::channel(4);
+        // Outbound stream handed back to the worker (JobAssignments). We must
+        // return it now, but the worker id is only known from the first inbound
+        // message (Hello) — so the per-worker channel registration happens in
+        // the spawned pump once Hello arrives.
+        let (out_tx, out_rx) = mpsc::channel::<Result<JobAssignment, Status>>(4);
 
-        // Inbound pump: read Hello (ignored beyond presence) and JobResults.
-        // Issue #64: previously this loop pattern-matched `Ok(Some(msg))`
-        // and silently exited on `Ok(None)` (clean stream end) and on `Err`
-        // (transport error, decode failure, peer reset). The worker then
-        // appeared to function while its stream was broken. We now log
-        // each terminal state at the appropriate level so an operator
-        // monitoring the control plane can tell why the loop quit.
-        let scheduler_in = scheduler.clone();
-        tokio::spawn(async move {
-            loop {
-                match inbound.message().await {
+        tokio::spawn(
+            async move {
+                // The first message must be Hello carrying the worker id.
+                let worker_id = match inbound.message().await {
                     Ok(Some(msg)) => match msg.payload {
-                        Some(bv1::worker_stream_message::Payload::Hello(_)) => {
-                            tracing::debug!("worker stream: hello received");
-                        }
-                        Some(bv1::worker_stream_message::Payload::Result(result)) => {
-                            if let Err(e) = scheduler_in.report(result).await {
-                                tracing::error!(
-                                    error = %e,
-                                    "invalid job_id in worker result"
-                                );
+                        Some(bv1::worker_stream_message::Payload::Hello(hello)) => {
+                            match hello.worker_id.and_then(|w| WorkerId::new(w.id).ok()) {
+                                Some(id) => id,
+                                None => {
+                                    tracing::error!(
+                                        "worker stream: Hello missing/invalid worker_id — closing"
+                                    );
+                                    return;
+                                }
                             }
                         }
-                        None => {
-                            tracing::warn!(
-                                "worker stream: received WorkerStreamMessage with no payload"
-                            );
+                        _ => {
+                            tracing::error!("worker stream: first message was not Hello — closing");
+                            return;
                         }
                     },
                     Ok(None) => {
-                        tracing::info!(
-                            "worker stream: closed cleanly by the worker — pump exiting"
-                        );
-                        break;
+                        tracing::info!("worker stream: closed before Hello");
+                        return;
                     }
                     Err(status) => {
                         tracing::error!(
                             code = ?status.code(),
-                            message = status.message(),
-                            "worker stream: transport error — pump exiting; \
-                             pending jobs for this worker will time out via the \
-                             scheduler timeout"
+                            "worker stream: transport error before Hello"
                         );
-                        break;
+                        return;
+                    }
+                };
+                tracing::info!(worker_id = %worker_id, "worker stream connected");
+
+                // Register this worker's own job channel so the scheduler can
+                // route jobs to it; spawn the outbound pump that forwards them.
+                let (job_tx, mut job_rx) = mpsc::channel::<bv1::Job>(8);
+                connected.lock().await.connect(worker_id.clone(), job_tx);
+                let outbound = tokio::spawn(async move {
+                    while let Some(job) = job_rx.recv().await {
+                        if out_tx
+                            .send(Ok(JobAssignment { job: Some(job) }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+
+                // Inbound pump: process JobResults until the stream ends. Each
+                // terminal state is logged (issue #64) so an operator can tell
+                // why the pump stopped.
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(msg)) => match msg.payload {
+                            Some(bv1::worker_stream_message::Payload::Hello(_)) => {
+                                tracing::debug!(worker_id = %worker_id, "duplicate hello ignored");
+                            }
+                            Some(bv1::worker_stream_message::Payload::Result(result)) => {
+                                if let Err(e) = scheduler.report(result).await {
+                                    tracing::error!(error = %e, "invalid job_id in worker result");
+                                }
+                            }
+                            None => {
+                                tracing::warn!("worker stream: message with no payload");
+                            }
+                        },
+                        Ok(None) => {
+                            tracing::info!(worker_id = %worker_id, "worker stream: closed cleanly");
+                            break;
+                        }
+                        Err(status) => {
+                            tracing::error!(
+                                worker_id = %worker_id,
+                                code = ?status.code(),
+                                message = status.message(),
+                                "worker stream: transport error — pump exiting; in-flight \
+                                 jobs for this worker time out via the scheduler timeout"
+                            );
+                            break;
+                        }
                     }
                 }
-            }
-        });
 
-        // Outbound pump: forward jobs from scheduler to worker.
-        tokio::spawn(async move {
-            while let Some(job) = job_rx.recv().await {
-                if out_tx
-                    .send(Ok(JobAssignment { job: Some(job) }))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                // Disconnect: deregister so the scheduler stops routing here,
+                // and stop the outbound pump (closing the worker's stream).
+                // Lease-based reassignment of in-flight jobs is task 4.
+                connected.lock().await.disconnect(&worker_id);
+                outbound.abort();
             }
-        });
+            .in_current_span(),
+        );
 
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }

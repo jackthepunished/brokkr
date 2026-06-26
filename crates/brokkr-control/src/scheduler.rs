@@ -1,8 +1,11 @@
-//! Single-node, single-queue job scheduler for Phase 1.
+//! Job scheduler: bridges the REAPI `Execute` RPC (client-facing) to the
+//! internal `brokkr.v1.WorkerService.Stream` (worker-facing).
 //!
-//! Bridges the REAPI `Execute` RPC (client-facing) to the internal
-//! `brokkr.v1.WorkerService.Stream` (worker-facing). Multi-worker fan-out and
-//! priority queues are Phase 4.
+//! Multi-worker dispatch follows ADR 0008: each connected worker has its own
+//! job channel ([`crate::scheduling::ConnectedWorkers`]); `execute` filters to
+//! the eligible (matching + connected) workers and a pluggable
+//! [`crate::scheduling::Strategy`] picks one. Global queueing, leases, and fair
+//! scheduling are Phase 4 task 4.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,14 +13,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use brokkr_cas::{ActionCache, Cas};
-use brokkr_common::{Digest, JobId};
+use brokkr_common::{Digest, JobId, WorkerId};
 use brokkr_proto::brokkr_v1 as bv1;
 use brokkr_proto::reapi_v2 as rapi;
 use prost::Message;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex};
 
 use crate::matching::eligible_workers;
+use crate::scheduling::{ConnectedWorkers, SharedConnectedWorkers, SimpleFifo, Strategy};
 use crate::worker_service::SharedWorkerRegistry;
 
 /// Default ceiling on how long [`Scheduler::execute`] waits for a worker to
@@ -57,19 +61,22 @@ pub struct ExecutionOutcome {
     pub cache_hit: bool,
 }
 
-/// Single-queue in-process job scheduler.
+/// Multi-worker job scheduler.
 pub struct Scheduler {
-    queue_tx: mpsc::UnboundedSender<bv1::Job>,
-    queue_rx: Mutex<Option<mpsc::UnboundedReceiver<bv1::Job>>>,
+    /// Workers with a live `Stream`, each with its own job channel + load.
+    /// `WorkerService.Stream` writes connect/disconnect; `execute` routes
+    /// through it.
+    connected: SharedConnectedWorkers,
+    /// Worker-selection policy (ADR 0008). Defaults to `SimpleFifo`.
+    strategy: Arc<dyn Strategy>,
     waiters: Mutex<HashMap<JobId, oneshot::Sender<bv1::JobResult>>>,
     cas: Arc<dyn Cas>,
     action_cache: Arc<dyn ActionCache>,
     default_execution_timeout: Duration,
-    /// Optional worker registry for platform-constraint admission control.
-    /// When set, [`Scheduler::execute`] rejects an action up front if no live
-    /// worker satisfies its platform. When `None` (e.g. unit tests that don't
-    /// exercise matching), admission control is skipped — preserving the
-    /// pre-Phase-4 single-worker behaviour.
+    /// Optional worker registry for platform-constraint filtering. When set,
+    /// candidates are narrowed to healthy workers whose capabilities satisfy
+    /// the action's platform; when `None` (e.g. fixtures that don't exercise
+    /// matching), any connected worker is a candidate.
     worker_registry: Option<SharedWorkerRegistry>,
 }
 
@@ -128,10 +135,9 @@ impl Scheduler {
         default_execution_timeout: Duration,
         worker_registry: Option<SharedWorkerRegistry>,
     ) -> Arc<Self> {
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
-            queue_tx,
-            queue_rx: Mutex::new(Some(queue_rx)),
+            connected: Arc::new(Mutex::new(ConnectedWorkers::new())),
+            strategy: Arc::new(SimpleFifo),
             waiters: Mutex::new(HashMap::new()),
             cas,
             action_cache,
@@ -140,11 +146,11 @@ impl Scheduler {
         })
     }
 
-    /// Take ownership of the job receiver. Returns `None` after the first call;
-    /// only one worker stream is supported in Phase 1.
-    #[tracing::instrument(name = "scheduler::take_receiver", skip(self))]
-    pub async fn take_receiver(&self) -> Option<mpsc::UnboundedReceiver<bv1::Job>> {
-        self.queue_rx.lock().await.take()
+    /// The shared connected-worker registry. `WorkerService.Stream` registers
+    /// each worker's job channel here on connect and removes it on disconnect;
+    /// `execute` routes jobs through it.
+    pub fn connected_workers(&self) -> SharedConnectedWorkers {
+        self.connected.clone()
     }
 
     /// Execute an action: look up the action cache, otherwise enqueue a job
@@ -158,6 +164,7 @@ impl Scheduler {
             cache_hit = tracing::field::Empty,
             exit_code = tracing::field::Empty,
             job_id = tracing::field::Empty,
+            worker_id = tracing::field::Empty,
         ),
     )]
     pub async fn execute(
@@ -200,38 +207,29 @@ impl Scheduler {
             .await
             .with_context(|| "fetching Command from CAS")?;
 
-        // Admission control: if a worker registry is wired in, reject the
-        // action up front when no live worker satisfies its platform, rather
-        // than enqueuing a job that no worker can ever claim (which would only
-        // surface as a timeout). The platform lives on `Action.platform`
-        // (REAPI v2.2) with a fallback to the deprecated `Command.platform`.
-        if let Some(registry) = self.worker_registry.as_ref() {
-            // `Command.platform` is deprecated in REAPI v2.2 (moved to
-            // `Action.platform`) but still used by older clients, so we accept
-            // it as a fallback — hence the scoped allow.
-            #[allow(deprecated)]
-            let platform = action
-                .platform
-                .clone()
-                .or_else(|| command.platform.clone())
-                .unwrap_or_default();
-            let has_eligible = {
-                let guard = registry.lock().await;
-                // Bind to a local so the borrowing iterator temporary is
-                // dropped before `guard` at the end of the block.
-                let any = eligible_workers(&guard, Instant::now(), &platform)
-                    .next()
-                    .is_some();
-                any
-            };
-            if !has_eligible {
-                tracing::warn!(
-                    action_digest = %action_digest,
-                    "no eligible worker for action platform; rejecting"
-                );
-                return Err(ExecutionError::NoEligibleWorker);
+        // Resolve the action's platform constraints. REAPI v2.2 carries them
+        // on `Action.platform`; older clients set the deprecated
+        // `Command.platform`, which we still accept as a fallback.
+        #[allow(deprecated)]
+        let platform = action
+            .platform
+            .clone()
+            .or_else(|| command.platform.clone())
+            .unwrap_or_default();
+
+        // Snapshot the registry-eligible worker ids (if a registry is wired
+        // in), releasing the registry lock before we touch the connected set —
+        // so the two locks are never held at once.
+        let eligible_ids: Option<Vec<WorkerId>> = match self.worker_registry.as_ref() {
+            Some(registry) => {
+                let reg = registry.lock().await;
+                let ids = eligible_workers(&reg, Instant::now(), &platform)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                Some(ids)
             }
-        }
+            None => None,
+        };
 
         // REAPI `Action.timeout` overrides the scheduler default; treat
         // missing / zero / negative as "use the default".
@@ -248,9 +246,40 @@ impl Scheduler {
             })
             .unwrap_or(self.default_execution_timeout);
 
+        // Pick a worker and claim a job sender + an in-flight slot under one
+        // lock on the connected set. Candidates = connected workers, narrowed
+        // to the registry-eligible ones when a registry is present.
+        let (worker_id, sender) = {
+            let mut connected = self.connected.lock().await;
+            let candidates: Vec<WorkerId> = match &eligible_ids {
+                Some(ids) => ids
+                    .iter()
+                    .filter(|id| connected.is_connected(id))
+                    .cloned()
+                    .collect(),
+                None => connected.connected_ids().cloned().collect(),
+            };
+            let Some(chosen) = self.strategy.choose(&candidates, &*connected) else {
+                tracing::warn!(
+                    action_digest = %action_digest,
+                    "no eligible connected worker for action platform; rejecting"
+                );
+                return Err(ExecutionError::NoEligibleWorker);
+            };
+            let Some(sender) = connected.sender(&chosen) else {
+                // Disconnected between selection and sender clone (racy); fail
+                // closed rather than route into the void.
+                return Err(ExecutionError::NoEligibleWorker);
+            };
+            connected.inc_inflight(&chosen);
+            (chosen, sender)
+        };
+
         let job_id = JobId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|e| anyhow!("invalid job id: {e}"))?;
-        tracing::Span::current().record("job_id", job_id.as_str());
+        tracing::Span::current()
+            .record("job_id", job_id.as_str())
+            .record("worker_id", worker_id.as_str());
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.insert(job_id.clone(), tx);
 
@@ -263,53 +292,59 @@ impl Scheduler {
             action: Some(action),
             command: Some(command),
         };
-        if self.queue_tx.send(job).is_err() {
-            // Drop the now-orphaned waiter so the map doesn't grow.
+        if sender.send(job).await.is_err() {
+            // The worker's channel closed (it disconnected after selection).
+            // Drop the waiter and release the in-flight slot.
             self.waiters.lock().await.remove(&job_id);
-            return Err(anyhow!("scheduler queue closed").into());
+            self.connected.lock().await.dec_inflight(&worker_id);
+            return Err(anyhow!("worker channel closed before dispatch").into());
         }
 
-        let report = match tokio::time::timeout(effective_timeout, rx).await {
-            Ok(Ok(report)) => report,
-            Ok(Err(_)) => {
-                // Waiter dropped without a value — the entry is already gone
-                // from the map (consumed by `report`).
-                return Err(anyhow!("worker did not report result").into());
+        // Await the result, then release the in-flight slot on every exit path.
+        // The inner `async` block lets `?` / early `return` short-circuit to
+        // `outcome` so the decrement below always runs exactly once.
+        let outcome: Result<ExecutionOutcome, ExecutionError> = async {
+            let report = match tokio::time::timeout(effective_timeout, rx).await {
+                Ok(Ok(report)) => report,
+                Ok(Err(_)) => {
+                    // Waiter dropped without a value (already removed by `report`).
+                    return Err(anyhow!("worker did not report result").into());
+                }
+                Err(_) => {
+                    // Reclaim the waiter slot so the map doesn't accumulate
+                    // stalled entries; a late report is then discarded on miss.
+                    self.waiters.lock().await.remove(&job_id);
+                    tracing::warn!(
+                        job_id = job_id.as_str(),
+                        timeout_secs = effective_timeout.as_secs_f64(),
+                        "scheduler: worker did not report within timeout"
+                    );
+                    return Err(ExecutionError::Timeout(effective_timeout));
+                }
+            };
+            if !report.error_message.is_empty() {
+                return Err(anyhow!("worker error: {}", report.error_message).into());
             }
-            Err(_) => {
-                // Time elapsed. Reclaim the waiter slot before returning so
-                // the map doesn't accumulate stalled entries; a late report
-                // from the worker will then be discarded by `report` because
-                // the lookup misses.
-                self.waiters.lock().await.remove(&job_id);
-                tracing::warn!(
-                    job_id = job_id.as_str(),
-                    timeout_secs = effective_timeout.as_secs_f64(),
-                    "scheduler: worker did not report within timeout"
-                );
-                return Err(ExecutionError::Timeout(effective_timeout));
+            let result = report
+                .result
+                .ok_or_else(|| anyhow!("worker reported no ActionResult"))?;
+            if result.exit_code == 0 {
+                self.action_cache
+                    .update_action_result(&action_digest, result.clone())
+                    .await
+                    .map_err(|e| anyhow!("action cache update: {e}"))?;
             }
-        };
-        if !report.error_message.is_empty() {
-            return Err(anyhow!("worker error: {}", report.error_message).into());
+            tracing::Span::current()
+                .record("cache_hit", false)
+                .record("exit_code", result.exit_code);
+            Ok(ExecutionOutcome {
+                result,
+                cache_hit: false,
+            })
         }
-        let result = report
-            .result
-            .ok_or_else(|| anyhow!("worker reported no ActionResult"))?;
-
-        if result.exit_code == 0 {
-            self.action_cache
-                .update_action_result(&action_digest, result.clone())
-                .await
-                .map_err(|e| anyhow!("action cache update: {e}"))?;
-        }
-        tracing::Span::current()
-            .record("cache_hit", false)
-            .record("exit_code", result.exit_code);
-        Ok(ExecutionOutcome {
-            result,
-            cache_hit: false,
-        })
+        .await;
+        self.connected.lock().await.dec_inflight(&worker_id);
+        outcome
     }
 
     /// Worker-side entry: receive a job result and wake the matching waiter.
@@ -499,6 +534,16 @@ mod tests {
         let timeout = Duration::from_millis(120);
         let scheduler = Scheduler::with_execution_timeout(cas, ac, timeout);
 
+        // Connect a worker (no registry → any connected worker is a
+        // candidate). Hold the receiver so the dispatched job buffers and
+        // `execute` awaits a result that never arrives → Timeout.
+        let (tx, _held_rx) = tokio::sync::mpsc::channel::<bv1::Job>(8);
+        scheduler
+            .connected_workers()
+            .lock()
+            .await
+            .connect(WorkerId::new("w1".to_string()).unwrap(), tx);
+
         let start = Instant::now();
         let err = scheduler.execute(action_digest, true).await.unwrap_err();
         let elapsed = start.elapsed();
@@ -579,12 +624,19 @@ mod tests {
         }
     }
 
-    fn registry_with_worker(labels: &[(&str, &str)]) -> SharedWorkerRegistry {
-        use brokkr_common::WorkerId;
+    /// Register a worker in `registry` with `labels` and connect it to
+    /// `scheduler`'s `ConnectedWorkers`, returning the held job receiver. Keep
+    /// the receiver alive so the per-worker channel stays open and dispatched
+    /// jobs buffer (instead of the sender erroring on a dropped receiver).
+    async fn register_and_connect(
+        scheduler: &Arc<Scheduler>,
+        registry: &SharedWorkerRegistry,
+        id: &str,
+        labels: &[(&str, &str)],
+    ) -> tokio::sync::mpsc::Receiver<bv1::Job> {
+        use crate::registry::WorkerCapabilities;
 
-        use crate::registry::{WorkerCapabilities, WorkerRegistry};
-
-        let mut reg = WorkerRegistry::default();
+        let wid = WorkerId::new(id.to_string()).unwrap();
         let caps = WorkerCapabilities {
             hostname: "w".to_string(),
             labels: labels
@@ -592,15 +644,16 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         };
-        reg.register(
-            WorkerId::new("w1".to_string()).unwrap(),
-            caps,
-            Instant::now(),
-        );
-        Arc::new(Mutex::new(reg))
+        registry
+            .lock()
+            .await
+            .register(wid.clone(), caps, Instant::now());
+        let (tx, rx) = tokio::sync::mpsc::channel::<bv1::Job>(8);
+        scheduler.connected_workers().lock().await.connect(wid, tx);
+        rx
     }
 
-    /// No registered worker → admission control rejects before enqueue.
+    /// No connected worker → routing rejects before dispatch.
     #[tokio::test]
     async fn execute_rejects_when_no_eligible_worker() {
         use crate::registry::WorkerRegistry;
@@ -608,7 +661,7 @@ mod tests {
         let cas = Arc::new(brokkr_cas::InMemoryCas::new());
         let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
         let ac = Arc::new(MockActionCache { force_error: false });
-        let registry = Arc::new(Mutex::new(WorkerRegistry::default())); // empty
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default())); // empty, none connected
         let scheduler =
             Scheduler::with_registry_and_timeout(cas, ac, Duration::from_millis(200), registry);
 
@@ -619,15 +672,23 @@ mod tests {
         );
     }
 
-    /// A worker whose labels don't satisfy the platform is not eligible.
+    /// A connected worker whose labels don't satisfy the platform is filtered
+    /// out → NoEligibleWorker.
     #[tokio::test]
     async fn execute_rejects_when_worker_does_not_match_platform() {
+        use crate::registry::WorkerRegistry;
+
         let cas = Arc::new(brokkr_cas::InMemoryCas::new());
         let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
         let ac = Arc::new(MockActionCache { force_error: false });
-        let registry = registry_with_worker(&[("os", "windows")]);
-        let scheduler =
-            Scheduler::with_registry_and_timeout(cas, ac, Duration::from_millis(200), registry);
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_millis(200),
+            registry.clone(),
+        );
+        let _held = register_and_connect(&scheduler, &registry, "w1", &[("os", "windows")]).await;
 
         let err = scheduler.execute(action_digest, true).await.unwrap_err();
         assert!(
@@ -636,22 +697,61 @@ mod tests {
         );
     }
 
-    /// An eligible worker present → admission passes; with no worker actually
-    /// consuming the queue the call then times out (proving it got past
-    /// admission rather than being rejected).
+    /// A connected, matching worker → routing dispatches; with no result coming
+    /// back the call times out (proving it got past selection rather than being
+    /// rejected).
     #[tokio::test]
-    async fn execute_passes_admission_with_matching_worker() {
+    async fn execute_passes_routing_with_matching_worker() {
+        use crate::registry::WorkerRegistry;
+
         let cas = Arc::new(brokkr_cas::InMemoryCas::new());
         let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
         let ac = Arc::new(MockActionCache { force_error: false });
-        let registry = registry_with_worker(&[("os", "linux")]);
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
         let timeout = Duration::from_millis(120);
-        let scheduler = Scheduler::with_registry_and_timeout(cas, ac, timeout, registry);
+        let scheduler = Scheduler::with_registry_and_timeout(cas, ac, timeout, registry.clone());
+        let _held = register_and_connect(&scheduler, &registry, "w1", &[("os", "linux")]).await;
 
         let err = scheduler.execute(action_digest, true).await.unwrap_err();
         assert!(
             matches!(err, ExecutionError::Timeout(_)),
-            "expected Timeout (admission passed), got {err:?}"
+            "expected Timeout (selection passed), got {err:?}"
+        );
+    }
+
+    /// Two connected matching workers: `SimpleFifo` spreads — in-flight
+    /// tracking sends the second job to the idle worker, so each worker's
+    /// channel receives exactly one job.
+    #[tokio::test]
+    async fn execute_spreads_across_two_idle_workers() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let timeout = Duration::from_millis(150);
+        let scheduler = Scheduler::with_registry_and_timeout(cas, ac, timeout, registry.clone());
+        let mut rx_a = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+        let mut rx_b = register_and_connect(&scheduler, &registry, "w-b", &[("os", "linux")]).await;
+
+        // Two concurrent executes; neither worker reports, so both time out.
+        // pick+inc-in-flight is one critical section under the connected lock,
+        // so the second execute sees the first worker busy and picks the other.
+        let (s1, s2) = (scheduler.clone(), scheduler.clone());
+        let (d1, d2) = (action_digest.clone(), action_digest);
+        let h1 = tokio::spawn(async move { s1.execute(d1, true).await });
+        let h2 = tokio::spawn(async move { s2.execute(d2, true).await });
+        let _ = h1.await.unwrap();
+        let _ = h2.await.unwrap();
+
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "worker a should have received exactly one job"
+        );
+        assert!(
+            rx_b.try_recv().is_ok(),
+            "worker b should have received exactly one job"
         );
     }
 }

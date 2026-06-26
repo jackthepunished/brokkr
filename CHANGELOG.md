@@ -660,3 +660,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constraint-matching path end-to-end (worker advertises → matcher →
   admission control). Richer / configurable capabilities (installed
   tools, GPU, RAM) are a later increment. One unit test.
+- ADR 0008 — multi-worker scheduling: per-worker job queues with
+  submit-time routing + a pluggable selection `Strategy` (chosen over a
+  central dispatcher / pull model). `docs/architecture/0008-multi-worker-scheduling.md`.
+- `brokkr-control::scheduling` (plan §16 task 3 foundation): the
+  `Strategy` trait + `LoadView` and a `SimpleFifo` strategy
+  (least-loaded candidate, deterministic id tie-break), plus
+  `ConnectedWorkers` — a registry of workers with a live stream, each
+  with its own job channel and in-flight count (distinct from
+  `WorkerRegistry`, which tracks liveness/capabilities). Pure
+  data-model + policy; the scheduler/worker-service wiring that routes
+  jobs through it is the next increment. Eight unit tests.
+- Multi-worker dispatch wired through the scheduler (ADR 0008). The
+  single shared job queue (`Scheduler::take_receiver`) is gone:
+  `WorkerService.Stream` now reads the worker id from the worker's
+  `Hello`, registers a per-worker job channel in the shared
+  `ConnectedWorkers`, pumps that worker's jobs, and deregisters on
+  disconnect. `Scheduler::execute` routes each action to a specific
+  worker — candidates = connected workers, narrowed to the
+  platform-matching healthy ones when a registry is wired in, then
+  `Strategy::choose` (`SimpleFifo`) picks one; per-worker in-flight
+  counts are incremented on dispatch and decremented when the result or
+  timeout resolves. No eligible connected worker → `NoEligibleWorker`.
+  `Scheduler` gained `connected_workers()`; the binary shares one
+  `ConnectedWorkers` between the scheduler and the worker service (the
+  scheduler owns it). Five scheduler tests updated/added (reject when
+  none connected, reject on label mismatch, route-then-timeout, two-worker
+  spread) plus the existing real-gRPC end-to-end. In-flight job
+  reassignment when a worker disconnects is deferred to task 4 (leases).
