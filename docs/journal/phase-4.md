@@ -256,3 +256,50 @@ single-worker (one queue, one stream); I6 introduces capability-aware
 toward multi-worker dispatch. Full multi-worker fan-out (multiple
 concurrent streams) is a later increment; I6 should be the smallest step
 that makes selection constraint-aware without rewriting dispatch.
+
+## I6 — constraint-aware admission control (§16 task 2)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Decision taken with the owner:** "admission control first" (vs. a
+  full multi-worker dispatch redesign or pausing). So I6 uses the matcher
+  to *reject* un-runnable actions without restructuring dispatch.
+- **Outcome:** `Scheduler::execute` now consults a shared `WorkerRegistry`
+  (when wired in) and returns the typed `ExecutionError::NoEligibleWorker`
+  → gRPC `FAILED_PRECONDITION` if no live worker satisfies the action's
+  platform, instead of enqueuing a job that no worker can claim. The
+  binary builds one registry shared by the scheduler (reads), the worker
+  service (writes), and the eviction reaper. Three scheduler tests;
+  `brokkr-control` green (34 lib tests).
+
+### Decisions
+
+- **Admission, not routing.** Delivery stays single-queue/single-worker;
+  the matcher only gates *admission*. This is the smallest step that puts
+  the matcher to work and gives clients a fast, correct
+  `FAILED_PRECONDITION` instead of a 30-minute timeout. Real per-worker
+  routing + scheduling strategies (task 3) is the redesign that follows.
+- **Opt-in via constructor, off by default.** `new` /
+  `with_execution_timeout` leave the registry `None` (admission skipped),
+  so the Phase-1 in-process fixtures and unit tests are unchanged; the
+  binary opts in with `with_worker_registry`. Avoids a flag-day behaviour
+  change in tests while making production fail-fast.
+- **Check after the cache lookup, before enqueue.** A cache hit needs no
+  worker, so admission runs only on the dispatch path, after the
+  Action/Command are fetched (we need the platform) and before the job is
+  queued.
+- **Deprecated `Command.platform` fallback, scoped allow.** REAPI v2.2
+  moved platform to `Action.platform`; older clients still set
+  `Command.platform`. We accept both with a one-line `#[allow(deprecated)]`
+  rather than dropping v2.0 compatibility.
+
+### Known gap → next increment (I7)
+
+Admission control is now live in the binary, but the CLI worker still
+registers with **empty labels** (`run_worker` sends
+`labels: Default::default()`). So an action with any platform constraint
+will be rejected in production until the worker advertises its real
+capabilities. I7: have `brokkr-worker` advertise `os` / `arch` (and
+configurable labels) at registration so constrained actions can actually
+be scheduled. Actions with no platform requirements are unaffected (empty
+platform matches any healthy worker).

@@ -639,3 +639,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ring`/proto decoupling). Hard-constraint matching only; soft/preferred
   constraints need a Brokkr convention (future ADR) since REAPI's
   `Platform` has no soft notion. Six unit tests.
+- `brokkr-control::Scheduler` platform-constraint **admission control**:
+  `execute` now rejects an action up front with the new typed
+  `ExecutionError::NoEligibleWorker` (gRPC `FAILED_PRECONDITION`, code 9)
+  when no live worker satisfies the action's `Platform`
+  (`Action.platform`, falling back to the deprecated `Command.platform`),
+  instead of enqueuing a job no worker can claim (which would only
+  surface as a timeout). New constructors `Scheduler::with_worker_registry`
+  / `with_registry_and_timeout` thread in the shared `WorkerRegistry`;
+  the existing `new` / `with_execution_timeout` keep admission control off
+  (registry `None`), preserving prior behaviour for fixtures. The
+  `brokkr-control` binary now builds one shared registry feeding the
+  scheduler (reads), the worker service (writes), and the eviction reaper.
+  Three scheduler tests (reject on no worker, reject on label mismatch,
+  pass-through with a matching worker). NOTE: the CLI worker still
+  registers with empty labels, so constrained actions can't be scheduled
+  until the worker advertises its capabilities (next increment).

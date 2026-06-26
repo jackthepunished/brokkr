@@ -81,11 +81,13 @@ impl ExecSvc for ExecutionService {
                     }
                     Err(e) => {
                         // DEADLINE_EXCEEDED for scheduler timeouts (issue
-                        // #63); INTERNAL for everything else. The choice of
-                        // code lets clients implement retry-on-timeout
-                        // policies without parsing the error string.
+                        // #63); FAILED_PRECONDITION when no worker can run the
+                        // action; INTERNAL for everything else. The code lets
+                        // clients implement retry policies without parsing the
+                        // error string.
                         let code = match &e {
                             ExecutionError::Timeout(_) => 4,
+                            ExecutionError::NoEligibleWorker => 9,
                             ExecutionError::Other(_) => 13,
                         };
                         brokkr_proto::longrunning::Operation {
