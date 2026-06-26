@@ -30,6 +30,21 @@ message RegisterWorkerResponse {
   uint32 heartbeat_seconds = 2;
 }
 
+// Periodic worker→control-plane liveness ping. The worker sends one roughly
+// every `heartbeat_seconds` (from RegisterWorkerResponse). The control plane
+// refreshes the worker's last-seen time; a worker that misses too many is
+// evicted from the registry and must re-register.
+message HeartbeatRequest {
+  WorkerId worker_id = 1;
+}
+
+message HeartbeatResponse {
+  // False if the control plane has no record of this worker (it was never
+  // registered, or it has already been evicted). The worker should re-register
+  // when it sees this.
+  bool known = 1;
+}
+
 // A unit of work dispatched to a worker.
 message Job {
   // Server-assigned unique job identifier (separate from action digest so
@@ -79,6 +94,10 @@ message JobAssignment {
 
 service WorkerService {
   rpc Register(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Periodic liveness ping. The control plane refreshes the worker's
+  // last-seen time and replies whether it still knows the worker.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // Long-lived bidi stream. Worker sends Hello first, then alternates
   // JobResult after each JobAssignment received from the server.

@@ -121,3 +121,44 @@ handle it via `registry.record_heartbeat`, and have the worker call it
 on the advertised cadence. Then a background eviction tick that calls
 `evict_stale` on an interval. (Proto change → first increment of Phase 4
 that regenerates `brokkr-proto`.)
+
+## I3 — heartbeat RPC (§16 task 1, liveness ping)
+
+- **Date:** 2026-06-27
+- **Affected crates:** `brokkr-proto`, `brokkr-control`
+- **Outcome:** `brokkr.v1.WorkerService.Heartbeat`
+  (`HeartbeatRequest{worker_id}` → `HeartbeatResponse{known}`) plus its
+  control-plane handler. `heartbeat` refreshes the worker's `last_seen`
+  through `WorkerRegistry::record_heartbeat`; the response's `known` flag
+  tells the worker whether the control plane still has a record of it.
+  Three handler tests; `brokkr-control` + `brokkr-proto` fmt/clippy/test
+  green.
+
+### Decisions
+
+- **Unknown worker is `known=false`, not an error.** A heartbeat from an
+  evicted (or never-registered) worker is an expected, recoverable
+  state, not a fault. Returning `known=false` gives the worker a clean
+  "re-register" signal; returning a gRPC error would make it retry a
+  dead identity or backoff for the wrong reason. Only a *malformed*
+  request (missing `worker_id`) is `INVALID_ARGUMENT`.
+- **No new proto message churn.** Reused the existing `WorkerId` message
+  for the request; the response is a single bool. Resisted adding a
+  server-suggested next-interval field — the cadence is already fixed at
+  register time, and re-negotiating it per heartbeat is YAGNI until
+  there's a reason to vary it.
+- **Server-side only this increment.** The RPC is implemented and tested
+  via direct handler calls; no worker calls it yet. Splitting the
+  transport/handler (here) from the worker's send-loop + the background
+  eviction tick (next) keeps each unit independently testable and the
+  diffs small. The proto addition is backward-compatible — existing
+  clients that never call `Heartbeat` are unaffected.
+
+### Next increment (I4)
+
+Worker-side: a heartbeat send-loop in `brokkr-worker` that pings on the
+advertised `heartbeat_seconds` and re-registers on `known=false`. Control
+side: a background eviction task (`tokio::time::interval` →
+`evict_stale`) wired into the `brokkr-control` binary. Target: an
+end-to-end test where a worker that stops heartbeating is evicted after
+the deadline. This closes §16 task 1.

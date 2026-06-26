@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
-    self as bv1, worker_service_server::WorkerService, JobAssignment, RegisterWorkerRequest,
-    RegisterWorkerResponse, WorkerId as ProtoWorkerId, WorkerStreamMessage,
+    self as bv1, worker_service_server::WorkerService, HeartbeatRequest, HeartbeatResponse,
+    JobAssignment, RegisterWorkerRequest, RegisterWorkerResponse, WorkerId as ProtoWorkerId,
+    WorkerStreamMessage,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
@@ -90,6 +91,39 @@ impl WorkerService for WorkerServiceImpl {
             }),
             heartbeat_seconds,
         }))
+    }
+
+    #[tracing::instrument(
+        name = "worker_service::heartbeat",
+        skip(self, request),
+        fields(worker_id = tracing::field::Empty, known = tracing::field::Empty),
+    )]
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let worker_id_proto = req
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("HeartbeatRequest.worker_id missing"))?;
+        let worker_id = WorkerId::new(worker_id_proto.id)
+            .map_err(|e| Status::invalid_argument(format!("invalid worker id: {e}")))?;
+        tracing::Span::current().record("worker_id", worker_id.as_str());
+
+        // An unknown worker is not an error — the registry may have evicted it
+        // after missed heartbeats, or it never registered. Reply `known=false`
+        // so the worker re-registers rather than retrying a dead identity.
+        let known = {
+            let mut registry = self.registry.lock().await;
+            registry
+                .record_heartbeat(&worker_id, Instant::now())
+                .is_ok()
+        };
+        tracing::Span::current().record("known", known);
+        if !known {
+            tracing::warn!("heartbeat from unknown worker; signalling re-register");
+        }
+        Ok(Response::new(HeartbeatResponse { known }))
     }
 
     type StreamStream = ReceiverStream<Result<JobAssignment, Status>>;
@@ -263,5 +297,51 @@ mod tests {
             .into_inner();
         assert_ne!(r1.worker_id.unwrap().id, r2.worker_id.unwrap().id);
         assert_eq!(svc.registry().lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_after_register_is_known() {
+        let svc = service();
+        let id = svc
+            .register(Request::new(RegisterWorkerRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+
+        let resp = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                worker_id: Some(id),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.known);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_unknown_worker_is_not_known() {
+        let svc = service();
+        let resp = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                worker_id: Some(ProtoWorkerId {
+                    id: "never-registered".to_string(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.known);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_with_missing_worker_id_is_invalid_argument() {
+        let svc = service();
+        let status = svc
+            .heartbeat(Request::new(HeartbeatRequest { worker_id: None }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }

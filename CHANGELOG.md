@@ -605,3 +605,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[tracing::instrument]` span recording the assigned `worker_id`.
   Two handler tests (capabilities persisted; distinct id per
   registration).
+- `brokkr.v1.WorkerService.Heartbeat` RPC (`HeartbeatRequest{worker_id}`
+  → `HeartbeatResponse{known}`). `WorkerServiceImpl::heartbeat` refreshes
+  the worker's `last_seen` via `WorkerRegistry::record_heartbeat`; an
+  unknown/evicted worker is **not** an error — it gets `known=false` so
+  it re-registers instead of retrying a dead identity. A missing
+  `worker_id` is `INVALID_ARGUMENT`. Three handler tests (known after
+  register, unknown → not known, missing id → invalid argument). The
+  worker-side heartbeat sender and the background eviction tick are the
+  next increment.
