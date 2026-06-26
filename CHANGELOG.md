@@ -577,3 +577,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Non-Linux hosts get a compile-time stub
   (`fuse::mount::MountError::Unsupported`) so the CLI/SDK
   build stays portable.
+
+## Phase 4 (in progress)
+
+### Added
+- `brokkr-control::registry` — in-memory `WorkerRegistry` (plan §16
+  task 1). Tracks each worker's `WorkerCapabilities` (hostname +
+  free-form labels, mirroring `RegisterWorkerRequest`) and its
+  `last_seen` instant; `register` / `record_heartbeat` /
+  `evict_stale` / `healthy` operate against a caller-supplied
+  `now: Instant` so liveness is deterministic under test (no
+  internal `Instant::now`/`SystemTime::now`). `HeartbeatPolicy`
+  defaults to the plan's 5 s interval × 3 missed = 15 s eviction
+  deadline; `record_heartbeat` on an unknown worker returns the
+  typed `RegistryError::UnknownWorker`. Ten unit tests. The
+  heartbeat RPC + scheduler worker-selection wiring are the next
+  increments; this lands the transport-agnostic data model first.
