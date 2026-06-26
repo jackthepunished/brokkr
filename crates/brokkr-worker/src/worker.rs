@@ -2,13 +2,14 @@
 //! received run the command and report the result.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use brokkr_common::WorkerId;
 use brokkr_proto::brokkr_v1::{
     self as bv1, worker_service_client::WorkerServiceClient, worker_stream_message::Payload,
-    JobResult, RegisterWorkerRequest, WorkerHello as ProtoWorkerHello, WorkerId as ProtoWorkerId,
-    WorkerStreamMessage,
+    HeartbeatRequest, JobResult, RegisterWorkerRequest, WorkerHello as ProtoWorkerHello,
+    WorkerId as ProtoWorkerId, WorkerStreamMessage,
 };
 use brokkr_proto::reapi_v2::{
     self as rapi, batch_update_blobs_request as bur,
@@ -16,6 +17,7 @@ use brokkr_proto::reapi_v2::{
 };
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
+use tracing::Instrument;
 
 use crate::runner::{proto_digest, run_command, RunOutcome, Runner};
 
@@ -134,6 +136,45 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow!("invalid worker id from control plane: {e}"))?;
     tracing::info!(worker_id = %worker_id, "worker registered");
 
+    // Background heartbeat: prove liveness on the cadence the control plane
+    // advertised so the registry doesn't evict us. On `known=false` the
+    // control plane has already evicted us (missed heartbeats) — stop pinging.
+    let heartbeat_secs = reg.heartbeat_seconds.max(1) as u64;
+    let mut hb_client = wsc.clone();
+    let hb_worker_id = worker_id.as_str().to_string();
+    let heartbeat_task = tokio::spawn(
+        async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+            // Registration already counts as the first heartbeat.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match hb_client
+                    .heartbeat(HeartbeatRequest {
+                        worker_id: Some(ProtoWorkerId {
+                            id: hb_worker_id.clone(),
+                        }),
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        if !resp.into_inner().known {
+                            tracing::warn!(
+                                "control plane no longer recognises this worker; \
+                                 stopping heartbeat (re-registration required)"
+                            );
+                            // TODO(brokkr-410): re-register and re-open the job
+                            // stream instead of just stopping the heartbeat loop.
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "heartbeat RPC failed"),
+                }
+            }
+        }
+        .in_current_span(),
+    );
+
     // Outbound channel: hello + job results.
     let (tx, rx) = mpsc::channel::<WorkerStreamMessage>(8);
     tx.send(WorkerStreamMessage {
@@ -177,6 +218,7 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
             break;
         }
     }
+    heartbeat_task.abort();
     Ok(())
 }
 

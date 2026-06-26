@@ -7,11 +7,15 @@
 #![deny(missing_docs)]
 
 pub mod membership;
+pub mod registry;
 pub mod scheduler;
 pub mod services;
 pub mod worker_service;
 
 pub use membership::{Membership, MembershipServiceImpl};
+pub use registry::{
+    HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
+};
 pub use scheduler::Scheduler;
 pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
-pub use worker_service::WorkerServiceImpl;
+pub use worker_service::{spawn_eviction_task, SharedWorkerRegistry, WorkerServiceImpl};

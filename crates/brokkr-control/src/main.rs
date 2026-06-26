@@ -7,8 +7,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use brokkr_cas::{RedbActionCache, RedbCas};
 use brokkr_control::{
-    ActionCacheService, CapabilitiesService, CasService, ExecutionService, Scheduler,
-    WorkerServiceImpl,
+    spawn_eviction_task, ActionCacheService, CapabilitiesService, CasService, ExecutionService,
+    Scheduler, WorkerServiceImpl,
 };
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
@@ -113,6 +113,12 @@ async fn main() -> Result<()> {
 
     tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, "brokkr-control starting");
 
+    let worker_service = WorkerServiceImpl::new(scheduler.clone());
+    // Background liveness reaper: evict workers that stop heartbeating. Held
+    // for the server's lifetime; aborting it on shutdown is implicit (process
+    // exit). The eviction decision lives in `WorkerRegistry::evict_stale`.
+    let _eviction = spawn_eviction_task(worker_service.registry());
+
     let mut server = Server::builder();
     if let Some(tls_cfg) = tls_cfg {
         server = server.tls_config(tls_cfg)?;
@@ -126,7 +132,7 @@ async fn main() -> Result<()> {
         .add_service(ExecutionServer::new(ExecutionService::new(
             scheduler.clone(),
         )))
-        .add_service(WorkerServiceServer::new(WorkerServiceImpl::new(scheduler)))
+        .add_service(WorkerServiceServer::new(worker_service))
         .serve(args.listen)
         .await
         .context("control plane server exited")?;

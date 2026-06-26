@@ -577,3 +577,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Non-Linux hosts get a compile-time stub
   (`fuse::mount::MountError::Unsupported`) so the CLI/SDK
   build stays portable.
+
+## Phase 4 (in progress)
+
+### Added
+- `brokkr-control::registry` — in-memory `WorkerRegistry` (plan §16
+  task 1). Tracks each worker's `WorkerCapabilities` (hostname +
+  free-form labels, mirroring `RegisterWorkerRequest`) and its
+  `last_seen` instant; `register` / `record_heartbeat` /
+  `evict_stale` / `healthy` operate against a caller-supplied
+  `now: Instant` so liveness is deterministic under test (no
+  internal `Instant::now`/`SystemTime::now`). `HeartbeatPolicy`
+  defaults to the plan's 5 s interval × 3 missed = 15 s eviction
+  deadline; `record_heartbeat` on an unknown worker returns the
+  typed `RegistryError::UnknownWorker`. Ten unit tests. The
+  heartbeat RPC + scheduler worker-selection wiring are the next
+  increments; this lands the transport-agnostic data model first.
+- `brokkr-control::WorkerServiceImpl` now persists registrations into
+  a shared `WorkerRegistry` (`SharedWorkerRegistry =
+  Arc<Mutex<WorkerRegistry>>`): `register` records the worker's
+  hostname + labels as `WorkerCapabilities` (previously discarded) and
+  advertises `heartbeat_seconds` derived from the registry's policy
+  interval (5 s) instead of a hardcoded 30, so a worker that honours
+  the cadence is never evicted while healthy. New `with_registry`
+  constructor + `registry()` accessor share the handle with the
+  (forthcoming) heartbeat RPC and eviction tick. `register` gains a
+  `#[tracing::instrument]` span recording the assigned `worker_id`.
+  Two handler tests (capabilities persisted; distinct id per
+  registration).
+- `brokkr.v1.WorkerService.Heartbeat` RPC (`HeartbeatRequest{worker_id}`
+  → `HeartbeatResponse{known}`). `WorkerServiceImpl::heartbeat` refreshes
+  the worker's `last_seen` via `WorkerRegistry::record_heartbeat`; an
+  unknown/evicted worker is **not** an error — it gets `known=false` so
+  it re-registers instead of retrying a dead identity. A missing
+  `worker_id` is `INVALID_ARGUMENT`. Three handler tests (known after
+  register, unknown → not known, missing id → invalid argument). The
+  worker-side heartbeat sender and the background eviction tick are the
+  next increment.
+- `brokkr-control::spawn_eviction_task` — background liveness reaper that
+  sweeps the shared `WorkerRegistry` once per heartbeat interval and
+  evicts workers past the deadline (`interval * max_missed`). Wired into
+  the `brokkr-control` binary; a zero interval disables it rather than
+  panicking. The eviction decision is `WorkerRegistry::evict_stale`
+  (unit-tested with an injected clock), so the wrapper is just the
+  periodic driver. New deterministic test
+  `eviction_is_observable_via_heartbeat`: register → evict → a
+  subsequent `Heartbeat` reports `known=false`.
+- `brokkr-worker`: the worker now runs a background heartbeat loop,
+  pinging `WorkerService.Heartbeat` on the `heartbeat_seconds` cadence
+  the control plane advertised at registration; on `known=false` it logs
+  and stops (full re-register is `TODO(brokkr-410)`). Closes plan §16
+  task 1 (worker registry + capabilities + heartbeat eviction).
