@@ -714,3 +714,45 @@ Wire `FairQueue` into the scheduler: tenant extraction in `execute`
 (header → `TenantId`), `PendingJob.tenant`, `Inner.pending: FairQueue`,
 `try_dispatch` scans `slots()` for the lowest-start dispatchable job. Then
 a two-tenant fairness integration test (the §16 DoD), and I17 quotas.
+
+## I16 — fair dispatch wired in (§16 task 4, the fair-share DoD)
+
+- **Date:** 2026-06-28
+- **Affected crate:** `brokkr-control`
+- **Outcome:** The §16 "two tenants running concurrently each get fair
+  share" DoD is met. `Inner.pending` is now the per-tenant `FairQueue`;
+  the `Execution` service extracts the tenant from `x-brokkr-tenant`
+  (default `"default"`) and threads `TenantId` into `Scheduler::execute`
+  → `PendingJob`; `try_dispatch` dequeues the lowest-virtual-start-tag job
+  with an idle eligible worker. 70 lib tests incl.
+  `two_tenants_share_a_worker_fairly`; real-gRPC e2e + soak green.
+
+### Decisions
+
+- **Dequeue = min-start-tag *dispatchable* slot.** Kept the existing
+  under-one-lock scan shape (no closures borrowing `Inner`): iterate
+  `pending.slots()`, compute each job's eligible idle worker as before, and
+  track the dispatchable slot with the smallest start tag, then
+  `pending.take(idx)`. So fairness composes cleanly with platform matching
+  + capacity-1 leases.
+- **Requeue re-tags.** Disconnect / expiry requeues `push` the job back
+  into the fair queue (a fresh start tag for its tenant) rather than
+  preserving the original tag. Simple and good enough; the job rejoins its
+  tenant's fair share. Timeout cleanup uses `FairQueue::retain`.
+- **Tenant from metadata, default fallback.** `x-brokkr-tenant` →
+  `TenantId`, `"default"` when absent/malformed (ADR 0010). CAS/ByteStream
+  uploads don't carry a tenant — tenancy is an *execution* concern for now;
+  quota accounting for storage is a later sub-increment.
+- **Deterministic fairness test.** Register the worker but connect it only
+  *after* all six jobs (3 per tenant) are queued, so every job is tagged
+  before any dispatch; then drive the single worker (recv → report) and
+  assert the dispatch order interleaves tenants (first-B before last-A),
+  3 each. Avoids the connect-before-enqueue race.
+
+### Next increment (I17)
+
+Per-tenant **max-concurrent quota** at admission: a per-tenant in-flight
+gauge in `Inner`, checked in `execute`; over-quota →
+`ExecutionError::QuotaExceeded` → gRPC `RESOURCE_EXHAUSTED`. Then §16 task 4
+is complete (fair share + quotas); remaining Phase 4 is auth (task 8) and
+the Bazel-compatibility test, then the exit-criteria wrap-up.
