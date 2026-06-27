@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `brokkr-control` REAPI services (`ContentAddressableStorage`,
+  `ActionCache`, `Execution`, `Capabilities`) now reject any request
+  carrying a non-empty `instance_name` with `INVALID_ARGUMENT` instead
+  of silently serving it from the single default instance. Phase 1 has
+  no multi-tenant isolation, so accepting a caller-named instance was a
+  latent cross-instance access gap (issue #72). The SDK always sends an
+  empty `instance_name`, so this is transparent to existing clients.
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
   `needless_return`; replaced with bare expressions so all four

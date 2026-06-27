@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::{digest_to_proto, proto_to_digest};
+use super::{digest_to_proto, proto_to_digest, validate_instance_name};
 
 /// REAPI `ContentAddressableStorage` service backed by a [`Cas`].
 pub struct CasService<C: Cas> {
@@ -32,6 +32,7 @@ impl<C: Cas> CasSvc for CasService<C> {
     ) -> Result<Response<rapi::FindMissingBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::find_missing_blobs");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let digests: Vec<super::Digest> = req
             .blob_digests
             .iter()
@@ -55,6 +56,7 @@ impl<C: Cas> CasSvc for CasService<C> {
     ) -> Result<Response<rapi::BatchUpdateBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::batch_update_blobs");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let request_count = req.requests.len();
 
         // Verify each entry's declared digest against its bytes *before*
@@ -133,6 +135,7 @@ impl<C: Cas> CasSvc for CasService<C> {
     ) -> Result<Response<rapi::BatchReadBlobsResponse>, Status> {
         let span = tracing::info_span!("cas::batch_read_blobs");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let digest_count = req.digests.len();
         let digests: Vec<super::Digest> = req
             .digests
@@ -200,5 +203,71 @@ impl<C: Cas> CasSvc for CasService<C> {
         Err(Status::unimplemented(
             "SpliceBlob not implemented in Phase 1",
         ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use std::sync::Arc;
+
+    use brokkr_cas::InMemoryCas;
+    use brokkr_proto::reapi_v2 as rapi;
+    use rapi::content_addressable_storage_server::ContentAddressableStorage as _;
+    use tonic::{Code, Request};
+
+    use super::CasService;
+
+    fn service() -> CasService<InMemoryCas> {
+        CasService::new(Arc::new(InMemoryCas::new()))
+    }
+
+    #[tokio::test]
+    async fn find_missing_blobs_rejects_named_instance() {
+        let req = rapi::FindMissingBlobsRequest {
+            instance_name: "tenant-a".to_string(),
+            ..Default::default()
+        };
+        let err = service()
+            .find_missing_blobs(Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn find_missing_blobs_accepts_default_instance() {
+        // Empty instance_name is the single Phase-1 instance — must succeed.
+        let resp = service()
+            .find_missing_blobs(Request::new(rapi::FindMissingBlobsRequest::default()))
+            .await
+            .unwrap();
+        assert!(resp.into_inner().missing_blob_digests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_read_blobs_rejects_named_instance() {
+        let req = rapi::BatchReadBlobsRequest {
+            instance_name: "tenant-a".to_string(),
+            ..Default::default()
+        };
+        let err = service()
+            .batch_read_blobs(Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn batch_update_blobs_rejects_named_instance() {
+        let req = rapi::BatchUpdateBlobsRequest {
+            instance_name: "tenant-a".to_string(),
+            ..Default::default()
+        };
+        let err = service()
+            .batch_update_blobs(Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 }
