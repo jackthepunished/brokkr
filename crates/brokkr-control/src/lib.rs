@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+pub mod lease;
 pub mod matching;
 pub mod membership;
 pub mod registry;
@@ -14,6 +15,7 @@ pub mod scheduling;
 pub mod services;
 pub mod worker_service;
 
+pub use lease::LeaseTable;
 pub use matching::{eligible_workers, labels_satisfy_platform, worker_satisfies};
 pub use membership::{Membership, MembershipServiceImpl};
 pub use registry::{

@@ -700,3 +700,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `BinPacking(2)`). `LocalityAware` is deferred — it needs the
   action's input-root passed into `Strategy::choose` (a trait-signature
   change) plus per-worker locality state, so it gets its own increment.
+- ADR 0009 — job leases, a global pending queue, and crash reassignment
+  (the §16 DoD "worker crash mid-job → job retried on another worker").
+  `docs/architecture/0009-leases-and-fair-scheduling.md`.
+- `brokkr-control::lease::LeaseTable<P>` (plan §16 task 4 foundation):
+  tracks active job leases (`JobId → {worker, deadline, payload}`),
+  generic over the re-dispatch payload and clock-injected. `complete`
+  resolves a lease on report (returns the payload, or `None` for a late
+  report to discard); `take_expired(now)` and `take_worker(id)` remove
+  and return the `(job_id, payload)` pairs to requeue on lease expiry /
+  worker disconnect. Pure bookkeeping; the dispatcher wiring that drives
+  it is the next increment. Seven unit tests.
