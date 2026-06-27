@@ -733,3 +733,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   knob to re-activate packing is a follow-up. Lease-*expiry* reassignment
   (slow worker, vs. disconnect) is also a follow-up; crash recovery via
   disconnect is live.
+- `brokkr-control` lease-expiry reaper: `Scheduler::reap_expired_leases`
+  (and the test seam `reap_expired_at(now)`) requeues jobs whose lease has
+  expired — a worker that is still connected but went silent — and
+  re-dispatches them, bounded by `MAX_ATTEMPTS`. `spawn_lease_reaper`
+  drives it on an interval (wired into the `brokkr-control` binary at half
+  the lease window); a zero interval disables it. Jobs now carry a
+  per-attempt `lease_duration` capped at `min(action timeout,
+  DEFAULT_LEASE_DURATION = 60s)`, so a hung worker is retried before the
+  caller's deadline. The shared requeue logic (disconnect + expiry) is
+  factored into `Inner::requeue_taken`. One scheduler test
+  (`lease_expiry_requeues_and_redispatches_job`). NOTE: an
+  expired-but-connected worker is not yet excluded from the re-dispatch
+  (it may be re-picked); "reassign strictly elsewhere" needs lease renewal
+  / tried-worker tracking — a follow-up.

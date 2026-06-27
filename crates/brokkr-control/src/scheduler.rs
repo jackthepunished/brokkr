@@ -19,6 +19,7 @@ use brokkr_proto::reapi_v2 as rapi;
 use prost::Message;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::Instrument;
 
 use crate::lease::LeaseTable;
 use crate::matching::eligible_workers;
@@ -34,6 +35,12 @@ const MAX_ATTEMPTS: u32 = 5;
 /// and a stalled / crashed worker hung the gRPC caller forever. REAPI's
 /// `Action.timeout`, when set, overrides this on a per-action basis.
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Default lease duration: how long a dispatched job may run before its lease
+/// expires and it is reassigned (ADR 0009). It is capped by the action timeout
+/// and is shorter than the overall execute wait, so a hung-but-connected worker
+/// is retried elsewhere before the caller's deadline.
+pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(60);
 
 /// Errors returned by [`Scheduler::execute`]. Typed (instead of `anyhow`) so
 /// the gRPC service can map `Timeout` to `DEADLINE_EXCEEDED` and everything
@@ -86,6 +93,28 @@ struct Inner {
     leases: LeaseTable<PendingJob>,
 }
 
+impl Inner {
+    /// Requeue jobs taken from the lease table (on worker disconnect or lease
+    /// expiry) for reassignment, bumping each attempt count. Returns
+    /// `(requeued_count, give_up_job_ids)`; the caller fails the give-up jobs'
+    /// waiters outside the lock. Jobs go to the front so a reassignment is
+    /// retried promptly.
+    fn requeue_taken(&mut self, jobs: Vec<(JobId, PendingJob)>) -> (usize, Vec<JobId>) {
+        let mut requeued = 0usize;
+        let mut give_up: Vec<JobId> = Vec::new();
+        for (job_id, mut pj) in jobs {
+            pj.attempts += 1;
+            if pj.attempts >= MAX_ATTEMPTS {
+                give_up.push(job_id);
+            } else {
+                self.pending.push_front(pj);
+                requeued += 1;
+            }
+        }
+        (requeued, give_up)
+    }
+}
+
 /// Multi-worker job scheduler with a global pending queue and job leases
 /// (ADR 0008 + ADR 0009).
 pub struct Scheduler {
@@ -99,6 +128,9 @@ pub struct Scheduler {
     cas: Arc<dyn Cas>,
     action_cache: Arc<dyn ActionCache>,
     default_execution_timeout: Duration,
+    /// Per-attempt lease duration (capped by the action timeout). A lease that
+    /// expires before the worker reports causes the job to be reassigned.
+    lease_duration: Duration,
     /// Optional worker registry for platform-constraint filtering. When set,
     /// candidates are narrowed to healthy workers whose capabilities satisfy
     /// the action's platform; when `None` (e.g. fixtures that don't exercise
@@ -205,6 +237,7 @@ impl Scheduler {
             cas,
             action_cache,
             default_execution_timeout,
+            lease_duration: DEFAULT_LEASE_DURATION,
             worker_registry,
         })
     }
@@ -232,25 +265,9 @@ impl Scheduler {
             let mut inner = self.inner.lock().await;
             inner.connected.disconnect(worker_id);
             let held = inner.leases.take_worker(worker_id);
-            let mut requeued = 0usize;
-            let mut give_up: Vec<JobId> = Vec::new();
-            for (job_id, mut pj) in held {
-                pj.attempts += 1;
-                if pj.attempts >= MAX_ATTEMPTS {
-                    give_up.push(job_id);
-                } else {
-                    inner.pending.push_front(pj);
-                    requeued += 1;
-                }
-            }
-            (requeued, give_up)
+            inner.requeue_taken(held)
         };
-        for job_id in give_up {
-            // Too many reassignments — fail the caller by dropping its waiter
-            // (its `rx` then errors → `execute` returns an error).
-            self.waiters.lock().await.remove(&job_id);
-            tracing::error!(job_id = %job_id, "job exceeded max dispatch attempts; failing");
-        }
+        self.fail_jobs(give_up).await;
         if requeued > 0 {
             tracing::info!(
                 worker_id = %worker_id,
@@ -259,6 +276,39 @@ impl Scheduler {
             );
         }
         self.try_dispatch().await;
+    }
+
+    /// Reassign jobs whose lease has expired as of `now` (a worker that is
+    /// still connected but went silent), then attempt a dispatch. Split from
+    /// [`reap_expired_leases`] so tests can drive expiry with an explicit
+    /// instant.
+    async fn reap_expired_at(self: &Arc<Self>, now: Instant) {
+        let (requeued, give_up) = {
+            let mut inner = self.inner.lock().await;
+            let expired = inner.leases.take_expired(now);
+            inner.requeue_taken(expired)
+        };
+        self.fail_jobs(give_up).await;
+        if requeued > 0 {
+            tracing::warn!(requeued, "reassigned job(s) whose lease expired");
+            self.try_dispatch().await;
+        }
+    }
+
+    /// Reassign jobs whose lease has expired as of now. Called on an interval
+    /// by [`spawn_lease_reaper`].
+    pub async fn reap_expired_leases(self: &Arc<Self>) {
+        self.reap_expired_at(Instant::now()).await;
+    }
+
+    /// Fail each job in `job_ids` by dropping its result waiter (its `rx` then
+    /// errors → `execute` returns an error). Used when a job exceeds
+    /// [`MAX_ATTEMPTS`] reassignments.
+    async fn fail_jobs(&self, job_ids: Vec<JobId>) {
+        for job_id in job_ids {
+            self.waiters.lock().await.remove(&job_id);
+            tracing::error!(job_id = %job_id, "job exceeded max dispatch attempts; failing");
+        }
     }
 
     /// Place as many queued jobs as possible onto idle, eligible, connected
@@ -464,7 +514,9 @@ impl Scheduler {
                 job_id: job_id.clone(),
                 job,
                 platform,
-                lease_duration: effective_timeout,
+                // A single attempt may run up to the action timeout, but no
+                // longer than the lease window so a hung worker is retried.
+                lease_duration: effective_timeout.min(self.lease_duration),
                 attempts: 0,
             });
         }
@@ -547,6 +599,12 @@ impl Scheduler {
         Ok(())
     }
 
+    /// The lease window the scheduler applies to dispatched jobs. Used by
+    /// [`spawn_lease_reaper`] to pick a sensible reap interval.
+    pub fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
     async fn fetch_message<M: Message + Default>(&self, digest: &Digest) -> Result<M> {
         let mut reads = self
             .cas
@@ -558,6 +616,33 @@ impl Scheduler {
             .map_err(|e| anyhow!("blob {} not in CAS: {e}", digest))?;
         M::decode(bytes.as_ref()).with_context(|| format!("decoding {} from CAS", digest))
     }
+}
+
+/// Spawn a background task that reaps expired job leases every `interval`,
+/// reassigning their jobs to other workers (ADR 0009). Mirrors
+/// [`crate::worker_service::spawn_eviction_task`]; wire it into the
+/// control-plane binary and hold the handle for the server's lifetime.
+pub fn spawn_lease_reaper(
+    scheduler: Arc<Scheduler>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(
+        async move {
+            // `tokio::time::interval` panics on a zero period; a zero interval
+            // disables the reaper instead of crashing the server.
+            if interval == Duration::ZERO {
+                tracing::warn!("lease reaper disabled (interval is zero)");
+                return;
+            }
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // drop the immediate first tick
+            loop {
+                ticker.tick().await;
+                scheduler.reap_expired_leases().await;
+            }
+        }
+        .in_current_span(),
+    )
 }
 
 #[cfg(test)]
@@ -1059,5 +1144,86 @@ mod tests {
         let outcome = exec.await.unwrap().unwrap();
         assert_eq!(outcome.result.exit_code, 0);
         assert!(!outcome.cache_hit);
+    }
+
+    /// Drain one job from whichever of two receivers has it within `budget`.
+    async fn recv_either(
+        rx_a: &mut tokio::sync::mpsc::Receiver<bv1::Job>,
+        rx_b: &mut tokio::sync::mpsc::Receiver<bv1::Job>,
+        budget: Duration,
+    ) -> Option<bv1::Job> {
+        for _ in 0..((budget.as_millis() / 10).max(1)) {
+            if let Ok(job) = rx_a.try_recv() {
+                return Some(job);
+            }
+            if let Ok(job) = rx_b.try_recv() {
+                return Some(job);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// An expired lease (a connected-but-silent worker) causes the job to be
+    /// requeued and re-dispatched. `reap_expired_at` is driven with a
+    /// far-future instant so the lease is unambiguously expired without
+    /// sleeping. NOTE: the re-dispatch may land on the *same* worker again — an
+    /// expired-but-connected worker is not excluded (proper "reassign
+    /// elsewhere" needs lease renewal / tried-worker tracking, a follow-up), so
+    /// this asserts the requeue + re-dispatch mechanism, not the target worker.
+    #[tokio::test]
+    async fn lease_expiry_requeues_and_redispatches_job() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx_a = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+        let mut rx_b = register_and_connect(&scheduler, &registry, "w-b", &[("os", "linux")]).await;
+
+        let exec = {
+            let s = scheduler.clone();
+            tokio::spawn(async move { s.execute(action_digest, true).await })
+        };
+
+        // First dispatch — learn the job id.
+        let first = recv_either(&mut rx_a, &mut rx_b, Duration::from_millis(500))
+            .await
+            .unwrap();
+        let job_id = first.job_id.clone();
+
+        // Force the lease past its deadline; the reaper requeues and
+        // re-dispatches the job.
+        scheduler
+            .reap_expired_at(Instant::now() + Duration::from_secs(3600))
+            .await;
+        let again = recv_either(&mut rx_a, &mut rx_b, Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert_eq!(again.job_id, job_id, "expired lease's job is re-dispatched");
+
+        // Report success for the re-dispatched job → execute completes.
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                cache_hit: false,
+                error_message: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = exec.await.unwrap().unwrap();
+        assert_eq!(outcome.result.exit_code, 0);
     }
 }
