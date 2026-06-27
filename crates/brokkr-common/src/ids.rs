@@ -172,6 +172,84 @@ impl TryFrom<&str> for JobId {
     }
 }
 
+/// The tenant id used when a request carries no explicit tenant.
+pub const DEFAULT_TENANT: &str = "default";
+
+/// A tenant (authenticated entity) identifier. Carried through the control
+/// plane for quota accounting and fair scheduling; the source is a request
+/// metadata header until auth makes it authoritative (plan §16 task 8).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(try_from = "String")]
+pub struct TenantId(String);
+
+impl TenantId {
+    /// Construct a [`TenantId`], validating it is non-empty and within
+    /// [`ID_MAX_LEN`].
+    pub fn new(inner: String) -> Result<Self, IdError> {
+        if inner.is_empty() {
+            return Err(IdError::Empty);
+        }
+        if inner.len() > ID_MAX_LEN {
+            return Err(IdError::TooLong {
+                max: ID_MAX_LEN,
+                len: inner.len(),
+            });
+        }
+        Ok(Self(inner))
+    }
+
+    /// Returns the raw string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes self and returns the inner [`String`].
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl Default for TenantId {
+    fn default() -> Self {
+        Self(DEFAULT_TENANT.to_string())
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<str> for TenantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for TenantId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s.to_string())
+    }
+}
+
+impl TryFrom<String> for TenantId {
+    type Error = IdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for TenantId {
+    type Error = IdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value.to_string())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_methods)]
 mod tests {
@@ -253,5 +331,21 @@ mod tests {
         map.insert(id.clone(), "value");
         // Should work with &str lookup via Borrow<str>
         assert_eq!(map.remove("job-key"), Some("value"));
+    }
+
+    // TenantId tests
+    #[test]
+    fn tenant_id_default_is_default_tenant() {
+        assert_eq!(TenantId::default().as_str(), DEFAULT_TENANT);
+        assert_eq!(DEFAULT_TENANT, "default");
+    }
+
+    #[test]
+    fn tenant_id_new_validates_and_roundtrips() {
+        assert_eq!(TenantId::new(String::new()).unwrap_err(), IdError::Empty);
+        let id = TenantId::new("team-acme".to_string()).unwrap();
+        assert_eq!(id.as_str(), "team-acme");
+        let parsed: TenantId = id.to_string().parse().unwrap();
+        assert_eq!(id, parsed);
     }
 }
