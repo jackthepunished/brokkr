@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `brokkr-sandbox` host runner no longer swallows a panicked or
+  cancelled stdout/stderr capture task. `JoinError` was discarded by
+  `unwrap_or_default()`, so a crashed pump returned empty output with
+  no signal to the operator (issue #68). The join is now handled
+  explicitly: on error it logs a `warn` naming the affected stream and
+  falls back to an empty buffer.
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
   `needless_return`; replaced with bare expressions so all four

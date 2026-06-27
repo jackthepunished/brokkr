@@ -215,8 +215,8 @@ pub(super) async fn run_action(
         },
     };
 
-    let stdout_buf = stdout_task.await.unwrap_or_default();
-    let stderr_buf = stderr_task.await.unwrap_or_default();
+    let stdout_buf = join_capture(stdout_task.await, "stdout");
+    let stderr_buf = join_capture(stderr_task.await, "stderr");
 
     // If the host's write hit EPIPE *and* the runner exited non-zero with
     // a diagnostic on stderr, prefer the runner's message — same M2 logic.
@@ -264,4 +264,49 @@ async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = r.read_to_end(&mut buf).await;
     buf
+}
+
+/// Resolve a joined stdout/stderr pump task into its captured bytes.
+///
+/// A `JoinError` means the pump task panicked or was cancelled (e.g. the
+/// runtime shutting down mid-action). We can't recover the bytes it was
+/// holding, so we fall back to an empty buffer — but we log a warning so the
+/// truncation is visible to an operator instead of vanishing silently, which
+/// `unwrap_or_default()` would have done (issue #68).
+fn join_capture(joined: Result<Vec<u8>, tokio::task::JoinError>, stream: &str) -> Vec<u8> {
+    match joined {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::warn!(
+                stream,
+                error = %e,
+                "output capture task failed to join; {stream} will be reported as empty"
+            );
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use super::join_capture;
+
+    #[tokio::test]
+    async fn join_capture_passes_through_successful_output() {
+        let task = tokio::spawn(async { vec![1u8, 2, 3] });
+        assert_eq!(join_capture(task.await, "stdout"), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn join_capture_returns_empty_when_task_panics() {
+        // A panicking pump task yields a JoinError; the buffer must come back
+        // empty rather than propagating the panic or hanging.
+        let task = tokio::spawn(async {
+            panic!("simulated pump panic");
+            #[allow(unreachable_code)]
+            Vec::<u8>::new()
+        });
+        assert!(join_capture(task.await, "stderr").is_empty());
+    }
 }
