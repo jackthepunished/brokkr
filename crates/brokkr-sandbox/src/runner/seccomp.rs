@@ -158,8 +158,21 @@ const DEFAULT_ALLOW: &[&str] = &[
     "ppoll",
     "select",
     "pselect6",
+    // Sockets are allowed, but the action cannot use them to reach anything
+    // outside the sandbox or smuggle fds across its boundary (issue #69):
+    //   * It runs in a fresh network namespace (NetworkPolicy::None leaves no
+    //     routable interface), which also scopes *abstract* AF_UNIX sockets to
+    //     the sandbox — they cannot name a host socket.
+    //   * The mount namespace exposes no host *pathname* AF_UNIX sockets (the
+    //     default rootfs is ro /usr + tmpfs), so connect() has no external
+    //     endpoint to reach.
+    //   * socketpair() has no external endpoint at all — both ends belong to
+    //     the action — so an SCM_RIGHTS cmsg over it only passes fds between
+    //     the action's own processes, which fork already permits. Cross-
+    //     boundary fd smuggling needs an external socket endpoint, and the
+    //     namespaces above guarantee there is none.
     "socket",
-    "socketpair", // intentionally allowed; netns blocks egress
+    "socketpair",
     "connect",
     "bind",
     "listen",

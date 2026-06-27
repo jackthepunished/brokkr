@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Reviewed the seccomp `socket` / `socketpair` allowance (issue #69) and
+  replaced the terse "netns blocks egress" comment with the full
+  rationale: the action's network namespace scopes abstract `AF_UNIX`
+  sockets (and blocks IP), the mount namespace hides host pathname
+  sockets, and `socketpair` is intra-process — so `SCM_RIGHTS` cannot
+  smuggle fds across the sandbox boundary. No behavioural change;
+  `socketpair` stays allowed because removing it would break legitimate
+  in-sandbox IPC for no security gain.
+
 ### Fixed
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
