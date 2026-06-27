@@ -18,7 +18,7 @@ pub mod execution;
 // Re-export so `crate::services::*` continues to work.
 pub use action_cache::ActionCacheService;
 pub use capabilities::CapabilitiesService;
-pub use cas::CasService;
+pub use cas::{BatchLimits, CasService};
 pub use execution::ExecutionService;
 
 // Shared helpers used across service implementations.

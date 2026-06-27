@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `brokkr-control` CAS service now bounds batch request sizes at the
+  service boundary. `FindMissingBlobs`, `BatchReadBlobs`, and
+  `BatchUpdateBlobs` previously iterated over an unbounded request, so a
+  client could exhaust control-plane memory with one giant batch (issue
+  #66). A new `BatchLimits` config (default 1000 blobs/request, 4 MiB
+  payload — matching the advertised `max_batch_total_size_bytes`) is
+  enforced before allocation; oversized requests are rejected with
+  `INVALID_ARGUMENT`. Construct with `CasService::with_limits` to
+  override.
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
   `needless_return`; replaced with bare expressions so all four
