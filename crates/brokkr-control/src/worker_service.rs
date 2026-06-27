@@ -163,7 +163,12 @@ impl WorkerService for WorkerServiceImpl {
                 .is_ok()
         };
         tracing::Span::current().record("known", known);
-        if !known {
+        if known {
+            // The worker is alive — renew the lease on whatever job it's
+            // running so a long action isn't reassigned out from under it. A
+            // lease only expires once a worker stops heartbeating (ADR 0009).
+            self.scheduler.renew_worker_leases(&worker_id).await;
+        } else {
             tracing::warn!("heartbeat from unknown worker; signalling re-register");
         }
         Ok(Response::new(HeartbeatResponse { known }))

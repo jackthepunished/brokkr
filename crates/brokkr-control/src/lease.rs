@@ -119,6 +119,20 @@ impl<P> LeaseTable<P> {
         Self::drain(&mut self.leases, held)
     }
 
+    /// Extend the deadline of every lease held by `worker_id` to `new_deadline`
+    /// (e.g. on a heartbeat — the worker is alive, so keep its job leased).
+    /// Returns the number of leases renewed.
+    pub fn renew_worker(&mut self, worker_id: &WorkerId, new_deadline: Instant) -> usize {
+        let mut renewed = 0;
+        for lease in self.leases.values_mut() {
+            if &lease.worker_id == worker_id {
+                lease.deadline = new_deadline;
+                renewed += 1;
+            }
+        }
+        renewed
+    }
+
     fn drain(leases: &mut HashMap<JobId, Lease<P>>, mut ids: Vec<JobId>) -> Vec<(JobId, P)> {
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         ids.into_iter()
@@ -240,6 +254,34 @@ mod tests {
     fn take_worker_unknown_is_empty() {
         let mut t: LeaseTable<&str> = LeaseTable::new();
         assert!(t.take_worker(&wid("nobody")).is_empty());
+    }
+
+    #[test]
+    fn renew_worker_extends_deadline_and_defers_expiry() {
+        let t0 = Instant::now();
+        let mut t = LeaseTable::new();
+        t.insert(jid("j1"), wid("w1"), t0 + Duration::from_secs(10), "a");
+        t.insert(jid("j2"), wid("w1"), t0 + Duration::from_secs(10), "b");
+        t.insert(jid("j3"), wid("w2"), t0 + Duration::from_secs(10), "c");
+
+        // Heartbeat from w1 pushes its two leases out to t0+100s.
+        let renewed = t.renew_worker(&wid("w1"), t0 + Duration::from_secs(100));
+        assert_eq!(renewed, 2);
+
+        // At t0+50s only w2's (un-renewed) lease has expired.
+        let expired = t.take_expired(t0 + Duration::from_secs(50));
+        let ids: Vec<&str> = expired.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["j3"]);
+        assert_eq!(t.len(), 2); // w1's renewed leases survive
+
+        // Past the renewed deadline they expire too.
+        assert_eq!(t.take_expired(t0 + Duration::from_secs(101)).len(), 2);
+    }
+
+    #[test]
+    fn renew_worker_unknown_renews_nothing() {
+        let mut t: LeaseTable<&str> = LeaseTable::new();
+        assert_eq!(t.renew_worker(&wid("nobody"), Instant::now()), 0);
     }
 
     #[test]
