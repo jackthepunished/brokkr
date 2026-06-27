@@ -7,7 +7,7 @@
 //! [`crate::scheduling::Strategy`] picks one. Global queueing, leases, and fair
 //! scheduling are Phase 4 task 4.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,11 +18,16 @@ use brokkr_proto::brokkr_v1 as bv1;
 use brokkr_proto::reapi_v2 as rapi;
 use prost::Message;
 use thiserror::Error;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::lease::LeaseTable;
 use crate::matching::eligible_workers;
-use crate::scheduling::{ConnectedWorkers, SharedConnectedWorkers, SimpleFifo, Strategy};
+use crate::scheduling::{ConnectedWorkers, SimpleFifo, Strategy};
 use crate::worker_service::SharedWorkerRegistry;
+
+/// Maximum dispatch attempts for a job before it is failed, to bound requeue
+/// loops when workers repeatedly die mid-job (ADR 0009).
+const MAX_ATTEMPTS: u32 = 5;
 
 /// Default ceiling on how long [`Scheduler::execute`] waits for a worker to
 /// report a result. Issue #63 — without this the oneshot wait was unbounded
@@ -61,14 +66,35 @@ pub struct ExecutionOutcome {
     pub cache_hit: bool,
 }
 
-/// Multi-worker job scheduler.
+/// A job waiting in (or re-dispatchable from) the scheduler's pending queue.
+/// Carries everything needed to (re-)dispatch it and to size its lease.
+#[derive(Clone, Debug)]
+struct PendingJob {
+    job_id: JobId,
+    job: bv1::Job,
+    platform: rapi::Platform,
+    lease_duration: Duration,
+    attempts: u32,
+}
+
+/// Dispatch state held under a single mutex, so every routing decision (which
+/// workers are connected, what is queued, what is leased) is made atomically —
+/// there is no inter-lock ordering to get wrong (ADR 0009).
+struct Inner {
+    connected: ConnectedWorkers,
+    pending: VecDeque<PendingJob>,
+    leases: LeaseTable<PendingJob>,
+}
+
+/// Multi-worker job scheduler with a global pending queue and job leases
+/// (ADR 0008 + ADR 0009).
 pub struct Scheduler {
-    /// Workers with a live `Stream`, each with its own job channel + load.
-    /// `WorkerService.Stream` writes connect/disconnect; `execute` routes
-    /// through it.
-    connected: SharedConnectedWorkers,
+    /// Connected workers + pending queue + active leases, under one lock.
+    inner: Mutex<Inner>,
     /// Worker-selection policy (ADR 0008). Defaults to `SimpleFifo`.
     strategy: Arc<dyn Strategy>,
+    /// Result waiters, keyed by job id. Survives requeue/reassignment so the
+    /// original `execute` caller transparently receives the retried result.
     waiters: Mutex<HashMap<JobId, oneshot::Sender<bv1::JobResult>>>,
     cas: Arc<dyn Cas>,
     action_cache: Arc<dyn ActionCache>,
@@ -169,7 +195,11 @@ impl Scheduler {
         strategy: Arc<dyn Strategy>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            connected: Arc::new(Mutex::new(ConnectedWorkers::new())),
+            inner: Mutex::new(Inner {
+                connected: ConnectedWorkers::new(),
+                pending: VecDeque::new(),
+                leases: LeaseTable::new(),
+            }),
             strategy,
             waiters: Mutex::new(HashMap::new()),
             cas,
@@ -179,11 +209,134 @@ impl Scheduler {
         })
     }
 
-    /// The shared connected-worker registry. `WorkerService.Stream` registers
-    /// each worker's job channel here on connect and removes it on disconnect;
-    /// `execute` routes jobs through it.
-    pub fn connected_workers(&self) -> SharedConnectedWorkers {
-        self.connected.clone()
+    /// Register a connected worker's job channel (called by
+    /// `WorkerService.Stream` once the worker's `Hello` arrives), then attempt
+    /// a dispatch in case queued work can now be placed.
+    pub async fn connect_worker(
+        self: &Arc<Self>,
+        worker_id: WorkerId,
+        job_tx: mpsc::Sender<bv1::Job>,
+    ) {
+        {
+            let mut inner = self.inner.lock().await;
+            inner.connected.connect(worker_id, job_tx);
+        }
+        self.try_dispatch().await;
+    }
+
+    /// Deregister a worker whose stream closed. Any job it currently holds is
+    /// requeued for reassignment to another worker (the §16 crash-recovery
+    /// path), bounded by [`MAX_ATTEMPTS`]; then a dispatch is attempted.
+    pub async fn disconnect_worker(self: &Arc<Self>, worker_id: &WorkerId) {
+        let (requeued, give_up) = {
+            let mut inner = self.inner.lock().await;
+            inner.connected.disconnect(worker_id);
+            let held = inner.leases.take_worker(worker_id);
+            let mut requeued = 0usize;
+            let mut give_up: Vec<JobId> = Vec::new();
+            for (job_id, mut pj) in held {
+                pj.attempts += 1;
+                if pj.attempts >= MAX_ATTEMPTS {
+                    give_up.push(job_id);
+                } else {
+                    inner.pending.push_front(pj);
+                    requeued += 1;
+                }
+            }
+            (requeued, give_up)
+        };
+        for job_id in give_up {
+            // Too many reassignments — fail the caller by dropping its waiter
+            // (its `rx` then errors → `execute` returns an error).
+            self.waiters.lock().await.remove(&job_id);
+            tracing::error!(job_id = %job_id, "job exceeded max dispatch attempts; failing");
+        }
+        if requeued > 0 {
+            tracing::info!(
+                worker_id = %worker_id,
+                requeued,
+                "worker disconnected; requeued its in-flight job(s) for reassignment"
+            );
+        }
+        self.try_dispatch().await;
+    }
+
+    /// Place as many queued jobs as possible onto idle, eligible, connected
+    /// workers, leasing each. The decision is made under the inner lock; the
+    /// channel send happens outside it.
+    async fn try_dispatch(self: &Arc<Self>) {
+        loop {
+            let now = Instant::now();
+            let placed = {
+                // Lock order is registry → inner (registry is only ever locked
+                // alone elsewhere, so this can't deadlock).
+                let reg_guard = match &self.worker_registry {
+                    Some(r) => Some(r.lock().await),
+                    None => None,
+                };
+                let mut inner = self.inner.lock().await;
+
+                // First queued job that has an idle, eligible, connected worker.
+                let mut found: Option<(usize, WorkerId)> = None;
+                for (idx, pj) in inner.pending.iter().enumerate() {
+                    let candidates: Vec<WorkerId> = match &reg_guard {
+                        Some(reg) => eligible_workers(reg, now, &pj.platform)
+                            .map(|(id, _)| id.clone())
+                            .filter(|id| {
+                                inner.connected.is_connected(id) && !inner.leases.is_worker_busy(id)
+                            })
+                            .collect(),
+                        None => inner
+                            .connected
+                            .connected_ids()
+                            .filter(|id| !inner.leases.is_worker_busy(id))
+                            .cloned()
+                            .collect(),
+                    };
+                    if let Some(w) = self.strategy.choose(&candidates, &inner.connected) {
+                        found = Some((idx, w));
+                        break;
+                    }
+                }
+                let Some((idx, worker_id)) = found else {
+                    return;
+                };
+                let Some(sender) = inner.connected.sender(&worker_id) else {
+                    return;
+                };
+                let Some(pj) = inner.pending.remove(idx) else {
+                    return;
+                };
+                let deadline = now + pj.lease_duration;
+                inner
+                    .leases
+                    .insert(pj.job_id.clone(), worker_id.clone(), deadline, pj.clone());
+                (worker_id, sender, pj)
+            };
+
+            let (worker_id, sender, pj) = placed;
+            tracing::debug!(job_id = %pj.job_id, worker_id = %worker_id, "dispatched job to worker");
+            if sender.send(pj.job.clone()).await.is_err() {
+                // The worker's channel closed between selection and send. Drop
+                // the lease + the dead worker, then requeue (bounded) so another
+                // worker can pick the job up.
+                let mut pj = pj;
+                pj.attempts += 1;
+                let give_up = pj.attempts >= MAX_ATTEMPTS;
+                {
+                    let mut inner = self.inner.lock().await;
+                    inner.leases.complete(&pj.job_id);
+                    inner.connected.disconnect(&worker_id);
+                    if !give_up {
+                        inner.pending.push_front(pj.clone());
+                    }
+                }
+                if give_up {
+                    self.waiters.lock().await.remove(&pj.job_id);
+                    tracing::error!(job_id = %pj.job_id, "job exceeded max dispatch attempts; failing");
+                }
+            }
+        }
     }
 
     /// Execute an action: look up the action cache, otherwise enqueue a job
@@ -250,22 +403,30 @@ impl Scheduler {
             .or_else(|| command.platform.clone())
             .unwrap_or_default();
 
-        // Snapshot the registry-eligible worker ids (if a registry is wired
-        // in), releasing the registry lock before we touch the connected set —
-        // so the two locks are never held at once.
-        let eligible_ids: Option<Vec<WorkerId>> = match self.worker_registry.as_ref() {
-            Some(registry) => {
+        // Fail fast when a registry is wired in and *no healthy worker* matches
+        // the platform — an action nothing can run should not queue forever.
+        // (A matching-but-busy worker still leads to queueing below.)
+        if let Some(registry) = self.worker_registry.as_ref() {
+            let has_match = {
                 let reg = registry.lock().await;
-                let ids = eligible_workers(&reg, Instant::now(), &platform)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                Some(ids)
+                // Bind so the borrowing iterator temporary drops before `reg`.
+                let any = eligible_workers(&reg, Instant::now(), &platform)
+                    .next()
+                    .is_some();
+                any
+            };
+            if !has_match {
+                tracing::warn!(
+                    action_digest = %action_digest,
+                    "no eligible worker for action platform; rejecting"
+                );
+                return Err(ExecutionError::NoEligibleWorker);
             }
-            None => None,
-        };
+        }
 
         // REAPI `Action.timeout` overrides the scheduler default; treat
-        // missing / zero / negative as "use the default".
+        // missing / zero / negative as "use the default". This bounds both the
+        // caller's wait and each dispatch attempt's lease.
         let effective_timeout = action
             .timeout
             .as_ref()
@@ -279,40 +440,12 @@ impl Scheduler {
             })
             .unwrap_or(self.default_execution_timeout);
 
-        // Pick a worker and claim a job sender + an in-flight slot under one
-        // lock on the connected set. Candidates = connected workers, narrowed
-        // to the registry-eligible ones when a registry is present.
-        let (worker_id, sender) = {
-            let mut connected = self.connected.lock().await;
-            let candidates: Vec<WorkerId> = match &eligible_ids {
-                Some(ids) => ids
-                    .iter()
-                    .filter(|id| connected.is_connected(id))
-                    .cloned()
-                    .collect(),
-                None => connected.connected_ids().cloned().collect(),
-            };
-            let Some(chosen) = self.strategy.choose(&candidates, &*connected) else {
-                tracing::warn!(
-                    action_digest = %action_digest,
-                    "no eligible connected worker for action platform; rejecting"
-                );
-                return Err(ExecutionError::NoEligibleWorker);
-            };
-            let Some(sender) = connected.sender(&chosen) else {
-                // Disconnected between selection and sender clone (racy); fail
-                // closed rather than route into the void.
-                return Err(ExecutionError::NoEligibleWorker);
-            };
-            connected.inc_inflight(&chosen);
-            (chosen, sender)
-        };
-
         let job_id = JobId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|e| anyhow!("invalid job id: {e}"))?;
-        tracing::Span::current()
-            .record("job_id", job_id.as_str())
-            .record("worker_id", worker_id.as_str());
+        tracing::Span::current().record("job_id", job_id.as_str());
+
+        // Register the result waiter before queueing so a fast
+        // dispatch→report can't race ahead of it.
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.insert(job_id.clone(), tx);
 
@@ -325,32 +458,38 @@ impl Scheduler {
             action: Some(action),
             command: Some(command),
         };
-        if sender.send(job).await.is_err() {
-            // The worker's channel closed (it disconnected after selection).
-            // Drop the waiter and release the in-flight slot.
-            self.waiters.lock().await.remove(&job_id);
-            self.connected.lock().await.dec_inflight(&worker_id);
-            return Err(anyhow!("worker channel closed before dispatch").into());
+        {
+            let mut inner = self.inner.lock().await;
+            inner.pending.push_back(PendingJob {
+                job_id: job_id.clone(),
+                job,
+                platform,
+                lease_duration: effective_timeout,
+                attempts: 0,
+            });
         }
+        self.try_dispatch().await;
 
-        // Await the result, then release the in-flight slot on every exit path.
-        // The inner `async` block lets `?` / early `return` short-circuit to
-        // `outcome` so the decrement below always runs exactly once.
+        // Await the final result under the overall timeout. Retries
+        // (reassignment after a worker dies) keep the same waiter, so this wait
+        // spans all attempts. On timeout, drop the job from the queue / lease
+        // table and reclaim the waiter.
         let outcome: Result<ExecutionOutcome, ExecutionError> = async {
             let report = match tokio::time::timeout(effective_timeout, rx).await {
                 Ok(Ok(report)) => report,
                 Ok(Err(_)) => {
-                    // Waiter dropped without a value (already removed by `report`).
-                    return Err(anyhow!("worker did not report result").into());
+                    // Waiter dropped without a value (e.g. exceeded max attempts).
+                    return Err(anyhow!("job failed before producing a result").into());
                 }
                 Err(_) => {
-                    // Reclaim the waiter slot so the map doesn't accumulate
-                    // stalled entries; a late report is then discarded on miss.
                     self.waiters.lock().await.remove(&job_id);
+                    let mut inner = self.inner.lock().await;
+                    inner.pending.retain(|p| p.job_id != job_id);
+                    inner.leases.complete(&job_id);
                     tracing::warn!(
                         job_id = job_id.as_str(),
                         timeout_secs = effective_timeout.as_secs_f64(),
-                        "scheduler: worker did not report within timeout"
+                        "scheduler: job did not complete within timeout"
                     );
                     return Err(ExecutionError::Timeout(effective_timeout));
                 }
@@ -376,20 +515,35 @@ impl Scheduler {
             })
         }
         .await;
-        self.connected.lock().await.dec_inflight(&worker_id);
         outcome
     }
 
-    /// Worker-side entry: receive a job result and wake the matching waiter.
+    /// Worker-side entry: a worker reported a job result. Completes the lease
+    /// (freeing the worker), wakes the result waiter, and triggers a dispatch
+    /// so the now-idle worker can pick up queued work. A result for a job with
+    /// no active lease (a late/duplicate report after reassignment or expiry) is
+    /// discarded — the at-least-once seam from ADR 0009.
     #[tracing::instrument(name = "scheduler::report", skip(self, result))]
-    pub async fn report(&self, result: bv1::JobResult) -> Result<()> {
+    pub async fn report(self: &Arc<Self>, result: bv1::JobResult) -> Result<()> {
         let job_id = JobId::new(result.job_id.clone())
             .map_err(|e| anyhow!("invalid job_id in result: {}", e))?;
-        let waiter = self.waiters.lock().await.remove(&job_id);
-        if let Some(tx) = waiter {
-            // If the receiver dropped (e.g. client cancelled), discard the result.
+        let known = {
+            let mut inner = self.inner.lock().await;
+            inner.leases.complete(&job_id).is_some()
+        };
+        if !known {
+            tracing::debug!(
+                job_id = job_id.as_str(),
+                "discarding late/duplicate worker result (no active lease)"
+            );
+            return Ok(());
+        }
+        if let Some(tx) = self.waiters.lock().await.remove(&job_id) {
+            // If the receiver dropped (client cancelled), discard the result.
             let _ = tx.send(result);
         }
+        // The reporting worker is now idle — try to place more queued work.
+        self.try_dispatch().await;
         Ok(())
     }
 
@@ -572,10 +726,8 @@ mod tests {
         // `execute` awaits a result that never arrives → Timeout.
         let (tx, _held_rx) = tokio::sync::mpsc::channel::<bv1::Job>(8);
         scheduler
-            .connected_workers()
-            .lock()
-            .await
-            .connect(WorkerId::new("w1".to_string()).unwrap(), tx);
+            .connect_worker(WorkerId::new("w1".to_string()).unwrap(), tx)
+            .await;
 
         let start = Instant::now();
         let err = scheduler.execute(action_digest, true).await.unwrap_err();
@@ -682,7 +834,7 @@ mod tests {
             .await
             .register(wid.clone(), caps, Instant::now());
         let (tx, rx) = tokio::sync::mpsc::channel::<bv1::Job>(8);
-        scheduler.connected_workers().lock().await.connect(wid, tx);
+        scheduler.connect_worker(wid, tx).await;
         rx
     }
 
@@ -769,8 +921,9 @@ mod tests {
         let mut rx_b = register_and_connect(&scheduler, &registry, "w-b", &[("os", "linux")]).await;
 
         // Two concurrent executes; neither worker reports, so both time out.
-        // pick+inc-in-flight is one critical section under the connected lock,
-        // so the second execute sees the first worker busy and picks the other.
+        // Capacity-1 leases mean once the first job leases a worker that worker
+        // is busy (excluded from candidates), so the second job lands on the
+        // other worker.
         let (s1, s2) = (scheduler.clone(), scheduler.clone());
         let (d1, d2) = (action_digest.clone(), action_digest);
         let h1 = tokio::spawn(async move { s1.execute(d1, true).await });
@@ -788,10 +941,14 @@ mod tests {
         );
     }
 
-    /// The scheduler honours its injected strategy: `BinPacking` (cap 2) packs
-    /// both concurrent jobs onto the lower-id worker instead of spreading.
+    /// The scheduler honours its injected strategy (`with_strategy` wiring).
+    /// NOTE: under ADR 0009 capacity-1 leases a worker can hold only one job at
+    /// a time, so `BinPacking` cannot pack a second job onto a busy worker — it
+    /// spreads exactly like `SimpleFifo` here. Packing only differs once a
+    /// worker may hold >1 lease (a future per-worker-capacity knob). This test
+    /// pins the current (spread) behaviour so that change is a deliberate one.
     #[tokio::test]
-    async fn execute_uses_injected_binpacking_strategy() {
+    async fn binpacking_with_capacity_one_spreads_like_simplefifo() {
         use crate::registry::WorkerRegistry;
         use crate::scheduling::BinPacking;
 
@@ -801,38 +958,106 @@ mod tests {
         let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
         let scheduler =
             Scheduler::with_strategy(cas, ac, registry.clone(), Arc::new(BinPacking::new(2)));
-        // Short timeout via the action would be cleaner, but with_strategy uses
-        // the default; the jobs just need to be dispatched, which happens
-        // before any wait — so we read the channels right after dispatch.
         let mut rx_a = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
         let mut rx_b = register_and_connect(&scheduler, &registry, "w-b", &[("os", "linux")]).await;
 
-        // Two concurrent executes. BinPacking(cap 2) packs w-a (lower id) to
-        // the cap before touching w-b, so both jobs land on w-a.
         let (s1, s2) = (scheduler.clone(), scheduler.clone());
         let (d1, d2) = (action_digest.clone(), action_digest);
         let h1 = tokio::spawn(async move { s1.execute(d1, true).await });
         let h2 = tokio::spawn(async move { s2.execute(d2, true).await });
 
-        // Both jobs are dispatched to w-a's channel; assert before the (long)
-        // default timeout elapses by polling the receivers with a short budget.
-        let mut a_count = 0;
-        for _ in 0..50 {
-            while rx_a.try_recv().is_ok() {
-                a_count += 1;
-            }
-            if a_count == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(a_count, 2, "BinPacking should pack both jobs onto w-a");
-        assert!(
-            rx_b.try_recv().is_err(),
-            "w-b should have received no jobs under BinPacking"
-        );
+        // Each worker receives exactly one job (capacity-1 forces the spread).
+        let got_a = recv_within(&mut rx_a, Duration::from_millis(500)).await;
+        let got_b = recv_within(&mut rx_b, Duration::from_millis(500)).await;
+        assert!(got_a.is_some(), "w-a should have received a job");
+        assert!(got_b.is_some(), "w-b should have received a job");
 
         h1.abort();
         h2.abort();
+    }
+
+    /// Receive one job from `rx` within `budget`, polling cooperatively. Returns
+    /// `None` if nothing arrives in time.
+    async fn recv_within(
+        rx: &mut tokio::sync::mpsc::Receiver<bv1::Job>,
+        budget: Duration,
+    ) -> Option<bv1::Job> {
+        for _ in 0..((budget.as_millis() / 10).max(1)) {
+            if let Ok(job) = rx.try_recv() {
+                return Some(job);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rx.try_recv().ok()
+    }
+
+    /// §16 DoD: a worker that dies mid-job → the job is reassigned to another
+    /// worker and completes. Submit a job onto worker A, disconnect A
+    /// (simulated crash), confirm the job is re-dispatched to B, then have B
+    /// report success — `execute` returns `Ok`.
+    #[tokio::test]
+    async fn disconnect_reassigns_in_flight_job_to_another_worker() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        // Generous timeout so the reassignment happens well within the budget.
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx_a = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+        let mut rx_b = register_and_connect(&scheduler, &registry, "w-b", &[("os", "linux")]).await;
+
+        // Caller submits the action.
+        let exec = {
+            let s = scheduler.clone();
+            tokio::spawn(async move { s.execute(action_digest, true).await })
+        };
+
+        // It dispatches to one of the workers. Whichever got it "crashes"; the
+        // job must reappear on the other worker.
+        let (dead, mut live_rx, first_job) = {
+            if let Some(job) = recv_within(&mut rx_a, Duration::from_millis(500)).await {
+                (WorkerId::new("w-a".to_string()).unwrap(), rx_b, job)
+            } else {
+                let job = recv_within(&mut rx_b, Duration::from_millis(500))
+                    .await
+                    .unwrap();
+                (WorkerId::new("w-b".to_string()).unwrap(), rx_a, job)
+            }
+        };
+        let job_id = first_job.job_id.clone();
+
+        // Simulate the crash: the worker's stream closes.
+        scheduler.disconnect_worker(&dead).await;
+
+        // The job is reassigned to the surviving worker (same job id).
+        let reassigned = recv_within(&mut live_rx, Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert_eq!(reassigned.job_id, job_id, "same job reassigned");
+
+        // The surviving worker reports success.
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                cache_hit: false,
+                error_message: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = exec.await.unwrap().unwrap();
+        assert_eq!(outcome.result.exit_code, 0);
+        assert!(!outcome.cache_hit);
     }
 }

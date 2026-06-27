@@ -711,3 +711,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and return the `(job_id, payload)` pairs to requeue on lease expiry /
   worker disconnect. Pure bookkeeping; the dispatcher wiring that drives
   it is the next increment. Seven unit tests.
+- `brokkr-control::Scheduler` rewritten around a global pending queue +
+  job leases + an event-driven dispatcher (ADR 0009), delivering the §16
+  DoD "worker crash mid-job → job retried on another worker". `execute`
+  now enqueues (the result waiter survives retries) and awaits under the
+  overall timeout; `try_dispatch` leases each queued job to an idle,
+  eligible, connected worker (capacity 1) chosen by the `Strategy`;
+  `report` completes the lease, wakes the waiter, and re-dispatches.
+  **Worker disconnect requeues the worker's in-flight job for reassignment
+  to another worker** (the crash-recovery path), bounded by
+  `MAX_ATTEMPTS = 5`; a late/duplicate report for a job with no active
+  lease is discarded (at-least-once, safe under determinism). Connect /
+  disconnect are now `Scheduler::connect_worker` / `disconnect_worker`
+  (the single `take_receiver` queue and `connected_workers()` accessor are
+  gone); `WorkerService.Stream` calls them. Dispatch state (connected
+  workers + pending queue + leases) lives under one mutex, so there is no
+  inter-lock ordering to get wrong. New scheduler test:
+  `disconnect_reassigns_in_flight_job_to_another_worker` (the DoD).
+  NOTE: under capacity-1, `BinPacking` spreads exactly like `SimpleFifo`
+  (a worker can't hold a second concurrent job); a per-worker-capacity
+  knob to re-activate packing is a follow-up. Lease-*expiry* reassignment
+  (slow worker, vs. disconnect) is also a follow-up; crash recovery via
+  disconnect is live.

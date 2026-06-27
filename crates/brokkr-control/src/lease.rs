@@ -78,6 +78,12 @@ impl<P> LeaseTable<P> {
         self.leases.contains_key(job_id)
     }
 
+    /// Whether `worker_id` currently holds any lease. With worker capacity 1
+    /// (ADR 0009) this is the worker's "busy" predicate for the dispatcher.
+    pub fn is_worker_busy(&self, worker_id: &WorkerId) -> bool {
+        self.leases.values().any(|l| &l.worker_id == worker_id)
+    }
+
     /// Number of active leases.
     pub fn len(&self) -> usize {
         self.leases.len()
@@ -234,5 +240,18 @@ mod tests {
     fn take_worker_unknown_is_empty() {
         let mut t: LeaseTable<&str> = LeaseTable::new();
         assert!(t.take_worker(&wid("nobody")).is_empty());
+    }
+
+    #[test]
+    fn is_worker_busy_reflects_held_leases() {
+        let t0 = Instant::now();
+        let d = t0 + Duration::from_secs(30);
+        let mut t = LeaseTable::new();
+        assert!(!t.is_worker_busy(&wid("w1")));
+        t.insert(jid("j1"), wid("w1"), d, "p");
+        assert!(t.is_worker_busy(&wid("w1")));
+        assert!(!t.is_worker_busy(&wid("w2")));
+        t.complete(&jid("j1"));
+        assert!(!t.is_worker_busy(&wid("w1")));
     }
 }
