@@ -15,13 +15,19 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 
-/// Errors from [`check_status`].
+/// A server-reported execution failure carrying the `google.rpc.Status` code.
+///
+/// Surfaced from both [`check_status`] (the `ExecuteResponse.status` path) and
+/// the streamed `Operation` error path, so callers can inspect `code` for
+/// retry decisions instead of parsing a message string (issue #62).
 #[derive(Debug, Error)]
 pub enum ExecuteError {
     /// Server returned a non-OK status.
     #[error("execution failed: {message} (code={code})")]
     Status {
-        /// The gRPC status code (non-zero).
+        /// The gRPC / `google.rpc.Status` code (non-zero). Tells the caller
+        /// whether the failure is retryable (`RESOURCE_EXHAUSTED`,
+        /// `UNAVAILABLE`, `DEADLINE_EXCEEDED`, …).
         code: i32,
         /// The error message from the server.
         message: String,
@@ -187,6 +193,18 @@ pub fn check_status(resp: &rapi::ExecuteResponse) -> Result<rapi::ActionResult, 
     }
 }
 
+/// Map a streamed `Operation` error `Status` into a structured [`ExecuteError`].
+///
+/// The `google.rpc.Status.code` is what tells a caller whether the failure is
+/// retryable, so it must survive in the error type rather than being flattened
+/// into a formatted string (issue #62).
+fn operation_error(status: brokkr_proto::rpc::Status) -> ExecuteError {
+    ExecuteError::Status {
+        code: status.code,
+        message: status.message,
+    }
+}
+
 /// Run `argv` on the cluster and return its result.
 ///
 /// Builds an `Action` (with empty input root + the given Command), uploads
@@ -318,7 +336,9 @@ pub async fn run_command(
                 let resp = rapi::ExecuteResponse::decode(any.value.as_slice())
                     .context("decoding ExecuteResponse")?;
                 let status_code = resp.status.as_ref().map(|s| s.code).unwrap_or(0);
-                let result = check_status(&resp).map_err(|e| anyhow!("{e}"))?;
+                // Propagate the structured ExecuteError (not a stringified copy)
+                // so callers can downcast and inspect the code (issue #62).
+                let result = check_status(&resp)?;
                 if status_code != 0 {
                     tracing::Span::current().record("exec_status_code", status_code);
                 }
@@ -333,7 +353,7 @@ pub async fn run_command(
                 });
             }
             Some(brokkr_proto::longrunning::operation::Result::Error(s)) => {
-                return Err(anyhow!("execution failed: {} ({})", s.message, s.code));
+                return Err(operation_error(s).into());
             }
             None => {
                 return Err(anyhow!("Operation done with no result"));
@@ -347,5 +367,40 @@ fn digest_of(bytes: &[u8]) -> rapi::Digest {
     rapi::Digest {
         hash: hex::encode(Sha256::digest(bytes)),
         size_bytes: bytes.len() as i64,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_error_surfaces_code_for_retry_inspection() {
+        let status = brokkr_proto::rpc::Status {
+            code: 8, // RESOURCE_EXHAUSTED
+            message: "quota exceeded".to_string(),
+            details: vec![],
+        };
+        let ExecuteError::Status { code, message } = operation_error(status) else {
+            panic!("expected Status variant");
+        };
+        assert_eq!(code, 8);
+        assert_eq!(message, "quota exceeded");
+    }
+
+    #[test]
+    fn execute_error_code_survives_anyhow_boxing() {
+        // run_command returns anyhow::Result, so a caller recovers the code by
+        // downcasting the boxed error rather than parsing the message.
+        let err: anyhow::Error = ExecuteError::Status {
+            code: 14, // UNAVAILABLE
+            message: "try again".to_string(),
+        }
+        .into();
+        assert!(matches!(
+            err.downcast_ref::<ExecuteError>(),
+            Some(ExecuteError::Status { code: 14, .. })
+        ));
     }
 }

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `brokkr-sdk` no longer discards the `google.rpc.Status.code` on a
+  failed execution. The streamed `Operation` error path flattened the
+  code into an `anyhow!` string, and the `ExecuteResponse.status` path
+  stringified the structured `ExecuteError` — so callers could not tell
+  `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `DEADLINE_EXCEEDED` apart for
+  retry decisions (issue #62). Both paths now propagate the structured
+  `ExecuteError::Status { code, message }`, recoverable by downcasting
+  the returned `anyhow::Error`.
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
   `needless_return`; replaced with bare expressions so all four
