@@ -442,3 +442,44 @@ I8 (foundation) + I9 (wiring) deliver multi-worker dispatch with the
 tenants/quotas, fair scheduling — where the global queue + lease-based
 reassignment land). A full two-process / two-worker gRPC integration test
 is also worth adding once a second strategy gives it more to assert.
+
+## I10 — BinPacking strategy + selectable strategy (§16 task 3)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control`
+- **Outcome:** A second selection strategy, `BinPacking`, behind the
+  existing `Strategy` trait, plus `Scheduler::with_strategy` so the
+  binary can choose. `BinPacking(cap)` packs the most-loaded worker still
+  under `cap` (then falls back to least-loaded when all are saturated),
+  versus `SimpleFifo`'s always-spread. Six unit tests + a scheduler test
+  proving the injected strategy is honoured. 50 lib tests green.
+
+### Decisions
+
+- **BinPacking fits the existing `choose(candidates, loads)` signature.**
+  It only needs per-worker load (from `LoadView`) + a `cap`, so no trait
+  change. The cap is a *soft* target: when everyone is at/over cap it
+  still places work (least-loaded fallback) rather than refusing — a hard
+  admission limit is a task-4 concern (backpressure/queueing).
+- **`cap` clamped to ≥1.** A 0 cap would send every candidate to the
+  fallback (degenerate spread); clamping keeps the knob meaningful.
+- **Selectable via a constructor, not a config flag yet.**
+  `Scheduler::with_strategy` takes `Arc<dyn Strategy>`; the existing
+  constructors keep defaulting to `SimpleFifo` (no call-site churn). A CLI
+  flag to pick the strategy at runtime is a small follow-up once there's a
+  reason to flip it in the binary.
+- **`LocalityAware` deferred — needs a trait change.** "Prefer a worker
+  that recently ran overlapping inputs" requires `choose` to see the
+  action's input-root digest (the current signature only passes load) and
+  per-worker recent-input state. Rather than speculatively widen the trait
+  now, it gets its own increment that designs the locality-hint plumbing
+  (and possibly a small ADR). Flagged here so it isn't silently dropped.
+
+### §16 task 3 status
+
+Multi-worker dispatch with two strategies (`SimpleFifo`, `BinPacking`)
+shipped (I8–I10). Remaining under "scheduling strategies": `LocalityAware`
+(own increment). **Next milestone:** §16 task 4 — job leases (incl.
+reassigning a disconnected worker's in-flight jobs, deferred from I9),
+tenants/quotas, fair scheduling; this is where ADR 0008's deferred global
+pending queue lands, likely with its own ADR.
