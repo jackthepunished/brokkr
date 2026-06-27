@@ -178,7 +178,6 @@ impl WorkerService for WorkerServiceImpl {
         let _guard = span.enter();
         let mut inbound = request.into_inner();
         let scheduler = self.scheduler.clone();
-        let connected = scheduler.connected_workers();
 
         // Outbound stream handed back to the worker (JobAssignments). We must
         // return it now, but the worker id is only known from the first inbound
@@ -221,10 +220,11 @@ impl WorkerService for WorkerServiceImpl {
                 };
                 tracing::info!(worker_id = %worker_id, "worker stream connected");
 
-                // Register this worker's own job channel so the scheduler can
-                // route jobs to it; spawn the outbound pump that forwards them.
+                // This worker's own job channel. Spawn the outbound pump first,
+                // then register with the scheduler — `connect_worker` may
+                // immediately dispatch a queued job, and the pump must be ready
+                // to forward it.
                 let (job_tx, mut job_rx) = mpsc::channel::<bv1::Job>(8);
-                connected.lock().await.connect(worker_id.clone(), job_tx);
                 let outbound = tokio::spawn(async move {
                     while let Some(job) = job_rx.recv().await {
                         if out_tx
@@ -236,6 +236,7 @@ impl WorkerService for WorkerServiceImpl {
                         }
                     }
                 });
+                scheduler.connect_worker(worker_id.clone(), job_tx).await;
 
                 // Inbound pump: process JobResults until the stream ends. Each
                 // terminal state is logged (issue #64) so an operator can tell
@@ -272,10 +273,10 @@ impl WorkerService for WorkerServiceImpl {
                     }
                 }
 
-                // Disconnect: deregister so the scheduler stops routing here,
-                // and stop the outbound pump (closing the worker's stream).
-                // Lease-based reassignment of in-flight jobs is task 4.
-                connected.lock().await.disconnect(&worker_id);
+                // Disconnect: deregister and requeue any job this worker held
+                // for reassignment to another worker (ADR 0009 crash recovery),
+                // then stop the outbound pump (closing the worker's stream).
+                scheduler.disconnect_worker(&worker_id).await;
                 outbound.abort();
             }
             .in_current_span(),

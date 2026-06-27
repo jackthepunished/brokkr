@@ -533,3 +533,53 @@ The dispatcher rewrite: `execute` enqueues (waiter survives retries) +
 expiry requeue via `take_worker` / `take_expired`. Headline test: a worker
 that disconnects mid-job → the job is reassigned to a second worker and
 completes (the §16 DoD).
+
+## I12 — dispatcher rewrite: global queue + leases + crash reassignment (§16 task 4, DoD)
+
+- **Date:** 2026-06-28
+- **Affected crate:** `brokkr-control`
+- **Outcome:** The §16 DoD is met — *worker crash mid-job → job retried on
+  another worker, completes*. The scheduler now enqueues every action onto
+  a global pending queue, an event-driven `try_dispatch` leases each job to
+  an idle eligible worker, `report` completes the lease + re-dispatches,
+  and **worker disconnect requeues the worker's in-flight job for
+  reassignment**. 59 lib tests + the real-gRPC `end_to_end` + the 200-RPC
+  `phase1_dod` soak all green through the new dispatch.
+
+### Decisions
+
+- **Single dispatch mutex (`Inner` = connected + pending + leases).**
+  Folded the three pieces of dispatch state under one lock so every
+  routing decision is atomic and there's *no inter-lock ordering to get
+  wrong*. The earlier worry (registry↔connected↔pending↔leases ordering)
+  evaporates: registry is locked before `Inner` (registry is only ever
+  locked alone elsewhere), and `waiters` is always acquired alone.
+- **Worker connect/disconnect moved onto the scheduler.** `ConnectedWorkers`
+  is now private inside `Inner`; `WorkerService.Stream` calls
+  `connect_worker` / `disconnect_worker` instead of poking a shared handle.
+  `disconnect_worker` is the crash-recovery entry point — it `take_worker`s
+  the dead worker's leases and requeues them.
+- **Capacity-1 ⇒ BinPacking degenerates to SimpleFifo (documented).** A
+  worker holds at most one lease, so it's busy-excluded from candidates
+  after one job; load is always 0 among candidates and the two strategies
+  coincide. Spreading now emerges from *busy-exclusion*, not in-flight
+  counts (so `ConnectedWorkers::inc/dec_inflight` are unused by the
+  scheduler — kept + still unit-tested for a future capacity>1). Pinned by
+  `binpacking_with_capacity_one_spreads_like_simplefifo`; re-activating
+  packing is a deliberate future change (per-worker capacity knob).
+- **At-least-once, bounded retries.** `report` discards a result whose
+  lease is already gone (late/duplicate after reassignment) — safe under
+  determinism. Requeues bump an attempt counter; past `MAX_ATTEMPTS` the
+  waiter is dropped so `execute` fails instead of looping forever.
+- **Overall timeout spans retries.** The caller's `execute` wait (and each
+  lease) is sized from the action timeout; reassignment reuses the same
+  waiter, so a crash-and-retry is transparent as long as it fits the
+  budget. Lease-*expiry*-based reassignment (slow worker, not disconnect)
+  is the remaining follow-up — crash recovery via disconnect is live now.
+
+### Next increment
+
+Lease-expiry reaper (`tokio::time::interval` → `LeaseTable::take_expired`
+→ requeue → `try_dispatch`), wired into the binary like the eviction
+reaper; a lease-renewal RPC for long actions; then §16 task 4's other
+halves — tenants/quotas and weighted fair queuing over the pending queue.
