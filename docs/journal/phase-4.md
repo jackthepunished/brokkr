@@ -483,3 +483,53 @@ shipped (I8–I10). Remaining under "scheduling strategies": `LocalityAware`
 reassigning a disconnected worker's in-flight jobs, deferred from I9),
 tenants/quotas, fair scheduling; this is where ADR 0008's deferred global
 pending queue lands, likely with its own ADR.
+
+## I11 — leases + global queue ADR + LeaseTable (§16 task 4)
+
+- **Date:** 2026-06-27
+- **Affected crate:** `brokkr-control` (+ ADR 0009)
+- **Decision taken with the owner:** task 4 starts with **global queue +
+  leases + crash-reassignment** (the §16 DoD), over tenants/quotas first
+  or finishing `LocalityAware`.
+- **Outcome:** ADR 0009 records the design — a global pending queue
+  drained by an event-driven dispatcher, time-bounded job leases, and
+  requeue-on-failure (lease expiry *or* worker disconnect → another
+  worker), at-least-once made safe by Brokkr's determinism axiom. The
+  first code increment lands `lease::LeaseTable<P>`, the pure lease
+  bookkeeping core, clock-injected and generic over the re-dispatch
+  payload. Seven unit tests; `brokkr-control` green.
+
+### Decisions
+
+- **Worker capacity = 1 leased job (ADR 0009).** The worker control loop
+  already runs actions serially, so the scheduler leases one job per
+  worker and treats it busy until report/expiry/disconnect. Per-worker
+  parallelism is a later knob.
+- **`LeaseTable` carries the re-dispatch payload.** A lease holds enough
+  to re-queue the job if it fails, so reassignment needs no separate
+  in-flight map. Generic `<P>` keeps the bookkeeping unit-testable
+  without the scheduler's `bv1::Job`/waiter types.
+- **`complete` returns `Option<P>`.** A late report after expiry/
+  reassignment finds no lease → `None` → caller discards it. This is the
+  at-least-once seam: the retry's result is the one that counts.
+- **`take_expired` / `take_worker` return sorted `(job_id, payload)`.**
+  Deterministic requeue order for logging/tests; `take_worker` is the
+  disconnect-reassignment path (the I9-deferred crash recovery).
+- **Inclusive expiry (`now >= deadline`).** Matches intuition for "due
+  by"; pinned by a test. (The registry uses strictly-greater for
+  staleness — different semantics, deliberately: a missed *heartbeat*
+  tolerates the exact boundary, a *lease* deadline does not.)
+- **Foundation split from wiring.** I11 = ADR + `LeaseTable` (tested);
+  I12 = the dispatcher/`execute` rewrite (pending queue, lease on
+  dispatch, requeue on expiry/disconnect, crash-reassignment integration
+  test). The dispatcher re-touches the scheduler core, so it's staged
+  behind the reviewable ADR.
+
+### Next increment (I12)
+
+The dispatcher rewrite: `execute` enqueues (waiter survives retries) +
+`try_dispatch` assigns queued jobs to idle eligible workers, leasing each;
+`report` completes the lease and re-dispatches; worker disconnect / lease
+expiry requeue via `take_worker` / `take_expired`. Headline test: a worker
+that disconnects mid-job → the job is reassigned to a second worker and
+completes (the §16 DoD).
