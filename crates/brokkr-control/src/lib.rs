@@ -20,6 +20,6 @@ pub use registry::{
     HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
 };
 pub use scheduler::Scheduler;
-pub use scheduling::{ConnectedWorkers, LoadView, SimpleFifo, Strategy};
+pub use scheduling::{BinPacking, ConnectedWorkers, LoadView, SimpleFifo, Strategy};
 pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
 pub use worker_service::{spawn_eviction_task, SharedWorkerRegistry, WorkerServiceImpl};

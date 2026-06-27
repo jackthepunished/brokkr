@@ -688,3 +688,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   none connected, reject on label mismatch, route-then-timeout, two-worker
   spread) plus the existing real-gRPC end-to-end. In-flight job
   reassignment when a worker disconnects is deferred to task 4 (leases).
+- `brokkr-control::scheduling::BinPacking` — a second selection strategy
+  (plan §16 task 3). Packs a worker toward a soft per-worker in-flight
+  `cap` (prefers the most-loaded candidate under cap) before spreading to
+  a fresh worker, so idle workers can scale down; falls back to
+  least-loaded when every candidate is saturated. Deterministic id
+  tie-break. `Scheduler::with_strategy` makes the selection strategy
+  injectable, so the binary can pick `SimpleFifo` / `BinPacking` at
+  startup. Six `BinPacking` unit tests + a scheduler test proving the
+  injected strategy is honoured (two concurrent jobs pack onto one worker
+  under `BinPacking(2)`). `LocalityAware` is deferred — it needs the
+  action's input-root passed into `Strategy::choose` (a trait-signature
+  change) plus per-worker locality state, so it gets its own increment.

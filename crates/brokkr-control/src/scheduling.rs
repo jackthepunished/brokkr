@@ -55,6 +55,59 @@ impl Strategy for SimpleFifo {
     }
 }
 
+/// Bin-packing: fill a worker toward `cap` in-flight jobs before spreading to a
+/// fresh one, so idle workers can scale down. Among candidates still under
+/// `cap`, picks the *most*-loaded (packs tight); if every candidate is at or
+/// over `cap`, falls back to the least-loaded so work still flows rather than
+/// stalling. Ties broken by worker id for determinism.
+#[derive(Debug, Clone, Copy)]
+pub struct BinPacking {
+    /// Soft per-worker in-flight target. A worker under this is preferred for
+    /// packing; the cap is not a hard admission limit (the fallback still
+    /// places work when everyone is saturated).
+    cap: usize,
+}
+
+impl BinPacking {
+    /// Create a bin-packing strategy with the given soft per-worker in-flight
+    /// `cap`. A `cap` of 0 is clamped to 1 (a 0 cap would send every candidate
+    /// straight to the least-loaded fallback, i.e. degenerate to spreading).
+    pub fn new(cap: usize) -> Self {
+        Self { cap: cap.max(1) }
+    }
+}
+
+impl Strategy for BinPacking {
+    fn choose(&self, candidates: &[WorkerId], loads: &dyn LoadView) -> Option<WorkerId> {
+        // Prefer the most-loaded worker still under cap (pack it tighter);
+        // `min_by` with a comparator that ranks higher load — then lower id —
+        // as "smaller" yields that worker deterministically.
+        let packed = candidates
+            .iter()
+            .filter(|w| loads.inflight(w) < self.cap)
+            .min_by(|a, b| {
+                loads
+                    .inflight(b)
+                    .cmp(&loads.inflight(a))
+                    .then_with(|| a.as_str().cmp(b.as_str()))
+            });
+        if let Some(w) = packed {
+            return Some(w.clone());
+        }
+        // Everyone is at/over cap — fall back to least-loaded so work still
+        // flows (same rule as `SimpleFifo`).
+        candidates
+            .iter()
+            .min_by(|a, b| {
+                loads
+                    .inflight(a)
+                    .cmp(&loads.inflight(b))
+                    .then_with(|| a.as_str().cmp(b.as_str()))
+            })
+            .cloned()
+    }
+}
+
 /// A connected worker's job-dispatch channel plus its live in-flight count.
 struct WorkerConn {
     job_tx: mpsc::Sender<bv1::Job>,
@@ -198,6 +251,55 @@ mod tests {
         // "fresh" has no entry → inflight 0 → chosen over busy=4.
         let l = loads(&[("busy", 4)]);
         assert_eq!(SimpleFifo.choose(&cands, &l), Some(wid("fresh")));
+    }
+
+    #[test]
+    fn bin_packing_empty_candidates_is_none() {
+        assert!(BinPacking::new(4).choose(&[], &loads(&[])).is_none());
+    }
+
+    #[test]
+    fn bin_packing_prefers_most_loaded_under_cap() {
+        let cands = vec![wid("a"), wid("b"), wid("c")];
+        // cap 4: a=3 (highest under cap) wins over b=1, c=0 — pack it tight.
+        let l = loads(&[("a", 3), ("b", 1), ("c", 0)]);
+        assert_eq!(BinPacking::new(4).choose(&cands, &l), Some(wid("a")));
+    }
+
+    #[test]
+    fn bin_packing_skips_workers_at_cap() {
+        let cands = vec![wid("a"), wid("b")];
+        // cap 2: a is at cap (2) so excluded; b (1, under cap) is chosen even
+        // though a is more loaded.
+        let l = loads(&[("a", 2), ("b", 1)]);
+        assert_eq!(BinPacking::new(2).choose(&cands, &l), Some(wid("b")));
+    }
+
+    #[test]
+    fn bin_packing_falls_back_to_least_loaded_when_all_at_cap() {
+        let cands = vec![wid("a"), wid("b"), wid("c")];
+        // cap 2: all at/over cap → least-loaded fallback picks c=2 (a=4, b=3).
+        let l = loads(&[("a", 4), ("b", 3), ("c", 2)]);
+        assert_eq!(BinPacking::new(2).choose(&cands, &l), Some(wid("c")));
+    }
+
+    #[test]
+    fn bin_packing_ties_break_by_id() {
+        let cands = vec![wid("zebra"), wid("alpha")];
+        // Equal load under cap → lower id wins.
+        let l = loads(&[("zebra", 1), ("alpha", 1)]);
+        assert_eq!(BinPacking::new(4).choose(&cands, &l), Some(wid("alpha")));
+    }
+
+    #[test]
+    fn bin_packing_zero_cap_is_clamped_and_spreads() {
+        // cap clamped to 1: with two idle workers nobody is under cap=1? 0<1 is
+        // true, so both are under cap → most-loaded (both 0) → lower id.
+        let cands = vec![wid("a"), wid("b")];
+        assert_eq!(
+            BinPacking::new(0).choose(&cands, &loads(&[])),
+            Some(wid("a"))
+        );
     }
 
     fn dummy_channel() -> mpsc::Sender<bv1::Job> {

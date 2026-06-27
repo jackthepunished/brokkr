@@ -85,7 +85,13 @@ impl Scheduler {
     /// default execution timeout ([`DEFAULT_EXECUTION_TIMEOUT`]) and no
     /// admission control.
     pub fn new(cas: Arc<dyn Cas>, action_cache: Arc<dyn ActionCache>) -> Arc<Self> {
-        Self::build(cas, action_cache, DEFAULT_EXECUTION_TIMEOUT, None)
+        Self::build(
+            cas,
+            action_cache,
+            DEFAULT_EXECUTION_TIMEOUT,
+            None,
+            Arc::new(SimpleFifo),
+        )
     }
 
     /// Construct a scheduler with a custom default per-action timeout. The
@@ -96,7 +102,13 @@ impl Scheduler {
         action_cache: Arc<dyn ActionCache>,
         default_execution_timeout: Duration,
     ) -> Arc<Self> {
-        Self::build(cas, action_cache, default_execution_timeout, None)
+        Self::build(
+            cas,
+            action_cache,
+            default_execution_timeout,
+            None,
+            Arc::new(SimpleFifo),
+        )
     }
 
     /// Construct a scheduler that performs platform-constraint admission
@@ -111,6 +123,7 @@ impl Scheduler {
             action_cache,
             DEFAULT_EXECUTION_TIMEOUT,
             Some(worker_registry),
+            Arc::new(SimpleFifo),
         )
     }
 
@@ -126,6 +139,25 @@ impl Scheduler {
             action_cache,
             default_execution_timeout,
             Some(worker_registry),
+            Arc::new(SimpleFifo),
+        )
+    }
+
+    /// Construct a scheduler with a custom worker-selection [`Strategy`] (and a
+    /// registry for constraint filtering), using the default timeout. Lets the
+    /// binary pick `SimpleFifo` / `BinPacking` / … at startup.
+    pub fn with_strategy(
+        cas: Arc<dyn Cas>,
+        action_cache: Arc<dyn ActionCache>,
+        worker_registry: SharedWorkerRegistry,
+        strategy: Arc<dyn Strategy>,
+    ) -> Arc<Self> {
+        Self::build(
+            cas,
+            action_cache,
+            DEFAULT_EXECUTION_TIMEOUT,
+            Some(worker_registry),
+            strategy,
         )
     }
 
@@ -134,10 +166,11 @@ impl Scheduler {
         action_cache: Arc<dyn ActionCache>,
         default_execution_timeout: Duration,
         worker_registry: Option<SharedWorkerRegistry>,
+        strategy: Arc<dyn Strategy>,
     ) -> Arc<Self> {
         Arc::new(Self {
             connected: Arc::new(Mutex::new(ConnectedWorkers::new())),
-            strategy: Arc::new(SimpleFifo),
+            strategy,
             waiters: Mutex::new(HashMap::new()),
             cas,
             action_cache,
@@ -753,5 +786,53 @@ mod tests {
             rx_b.try_recv().is_ok(),
             "worker b should have received exactly one job"
         );
+    }
+
+    /// The scheduler honours its injected strategy: `BinPacking` (cap 2) packs
+    /// both concurrent jobs onto the lower-id worker instead of spreading.
+    #[tokio::test]
+    async fn execute_uses_injected_binpacking_strategy() {
+        use crate::registry::WorkerRegistry;
+        use crate::scheduling::BinPacking;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler =
+            Scheduler::with_strategy(cas, ac, registry.clone(), Arc::new(BinPacking::new(2)));
+        // Short timeout via the action would be cleaner, but with_strategy uses
+        // the default; the jobs just need to be dispatched, which happens
+        // before any wait — so we read the channels right after dispatch.
+        let mut rx_a = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+        let mut rx_b = register_and_connect(&scheduler, &registry, "w-b", &[("os", "linux")]).await;
+
+        // Two concurrent executes. BinPacking(cap 2) packs w-a (lower id) to
+        // the cap before touching w-b, so both jobs land on w-a.
+        let (s1, s2) = (scheduler.clone(), scheduler.clone());
+        let (d1, d2) = (action_digest.clone(), action_digest);
+        let h1 = tokio::spawn(async move { s1.execute(d1, true).await });
+        let h2 = tokio::spawn(async move { s2.execute(d2, true).await });
+
+        // Both jobs are dispatched to w-a's channel; assert before the (long)
+        // default timeout elapses by polling the receivers with a short budget.
+        let mut a_count = 0;
+        for _ in 0..50 {
+            while rx_a.try_recv().is_ok() {
+                a_count += 1;
+            }
+            if a_count == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(a_count, 2, "BinPacking should pack both jobs onto w-a");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "w-b should have received no jobs under BinPacking"
+        );
+
+        h1.abort();
+        h2.abort();
     }
 }
