@@ -670,3 +670,47 @@ disconnect (I12), expiry reaper (I13), renewal on heartbeat (I14).
 get fair share" DoD. That's the next milestone: ADR 0010 + an
 AskUserQuestion on tenant-id source, quota types, and the WFQ algorithm
 before implementing.
+
+## I15 — tenants + fair-queue foundation (§16 task 4, ADR 0010)
+
+- **Date:** 2026-06-28
+- **Affected crates:** `brokkr-common`, `brokkr-control` (+ ADR 0010)
+- **Decisions taken with the owner:** tenant id from a **gRPC metadata
+  header** (`x-brokkr-tenant`, default fallback); **virtual-time WFQ
+  (SFQ)** for fair sharing.
+- **Outcome:** ADR 0010 records the design. `brokkr_common::TenantId`
+  newtype + `brokkr-control::fairqueue::FairQueue<J>`, a pure Start-time
+  Fair Queue: per-tenant virtual start tags, weight-proportional service,
+  eligibility-constrained dequeue via `slots()` + `take(index)`. 7 fair-queue
+  + 2 tenant unit tests; both crates green. Scheduler wiring is I16.
+
+### Decisions
+
+- **SFQ with unit cost.** Action runtime is unknown up front, so every job
+  is cost 1; a tenant of weight `w` advances its virtual clock by `COST/w`
+  per job, so weight-2 is serviced ~2× as often. Integer fixed-point
+  virtual time (no floats) keeps it deterministic + `Ord`-clean.
+- **Eligibility-constrained dequeue, not strict global min.** Dispatch must
+  still honour platform matching + idle workers (ADR 0008/0009), so
+  `FairQueue` exposes `slots()` (each with its start tag) for the scheduler
+  to scan and `take(index)` to remove the chosen one + advance virtual
+  time. This mirrors the existing under-one-lock scan in `try_dispatch`, so
+  wiring it in won't reintroduce a borrow/lock tangle. A `pop()` convenience
+  (global min) backs the unit tests.
+- **Header-sourced tenant id, pre-auth.** `x-brokkr-tenant` with a
+  `"default"` fallback; client-asserted until auth (§16 task 8) makes it
+  authoritative. Deliberately *not* REAPI `instance_name` (routing, not
+  identity).
+- **Foundation split from wiring.** I15 is the pure, fully-unit-tested
+  pieces; I16 replaces `Inner.pending: VecDeque<PendingJob>` with the
+  `FairQueue`, extracts the tenant in the `Execution`/`WorkerService`
+  handlers, threads it into `PendingJob`, and switches `try_dispatch`'s
+  scan to `slots()`/`take`. I17 adds the max-concurrent-per-tenant quota at
+  admission.
+
+### Next increment (I16)
+
+Wire `FairQueue` into the scheduler: tenant extraction in `execute`
+(header → `TenantId`), `PendingJob.tenant`, `Inner.pending: FairQueue`,
+`try_dispatch` scans `slots()` for the lowest-start dispatchable job. Then
+a two-tenant fairness integration test (the §16 DoD), and I17 quotas.

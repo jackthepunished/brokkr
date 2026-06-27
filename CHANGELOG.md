@@ -774,3 +774,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reassigned (and that worker is also evicted from the registry). No proto
   or worker-side change — it reuses the existing `Heartbeat` RPC. Two
   `LeaseTable::renew_worker` unit tests.
+- ADR 0010 — tenants + weighted fair scheduling: tenant id from a gRPC
+  metadata header (`x-brokkr-tenant`, default fallback) and virtual-time
+  Start-time Fair Queuing over per-tenant-tagged pending jobs.
+  `docs/architecture/0010-tenants-and-fair-scheduling.md`.
+- `brokkr_common::TenantId` — tenant identifier newtype (`Default` =
+  `"default"`, `DEFAULT_TENANT`), same validation as the other id
+  newtypes. Two unit tests.
+- `brokkr-control::fairqueue::FairQueue<J>` (plan §16 task 4 foundation):
+  a pure, generic Start-time Fair Queue. `push(tenant, job)` assigns an
+  SFQ virtual start tag (`start = max(virtual_time, last_finish[tenant])`,
+  tenant clock += `cost/weight`, unit cost); `slots()` + `take(index)` let
+  the scheduler dequeue the lowest-start-tag *dispatchable* job (respecting
+  worker eligibility); `pop()` / `set_weight` / `retain` round it out.
+  Seven unit tests (single-tenant FIFO, equal-tenant interleave,
+  weight-proportional service, eligibility-filtered take, idle-tenant
+  no-hoard). Wiring into the scheduler is the next increment.
