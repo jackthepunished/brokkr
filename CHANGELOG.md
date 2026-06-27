@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-sandbox IPC for no security gain.
 
 ### Fixed
+- `brokkr-worker` and `brokkr-sandbox` now bound how much of an action's
+  stdout/stderr they buffer. The worker's plain runner used
+  `Command::output()` and the sandbox host drained the runner pipes with
+  an unbounded `read_to_end`, so an action writing gigabytes to stdout
+  could OOM the worker (issue #67). Both paths now cap each stream at
+  50 MiB (`read_capped`), draining and dropping the excess with a `warn`
+  rather than buffering it.
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
   `needless_return`; replaced with bare expressions so all four
