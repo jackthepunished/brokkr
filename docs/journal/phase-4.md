@@ -583,3 +583,48 @@ Lease-expiry reaper (`tokio::time::interval` → `LeaseTable::take_expired`
 → requeue → `try_dispatch`), wired into the binary like the eviction
 reaper; a lease-renewal RPC for long actions; then §16 task 4's other
 halves — tenants/quotas and weighted fair queuing over the pending queue.
+
+## I13 — lease-expiry reaper (§16 task 4)
+
+- **Date:** 2026-06-28
+- **Affected crate:** `brokkr-control`
+- **Outcome:** `Scheduler::reap_expired_leases` (tested via
+  `reap_expired_at(now)`) requeues + re-dispatches jobs whose lease
+  expired — a worker still connected but gone silent — bounded by
+  `MAX_ATTEMPTS`. `spawn_lease_reaper` drives it on an interval, wired into
+  the binary at half the lease window. Jobs now carry a per-attempt
+  `lease_duration = min(action timeout, DEFAULT_LEASE_DURATION = 60s)`, so
+  a hung worker is retried before the caller's deadline (vs. the previous
+  lease == overall-timeout, where expiry coincided with giving up). 60 lib
+  tests green.
+
+### Decisions
+
+- **Shared requeue path.** Disconnect and expiry both end in
+  `Inner::requeue_taken` (bump attempts → push-front or give-up), and
+  give-up jobs are failed via `fail_jobs` (drop the waiter). One code path,
+  two triggers.
+- **Separate, shorter lease window.** Added `DEFAULT_LEASE_DURATION` (60s)
+  distinct from the overall execute timeout. Without it the lease only
+  expired when the caller had already given up, so the reaper was inert in
+  production; now a silent worker's job is retried mid-flight.
+- **Test seam `reap_expired_at(now)`.** The reaper reads `Instant::now()`;
+  splitting out an instant-taking inner method lets the test force expiry
+  with a far-future instant — deterministic, no sleeping on the real lease
+  window.
+- **Known limitation: expired-but-connected workers aren't excluded.**
+  Unlike disconnect (which removes the worker), an expired lease leaves the
+  worker connected, so the deterministic `Strategy` may re-pick it. The job
+  still makes progress (or fails after `MAX_ATTEMPTS`), but "reassign
+  strictly elsewhere" wants lease **renewal** (so a merely-slow worker
+  keeps its lease) or per-job tried-worker tracking. Documented + pinned by
+  a mechanism-level test (asserts re-dispatch, not the target). Renewal is
+  the natural next lease increment.
+
+### Next
+
+Lease renewal RPC (long-running actions extend their lease; only truly
+silent/dead workers expire), which also fixes the re-pick limitation. Then
+§16 task 4's other half: **tenants/quotas + weighted fair queuing** over
+the pending queue (the "two tenants get fair share" DoD) — its own ADR
+(0010) + an options check-in before implementing.

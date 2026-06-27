@@ -21,7 +21,7 @@ pub use membership::{Membership, MembershipServiceImpl};
 pub use registry::{
     HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
 };
-pub use scheduler::Scheduler;
+pub use scheduler::{spawn_lease_reaper, Scheduler};
 pub use scheduling::{BinPacking, ConnectedWorkers, LoadView, SimpleFifo, Strategy};
 pub use services::{ActionCacheService, CapabilitiesService, CasService, ExecutionService};
 pub use worker_service::{spawn_eviction_task, SharedWorkerRegistry, WorkerServiceImpl};

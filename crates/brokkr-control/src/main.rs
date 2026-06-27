@@ -3,13 +3,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use brokkr_cas::{RedbActionCache, RedbCas};
 use brokkr_control::registry::WorkerRegistry;
 use brokkr_control::{
-    spawn_eviction_task, ActionCacheService, CapabilitiesService, CasService, ExecutionService,
-    Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
+    spawn_eviction_task, spawn_lease_reaper, ActionCacheService, CapabilitiesService, CasService,
+    ExecutionService, Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
 };
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
@@ -127,6 +128,10 @@ async fn main() -> Result<()> {
     // for the server's lifetime; aborting it on shutdown is implicit (process
     // exit). The eviction decision lives in `WorkerRegistry::evict_stale`.
     let _eviction = spawn_eviction_task(worker_registry.clone());
+    // Background lease reaper: reassign jobs whose lease expired (a connected
+    // but silent worker). Checked at a fraction of the lease window.
+    let reap_interval = (scheduler.lease_duration() / 2).max(Duration::from_secs(1));
+    let _lease_reaper = spawn_lease_reaper(scheduler.clone(), reap_interval);
 
     let mut server = Server::builder();
     if let Some(tls_cfg) = tls_cfg {
