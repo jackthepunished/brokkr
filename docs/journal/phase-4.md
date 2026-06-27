@@ -628,3 +628,45 @@ silent/dead workers expire), which also fixes the re-pick limitation. Then
 §16 task 4's other half: **tenants/quotas + weighted fair queuing** over
 the pending queue (the "two tenants get fair share" DoD) — its own ADR
 (0010) + an options check-in before implementing.
+
+## I14 — lease renewal via heartbeat (§16 task 4)
+
+- **Date:** 2026-06-28
+- **Affected crate:** `brokkr-control`
+- **Outcome:** Each worker heartbeat renews the leases that worker holds
+  (`Scheduler::renew_worker_leases` → `LeaseTable::renew_worker`), so a
+  lease expires only when a worker *stops heartbeating*, not merely because
+  it's running a long action. Closes the lease lifecycle. 62 lib tests
+  green.
+
+### Decisions
+
+- **Renew on heartbeat, not a new RPC.** The simplest, most elegant
+  design: the worker already heartbeats every `heartbeat_seconds` to prove
+  liveness; piggybacking lease renewal on that signal means *no proto
+  change and no worker-side change*. Lease lifetime becomes "the worker is
+  alive" — exactly what a lease should track. A dedicated `RenewLease` RPC
+  (or an `active_job_id` on the heartbeat) would only matter if we needed
+  per-job renewal semantics; with capacity-1 "renew the worker's lease" is
+  unambiguous.
+- **This resolves the I13 re-pick caveat.** Because a live worker's lease
+  is renewed every heartbeat (5s) and the lease window is 60s, a healthy
+  worker's lease never expires → it's never wrongly reassigned/re-picked.
+  Only a worker that genuinely stopped heartbeating expires — and that
+  worker is also being evicted from the registry and will disconnect, so
+  the reassignment lands elsewhere. Lease expiry is now a true
+  dead-worker backstop, complementing disconnect-based recovery.
+- **Hung-action bound is the action timeout, not the lease.** A worker that
+  is alive (heartbeating) but stuck in an infinite-loop action keeps its
+  lease renewed; the *action timeout* (`execute`'s overall wait) is what
+  bounds that case and returns `Timeout`. Lease = worker liveness; action
+  timeout = work liveness. Clean separation.
+
+### §16 task 4 status
+
+Lease machinery is complete: global queue (I12), crash reassignment on
+disconnect (I12), expiry reaper (I13), renewal on heartbeat (I14).
+**Remaining:** tenants/quotas + weighted fair queuing — the "two tenants
+get fair share" DoD. That's the next milestone: ADR 0010 + an
+AskUserQuestion on tenant-id source, quota types, and the WFQ algorithm
+before implementing.

@@ -301,6 +301,17 @@ impl Scheduler {
         self.reap_expired_at(Instant::now()).await;
     }
 
+    /// Renew the leases held by `worker_id`, pushing their deadlines out by the
+    /// lease window. Called on each heartbeat: a worker that is alive (still
+    /// heartbeating) keeps its in-flight job leased rather than having it
+    /// expire and be reassigned. A lease therefore expires only when a worker
+    /// stops heartbeating (dead / partitioned). Returns the number renewed.
+    pub async fn renew_worker_leases(&self, worker_id: &WorkerId) -> usize {
+        let new_deadline = Instant::now() + self.lease_duration;
+        let mut inner = self.inner.lock().await;
+        inner.leases.renew_worker(worker_id, new_deadline)
+    }
+
     /// Fail each job in `job_ids` by dropping its result waiter (its `rx` then
     /// errors → `execute` returns an error). Used when a job exceeds
     /// [`MAX_ATTEMPTS`] reassignments.

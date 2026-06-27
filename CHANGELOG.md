@@ -764,3 +764,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expired-but-connected worker is not yet excluded from the re-dispatch
   (it may be re-picked); "reassign strictly elsewhere" needs lease renewal
   / tried-worker tracking — a follow-up.
+- `brokkr-control` lease renewal via heartbeat: each worker heartbeat now
+  renews the leases that worker holds (`Scheduler::renew_worker_leases` →
+  `LeaseTable::renew_worker`), so a lease expires only when a worker stops
+  heartbeating (dead / partitioned) rather than merely running a long
+  action. This aligns lease lifetime with heartbeat liveness and resolves
+  the I13 caveat: a live, heartbeating worker never has its lease expire,
+  so it can't be re-picked; only a genuinely silent worker's job is
+  reassigned (and that worker is also evicted from the registry). No proto
+  or worker-side change — it reuses the existing `Heartbeat` RPC. Two
+  `LeaseTable::renew_worker` unit tests.
