@@ -790,3 +790,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Seven unit tests (single-tenant FIFO, equal-tenant interleave,
   weight-proportional service, eligibility-filtered take, idle-tenant
   no-hoard). Wiring into the scheduler is the next increment.
+- `brokkr-control` fair scheduling wired end-to-end (ADR 0010, the §16
+  "two tenants get fair share" DoD): the scheduler's pending queue is now
+  the per-tenant `FairQueue`. The `Execution` service reads the tenant from
+  the `x-brokkr-tenant` request metadata header (default `"default"`) and
+  threads a `TenantId` into `Scheduler::execute` and each `PendingJob`;
+  `try_dispatch` dequeues the lowest-virtual-start-tag job that has an idle
+  eligible worker; requeue (disconnect / lease expiry) and timeout cleanup
+  re-tag / retain through the fair queue. New scheduler test
+  `two_tenants_share_a_worker_fairly` — two tenants' jobs interleave on one
+  worker rather than draining one-tenant-first. Per-tenant quotas
+  (max-concurrent) are the next increment.

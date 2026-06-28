@@ -7,13 +7,13 @@
 //! [`crate::scheduling::Strategy`] picks one. Global queueing, leases, and fair
 //! scheduling are Phase 4 task 4.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use brokkr_cas::{ActionCache, Cas};
-use brokkr_common::{Digest, JobId, WorkerId};
+use brokkr_common::{Digest, JobId, TenantId, WorkerId};
 use brokkr_proto::brokkr_v1 as bv1;
 use brokkr_proto::reapi_v2 as rapi;
 use prost::Message;
@@ -21,6 +21,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::Instrument;
 
+use crate::fairqueue::FairQueue;
 use crate::lease::LeaseTable;
 use crate::matching::eligible_workers;
 use crate::scheduling::{ConnectedWorkers, SimpleFifo, Strategy};
@@ -78,6 +79,7 @@ pub struct ExecutionOutcome {
 #[derive(Clone, Debug)]
 struct PendingJob {
     job_id: JobId,
+    tenant: TenantId,
     job: bv1::Job,
     platform: rapi::Platform,
     lease_duration: Duration,
@@ -86,10 +88,11 @@ struct PendingJob {
 
 /// Dispatch state held under a single mutex, so every routing decision (which
 /// workers are connected, what is queued, what is leased) is made atomically —
-/// there is no inter-lock ordering to get wrong (ADR 0009).
+/// there is no inter-lock ordering to get wrong (ADR 0009). The pending queue
+/// is a per-tenant fair queue (ADR 0010).
 struct Inner {
     connected: ConnectedWorkers,
-    pending: VecDeque<PendingJob>,
+    pending: FairQueue<PendingJob>,
     leases: LeaseTable<PendingJob>,
 }
 
@@ -107,7 +110,8 @@ impl Inner {
             if pj.attempts >= MAX_ATTEMPTS {
                 give_up.push(job_id);
             } else {
-                self.pending.push_front(pj);
+                let tenant = pj.tenant.clone();
+                self.pending.push(tenant, pj);
                 requeued += 1;
             }
         }
@@ -229,7 +233,7 @@ impl Scheduler {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 connected: ConnectedWorkers::new(),
-                pending: VecDeque::new(),
+                pending: FairQueue::new(),
                 leases: LeaseTable::new(),
             }),
             strategy,
@@ -337,11 +341,12 @@ impl Scheduler {
                 };
                 let mut inner = self.inner.lock().await;
 
-                // First queued job that has an idle, eligible, connected worker.
-                let mut found: Option<(usize, WorkerId)> = None;
-                for (idx, pj) in inner.pending.iter().enumerate() {
+                // The fair queue's lowest-start-tag job that has an idle,
+                // eligible, connected worker (fair-share dequeue, ADR 0010).
+                let mut found: Option<(usize, WorkerId, u64)> = None;
+                for slot in inner.pending.slots() {
                     let candidates: Vec<WorkerId> = match &reg_guard {
-                        Some(reg) => eligible_workers(reg, now, &pj.platform)
+                        Some(reg) => eligible_workers(reg, now, &slot.job.platform)
                             .map(|(id, _)| id.clone())
                             .filter(|id| {
                                 inner.connected.is_connected(id) && !inner.leases.is_worker_busy(id)
@@ -355,17 +360,19 @@ impl Scheduler {
                             .collect(),
                     };
                     if let Some(w) = self.strategy.choose(&candidates, &inner.connected) {
-                        found = Some((idx, w));
-                        break;
+                        // Keep the dispatchable slot with the smallest start tag.
+                        if found.as_ref().is_none_or(|(_, _, best)| slot.start < *best) {
+                            found = Some((slot.index, w, slot.start));
+                        }
                     }
                 }
-                let Some((idx, worker_id)) = found else {
+                let Some((idx, worker_id, _)) = found else {
                     return;
                 };
                 let Some(sender) = inner.connected.sender(&worker_id) else {
                     return;
                 };
-                let Some(pj) = inner.pending.remove(idx) else {
+                let Some(pj) = inner.pending.take(idx) else {
                     return;
                 };
                 let deadline = now + pj.lease_duration;
@@ -389,7 +396,7 @@ impl Scheduler {
                     inner.leases.complete(&pj.job_id);
                     inner.connected.disconnect(&worker_id);
                     if !give_up {
-                        inner.pending.push_front(pj.clone());
+                        inner.pending.push(pj.tenant.clone(), pj.clone());
                     }
                 }
                 if give_up {
@@ -407,6 +414,7 @@ impl Scheduler {
         skip(self),
         fields(
             action_digest = %action_digest,
+            tenant = %tenant,
             skip_cache_lookup,
             cache_hit = tracing::field::Empty,
             exit_code = tracing::field::Empty,
@@ -418,6 +426,7 @@ impl Scheduler {
         self: &Arc<Self>,
         action_digest: Digest,
         skip_cache_lookup: bool,
+        tenant: TenantId,
     ) -> Result<ExecutionOutcome, ExecutionError> {
         if !skip_cache_lookup {
             if let Some(cached) = self
@@ -521,15 +530,19 @@ impl Scheduler {
         };
         {
             let mut inner = self.inner.lock().await;
-            inner.pending.push_back(PendingJob {
-                job_id: job_id.clone(),
-                job,
-                platform,
-                // A single attempt may run up to the action timeout, but no
-                // longer than the lease window so a hung worker is retried.
-                lease_duration: effective_timeout.min(self.lease_duration),
-                attempts: 0,
-            });
+            inner.pending.push(
+                tenant.clone(),
+                PendingJob {
+                    job_id: job_id.clone(),
+                    tenant,
+                    job,
+                    platform,
+                    // A single attempt may run up to the action timeout, but no
+                    // longer than the lease window so a hung worker is retried.
+                    lease_duration: effective_timeout.min(self.lease_duration),
+                    attempts: 0,
+                },
+            );
         }
         self.try_dispatch().await;
 
@@ -768,7 +781,10 @@ mod tests {
         let ac = Arc::new(MockActionCache { force_error: false });
         let scheduler = Scheduler::new(cas, ac);
 
-        let err = scheduler.execute(missing_digest, false).await.unwrap_err();
+        let err = scheduler
+            .execute(missing_digest, false, TenantId::default())
+            .await
+            .unwrap_err();
         // The NotFound error is wrapped by with_context("fetching Action from CAS").
         assert!(
             err.to_string().contains("fetching Action from CAS"),
@@ -826,7 +842,10 @@ mod tests {
             .await;
 
         let start = Instant::now();
-        let err = scheduler.execute(action_digest, true).await.unwrap_err();
+        let err = scheduler
+            .execute(action_digest, true, TenantId::default())
+            .await
+            .unwrap_err();
         let elapsed = start.elapsed();
 
         match err {
@@ -852,7 +871,7 @@ mod tests {
         let scheduler = Scheduler::new(cas, ac);
 
         let err = scheduler
-            .execute(Digest::of(b"any action"), false)
+            .execute(Digest::of(b"any action"), false, TenantId::default())
             .await
             .unwrap_err();
         assert!(
@@ -946,7 +965,10 @@ mod tests {
         let scheduler =
             Scheduler::with_registry_and_timeout(cas, ac, Duration::from_millis(200), registry);
 
-        let err = scheduler.execute(action_digest, true).await.unwrap_err();
+        let err = scheduler
+            .execute(action_digest, true, TenantId::default())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ExecutionError::NoEligibleWorker),
             "expected NoEligibleWorker, got {err:?}"
@@ -971,7 +993,10 @@ mod tests {
         );
         let _held = register_and_connect(&scheduler, &registry, "w1", &[("os", "windows")]).await;
 
-        let err = scheduler.execute(action_digest, true).await.unwrap_err();
+        let err = scheduler
+            .execute(action_digest, true, TenantId::default())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ExecutionError::NoEligibleWorker),
             "expected NoEligibleWorker, got {err:?}"
@@ -993,7 +1018,10 @@ mod tests {
         let scheduler = Scheduler::with_registry_and_timeout(cas, ac, timeout, registry.clone());
         let _held = register_and_connect(&scheduler, &registry, "w1", &[("os", "linux")]).await;
 
-        let err = scheduler.execute(action_digest, true).await.unwrap_err();
+        let err = scheduler
+            .execute(action_digest, true, TenantId::default())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ExecutionError::Timeout(_)),
             "expected Timeout (selection passed), got {err:?}"
@@ -1022,8 +1050,8 @@ mod tests {
         // other worker.
         let (s1, s2) = (scheduler.clone(), scheduler.clone());
         let (d1, d2) = (action_digest.clone(), action_digest);
-        let h1 = tokio::spawn(async move { s1.execute(d1, true).await });
-        let h2 = tokio::spawn(async move { s2.execute(d2, true).await });
+        let h1 = tokio::spawn(async move { s1.execute(d1, true, TenantId::default()).await });
+        let h2 = tokio::spawn(async move { s2.execute(d2, true, TenantId::default()).await });
         let _ = h1.await.unwrap();
         let _ = h2.await.unwrap();
 
@@ -1059,8 +1087,8 @@ mod tests {
 
         let (s1, s2) = (scheduler.clone(), scheduler.clone());
         let (d1, d2) = (action_digest.clone(), action_digest);
-        let h1 = tokio::spawn(async move { s1.execute(d1, true).await });
-        let h2 = tokio::spawn(async move { s2.execute(d2, true).await });
+        let h1 = tokio::spawn(async move { s1.execute(d1, true, TenantId::default()).await });
+        let h2 = tokio::spawn(async move { s2.execute(d2, true, TenantId::default()).await });
 
         // Each worker receives exactly one job (capacity-1 forces the spread).
         let got_a = recv_within(&mut rx_a, Duration::from_millis(500)).await;
@@ -1112,7 +1140,7 @@ mod tests {
         // Caller submits the action.
         let exec = {
             let s = scheduler.clone();
-            tokio::spawn(async move { s.execute(action_digest, true).await })
+            tokio::spawn(async move { s.execute(action_digest, true, TenantId::default()).await })
         };
 
         // It dispatches to one of the workers. Whichever got it "crashes"; the
@@ -1201,7 +1229,7 @@ mod tests {
 
         let exec = {
             let s = scheduler.clone();
-            tokio::spawn(async move { s.execute(action_digest, true).await })
+            tokio::spawn(async move { s.execute(action_digest, true, TenantId::default()).await })
         };
 
         // First dispatch — learn the job id.
@@ -1236,5 +1264,134 @@ mod tests {
 
         let outcome = exec.await.unwrap().unwrap();
         assert_eq!(outcome.result.exit_code, 0);
+    }
+
+    /// Stage an Action whose command echoes `arg`, so different `arg`s produce
+    /// distinct action digests (identifiable in the worker's job stream).
+    async fn stage_action_arg(
+        cas: &brokkr_cas::InMemoryCas,
+        arg: &str,
+        platform: Option<rapi::Platform>,
+    ) -> Digest {
+        use brokkr_cas::Cas as _;
+
+        let command = rapi::Command {
+            arguments: vec!["/bin/echo".to_string(), arg.to_string()],
+            ..Default::default()
+        };
+        let command_bytes = command.encode_to_vec();
+        let command_digest = Digest::of(&command_bytes);
+        let action = rapi::Action {
+            command_digest: Some(rapi::Digest {
+                hash: command_digest.hash().to_string(),
+                size_bytes: command_digest.size_bytes(),
+            }),
+            platform,
+            ..Default::default()
+        };
+        let action_bytes = action.encode_to_vec();
+        let action_digest = Digest::of(&action_bytes);
+        cas.batch_update_blobs(vec![
+            (action_digest.clone(), Bytes::from(action_bytes)),
+            (command_digest, Bytes::from(command_bytes)),
+        ])
+        .await
+        .unwrap();
+        action_digest
+    }
+
+    /// §16 DoD: two tenants submitting concurrently share a single worker
+    /// fairly — their jobs interleave rather than one tenant draining first.
+    /// Both tenants enqueue (worker registered but not yet connected) so all
+    /// six jobs are tagged before any dispatch; then one worker drains them in
+    /// fair-queue order, reporting each to free itself.
+    #[tokio::test]
+    async fn two_tenants_share_a_worker_fairly() {
+        use crate::registry::{WorkerCapabilities, WorkerRegistry};
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let plat = os_platform("linux");
+        let action_a = stage_action_arg(cas.as_ref(), "a", Some(plat.clone())).await;
+        let action_b = stage_action_arg(cas.as_ref(), "b", Some(plat)).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+
+        // Register the worker (so admission passes) but DON'T connect it yet —
+        // all six jobs queue before any dispatch.
+        let wid = WorkerId::new("w".to_string()).unwrap();
+        registry.lock().await.register(
+            wid.clone(),
+            WorkerCapabilities {
+                hostname: "w".to_string(),
+                labels: [("os".to_string(), "linux".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            Instant::now(),
+        );
+
+        let ta = TenantId::new("tenant-a".to_string()).unwrap();
+        let tb = TenantId::new("tenant-b".to_string()).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let (s, d, t) = (scheduler.clone(), action_a.clone(), ta.clone());
+            handles.push(tokio::spawn(async move { s.execute(d, true, t).await }));
+        }
+        for _ in 0..3 {
+            let (s, d, t) = (scheduler.clone(), action_b.clone(), tb.clone());
+            handles.push(tokio::spawn(async move { s.execute(d, true, t).await }));
+        }
+
+        // Let all six enqueue, then connect the worker so dispatch drains them.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bv1::Job>(8);
+        scheduler.connect_worker(wid, tx).await;
+
+        // Drive the single worker: recv a job, note its tenant by action
+        // digest, report success to free the worker, repeat for all six.
+        let mut order = String::new();
+        for _ in 0..6 {
+            let job = recv_within(&mut rx, Duration::from_millis(1000))
+                .await
+                .unwrap();
+            let digest = job.action_digest.as_ref().unwrap().hash.clone();
+            order.push(if digest.as_str() == action_a.hash() {
+                'a'
+            } else {
+                'b'
+            });
+            scheduler
+                .report(bv1::JobResult {
+                    job_id: job.job_id,
+                    result: Some(rapi::ActionResult {
+                        exit_code: 0,
+                        ..Default::default()
+                    }),
+                    cache_hit: false,
+                    error_message: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        assert_eq!(order.matches('a').count(), 3, "order={order}");
+        assert_eq!(order.matches('b').count(), 3, "order={order}");
+        // Fair share ⇒ tenants interleave: the first B job dispatches before the
+        // last A job (not a strict A-A-A-B-B-B drain).
+        let first_b = order.find('b').unwrap();
+        let last_a = order.rfind('a').unwrap();
+        assert!(
+            first_b < last_a,
+            "tenants must interleave (fair share), got {order}"
+        );
     }
 }
