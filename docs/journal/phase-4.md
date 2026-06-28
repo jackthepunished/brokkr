@@ -795,3 +795,47 @@ Bazel-compatibility test. The latter needs a real `bazel` client driving a
 runnable cluster end-to-end — likely **not** feasible in the WSL2/no-bazel
 dev env and a substantial lift; assess + surface to the owner before
 attempting. Then the Phase 4 exit-criteria wrap-up (`docs/plan.md` §11).
+
+## I18 — auth core: JWT client validation (§16 task 8, ADR 0011)
+
+- **Date:** 2026-06-29
+- **Affected crates:** `brokkr-control` (+ ADR 0011, workspace deps)
+- **Decisions taken with the owner:** client auth = **OIDC/JWT** (over
+  static tokens); **open mode** when unconfigured; JWT crate =
+  **`jsonwebtoken`**.
+- **Outcome:** `brokkr-control::auth` — `JwtAuth` validates a bearer
+  token (HS256/RS256 signature, `exp`, optional `iss`/`aud`) and extracts
+  the tenant from a configured claim; `Authenticator` = `Disabled`
+  (header tenant) | `Jwt` (claim tenant, authoritative). 8 unit tests;
+  80 lib tests green. Pure core — interceptor wiring is I19.
+
+### Decisions
+
+- **Tenant from the claim is authoritative.** Closes the ADR-0010
+  client-asserted-tenant gap: when auth is on, the JWT's tenant claim wins
+  over the `x-brokkr-tenant` header.
+- **`serde_json::Value` claims, not a typed struct.** Decode into a
+  `Value` and read the configured claim by name — avoids a `serde` derive
+  and lets the tenant-claim name be configurable.
+- **`exp` required, `aud` opt-in.** `Validation` requires `exp` by
+  default (good); `validate_aud` is turned off unless `with_audience` is
+  set, so tokens without an `aud` aren't spuriously rejected.
+- **`jsonwebtoken` + MSRV pin.** The crate's transitive `simple_asn1` →
+  `time` pulls `time` 0.3.51 which needs rustc 1.88 (> our MSRV 1.85), so
+  pinned `simple_asn1` 0.6.2 + `time` 0.3.36 (lockfile-only, scoped to
+  this dep — not an unrelated `cargo update`). Crypto backend `ring` was
+  already in-tree via rustls/tonic TLS, so no new crypto backend.
+- **Boxed `Jwt` variant.** `JwtAuth` (key + validation) dwarfs the unit
+  `Disabled`, so `Authenticator::Jwt(Box<JwtAuth>)` (clippy
+  `large_enum_variant`).
+
+### Next increment (I19)
+
+Wire it into the server: a tonic interceptor on the client-facing services
+that authenticates the `authorization: Bearer` token → injects the
+authoritative `TenantId` into request extensions (rejecting with
+`UNAUTHENTICATED` when auth is on and the token is missing/invalid); the
+`Execution` handler prefers the injected tenant over the header. Config +
+binary flags (key/secret, iss/aud, claim) with the open-mode startup
+warning. Worker↔control mTLS enforcement. Then the Bazel-compat assessment
++ Phase 4 exit-criteria wrap-up.

@@ -812,3 +812,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal (success / timeout / failure), so completing a job frees the
   slot. Two scheduler tests (over-quota rejects; completion frees the
   slot). CPU-seconds/day and storage quotas remain follow-ups.
+- ADR 0011 — authentication: OIDC/JWT bearer for clients (tenant from a
+  claim, authoritative over the `x-brokkr-tenant` header), worker↔control
+  mTLS, open-mode-with-warning when unconfigured.
+  `docs/architecture/0011-auth.md`.
+- `brokkr-control::auth` (plan §16 task 8): JWT client-auth core.
+  `JwtAuth` validates a bearer token's signature (HS256 / RS256), `exp`,
+  and optional `iss`/`aud`, and reads the tenant from a configured claim;
+  `Authenticator` is either `Disabled` (open mode → tenant from header) or
+  `Jwt` (token's tenant claim is authoritative). Eight unit tests. The
+  server interceptor wiring is the next increment.
+- New dependency `jsonwebtoken` (9; MIT) for JWT validation — crypto via
+  `ring`, already in-tree through rustls/tonic TLS; no network I/O. Its
+  transitive `time`/`simple_asn1` were pinned down (`simple_asn1` 0.6.2,
+  `time` 0.3.36) to stay within MSRV 1.85 (newer `time` requires 1.88);
+  lockfile-only, scoped to this dependency.
