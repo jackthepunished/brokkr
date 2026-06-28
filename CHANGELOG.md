@@ -801,3 +801,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `two_tenants_share_a_worker_fairly` — two tenants' jobs interleave on one
   worker rather than draining one-tenant-first. Per-tenant quotas
   (max-concurrent) are the next increment.
+- `brokkr-control` per-tenant max-concurrent-jobs quota (ADR 0010,
+  completes §16 task 4). `Scheduler::with_tenant_quota` sets an optional
+  per-tenant limit (`None` = unlimited); `execute` counts a tenant's
+  in-flight jobs (queued + leased) and rejects admission over the limit
+  with the new typed `ExecutionError::QuotaExceeded(limit)` → gRPC
+  `RESOURCE_EXHAUSTED` (code 8), before the job is enqueued. The count is
+  incremented under the same lock as the enqueue (so concurrent submits
+  can't both slip past) and decremented when the `execute` call goes
+  terminal (success / timeout / failure), so completing a job frees the
+  slot. Two scheduler tests (over-quota rejects; completion frees the
+  slot). CPU-seconds/day and storage quotas remain follow-ups.

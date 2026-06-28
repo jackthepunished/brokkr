@@ -58,6 +58,10 @@ pub enum ExecutionError {
     /// failure and avoid pointless retries.
     #[error("no eligible worker for the action's platform constraints")]
     NoEligibleWorker,
+    /// The tenant is already at its max-concurrent-jobs quota. Translates to
+    /// gRPC `RESOURCE_EXHAUSTED` (code 8) so the client backs off / retries.
+    #[error("tenant has reached its concurrent-jobs quota ({0})")]
+    QuotaExceeded(usize),
     /// Catch-all for failures during dispatch (CAS read, action-cache write,
     /// worker reporting an error, etc.). Translates to gRPC `INTERNAL`
     /// (code 13).
@@ -94,6 +98,33 @@ struct Inner {
     connected: ConnectedWorkers,
     pending: FairQueue<PendingJob>,
     leases: LeaseTable<PendingJob>,
+    /// Per-tenant count of in-flight jobs (queued + leased), for the
+    /// max-concurrent quota (ADR 0010). A job is counted from admission in
+    /// `execute` until that call returns (success / timeout / failure).
+    tenant_inflight: HashMap<TenantId, usize>,
+}
+
+impl Inner {
+    /// Current in-flight job count for `tenant`.
+    fn tenant_inflight(&self, tenant: &TenantId) -> usize {
+        self.tenant_inflight.get(tenant).copied().unwrap_or(0)
+    }
+
+    /// Record one more in-flight job for `tenant` (on admission).
+    fn inc_tenant(&mut self, tenant: &TenantId) {
+        *self.tenant_inflight.entry(tenant.clone()).or_insert(0) += 1;
+    }
+
+    /// Record one fewer in-flight job for `tenant` (on completion), removing
+    /// the entry at zero so the map doesn't accumulate idle tenants.
+    fn dec_tenant(&mut self, tenant: &TenantId) {
+        if let Some(n) = self.tenant_inflight.get_mut(tenant) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.tenant_inflight.remove(tenant);
+            }
+        }
+    }
 }
 
 impl Inner {
@@ -135,6 +166,9 @@ pub struct Scheduler {
     /// Per-attempt lease duration (capped by the action timeout). A lease that
     /// expires before the worker reports causes the job to be reassigned.
     lease_duration: Duration,
+    /// Optional per-tenant max-concurrent-jobs quota (ADR 0010). `None` =
+    /// unlimited. A tenant at its limit gets `QuotaExceeded` at admission.
+    max_concurrent_per_tenant: Option<usize>,
     /// Optional worker registry for platform-constraint filtering. When set,
     /// candidates are narrowed to healthy workers whose capabilities satisfy
     /// the action's platform; when `None` (e.g. fixtures that don't exercise
@@ -153,6 +187,7 @@ impl Scheduler {
             DEFAULT_EXECUTION_TIMEOUT,
             None,
             Arc::new(SimpleFifo),
+            None,
         )
     }
 
@@ -170,6 +205,7 @@ impl Scheduler {
             default_execution_timeout,
             None,
             Arc::new(SimpleFifo),
+            None,
         )
     }
 
@@ -186,6 +222,7 @@ impl Scheduler {
             DEFAULT_EXECUTION_TIMEOUT,
             Some(worker_registry),
             Arc::new(SimpleFifo),
+            None,
         )
     }
 
@@ -202,6 +239,7 @@ impl Scheduler {
             default_execution_timeout,
             Some(worker_registry),
             Arc::new(SimpleFifo),
+            None,
         )
     }
 
@@ -220,6 +258,26 @@ impl Scheduler {
             DEFAULT_EXECUTION_TIMEOUT,
             Some(worker_registry),
             strategy,
+            None,
+        )
+    }
+
+    /// Construct a scheduler with a per-tenant max-concurrent-jobs quota and a
+    /// registry (for constraint filtering), using the default timeout +
+    /// strategy. `None` means unlimited.
+    pub fn with_tenant_quota(
+        cas: Arc<dyn Cas>,
+        action_cache: Arc<dyn ActionCache>,
+        worker_registry: SharedWorkerRegistry,
+        max_concurrent_per_tenant: Option<usize>,
+    ) -> Arc<Self> {
+        Self::build(
+            cas,
+            action_cache,
+            DEFAULT_EXECUTION_TIMEOUT,
+            Some(worker_registry),
+            Arc::new(SimpleFifo),
+            max_concurrent_per_tenant,
         )
     }
 
@@ -229,14 +287,17 @@ impl Scheduler {
         default_execution_timeout: Duration,
         worker_registry: Option<SharedWorkerRegistry>,
         strategy: Arc<dyn Strategy>,
+        max_concurrent_per_tenant: Option<usize>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 connected: ConnectedWorkers::new(),
                 pending: FairQueue::new(),
                 leases: LeaseTable::new(),
+                tenant_inflight: HashMap::new(),
             }),
             strategy,
+            max_concurrent_per_tenant,
             waiters: Mutex::new(HashMap::new()),
             cas,
             action_cache,
@@ -528,21 +589,34 @@ impl Scheduler {
             action: Some(action),
             command: Some(command),
         };
-        {
+        let pj = PendingJob {
+            job_id: job_id.clone(),
+            tenant: tenant.clone(),
+            job,
+            platform,
+            // A single attempt may run up to the action timeout, but no longer
+            // than the lease window so a hung worker is retried.
+            lease_duration: effective_timeout.min(self.lease_duration),
+            attempts: 0,
+        };
+        // Admission: enqueue + count one in-flight for the tenant, unless it is
+        // already at its max-concurrent quota (checked and incremented under the
+        // same lock so concurrent submits can't both slip past).
+        let over_quota = {
             let mut inner = self.inner.lock().await;
-            inner.pending.push(
-                tenant.clone(),
-                PendingJob {
-                    job_id: job_id.clone(),
-                    tenant,
-                    job,
-                    platform,
-                    // A single attempt may run up to the action timeout, but no
-                    // longer than the lease window so a hung worker is retried.
-                    lease_duration: effective_timeout.min(self.lease_duration),
-                    attempts: 0,
-                },
-            );
+            match self.max_concurrent_per_tenant {
+                Some(limit) if inner.tenant_inflight(&tenant) >= limit => Some(limit),
+                _ => {
+                    inner.inc_tenant(&tenant);
+                    inner.pending.push(tenant.clone(), pj);
+                    None
+                }
+            }
+        };
+        if let Some(limit) = over_quota {
+            self.waiters.lock().await.remove(&job_id);
+            tracing::warn!(tenant = %tenant, limit, "tenant at max-concurrent quota; rejecting");
+            return Err(ExecutionError::QuotaExceeded(limit));
         }
         self.try_dispatch().await;
 
@@ -591,6 +665,9 @@ impl Scheduler {
             })
         }
         .await;
+        // The job is terminal (completed / timed out / failed) — release the
+        // tenant's in-flight slot so it counts against the quota no longer.
+        self.inner.lock().await.dec_tenant(&tenant);
         outcome
     }
 
@@ -1393,5 +1470,111 @@ mod tests {
             first_b < last_a,
             "tenants must interleave (fair share), got {order}"
         );
+    }
+
+    /// A tenant at its max-concurrent quota gets `QuotaExceeded` for further
+    /// submissions while its earlier job is still in flight.
+    #[tokio::test]
+    async fn over_quota_rejects_additional_jobs() {
+        use crate::registry::{WorkerCapabilities, WorkerRegistry};
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_tenant_quota(cas, ac, registry.clone(), Some(1));
+
+        // Register a matching worker so admission's fail-fast passes, but do
+        // NOT connect it — the first job stays queued (in-flight) rather than
+        // completing.
+        registry.lock().await.register(
+            WorkerId::new("w".to_string()).unwrap(),
+            WorkerCapabilities {
+                hostname: "w".to_string(),
+                labels: [("os".to_string(), "linux".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            Instant::now(),
+        );
+
+        let tenant = TenantId::new("t".to_string()).unwrap();
+        let h1 = {
+            let (s, d, t) = (scheduler.clone(), action.clone(), tenant.clone());
+            tokio::spawn(async move { s.execute(d, true, t).await })
+        };
+        // Let the first job enqueue (count one in-flight) before submitting the
+        // second.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let err = scheduler
+            .execute(action.clone(), true, tenant.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::QuotaExceeded(1)),
+            "expected QuotaExceeded(1), got {err:?}"
+        );
+        h1.abort();
+    }
+
+    /// Completing a job frees the tenant's quota slot so it can submit again.
+    #[tokio::test]
+    async fn completing_a_job_frees_tenant_quota() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_tenant_quota(cas, ac, registry.clone(), Some(1));
+        let mut rx = register_and_connect(&scheduler, &registry, "w", &[("os", "linux")]).await;
+
+        let tenant = TenantId::new("t".to_string()).unwrap();
+        // Job 1 dispatches to the worker (leased) — in-flight = 1.
+        let h1 = {
+            let (s, d, t) = (scheduler.clone(), action.clone(), tenant.clone());
+            tokio::spawn(async move { s.execute(d, true, t).await })
+        };
+        let job1 = recv_within(&mut rx, Duration::from_millis(1000))
+            .await
+            .unwrap();
+
+        // Job 2 (same tenant) is over quota while job 1 is in flight.
+        let err = scheduler
+            .execute(action.clone(), true, tenant.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::QuotaExceeded(1)),
+            "got {err:?}"
+        );
+
+        // Complete job 1 → execute returns → quota slot freed.
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job1.job_id,
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                cache_hit: false,
+                error_message: String::new(),
+            })
+            .await
+            .unwrap();
+        h1.await.unwrap().unwrap();
+
+        // Job 3 (same tenant) is now admitted and dispatches to the worker.
+        let h3 = {
+            let (s, d, t) = (scheduler.clone(), action.clone(), tenant.clone());
+            tokio::spawn(async move { s.execute(d, true, t).await })
+        };
+        let job3 = recv_within(&mut rx, Duration::from_millis(1000)).await;
+        assert!(
+            job3.is_some(),
+            "job after quota freed should be admitted and dispatched"
+        );
+        h3.abort();
     }
 }

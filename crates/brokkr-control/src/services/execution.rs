@@ -102,6 +102,7 @@ impl ExecSvc for ExecutionService {
                         // error string.
                         let code = match &e {
                             ExecutionError::Timeout(_) => 4,
+                            ExecutionError::QuotaExceeded(_) => 8,
                             ExecutionError::NoEligibleWorker => 9,
                             ExecutionError::Other(_) => 13,
                         };
