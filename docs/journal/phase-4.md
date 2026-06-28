@@ -756,3 +756,42 @@ gauge in `Inner`, checked in `execute`; over-quota →
 `ExecutionError::QuotaExceeded` → gRPC `RESOURCE_EXHAUSTED`. Then §16 task 4
 is complete (fair share + quotas); remaining Phase 4 is auth (task 8) and
 the Bazel-compatibility test, then the exit-criteria wrap-up.
+
+## I17 — per-tenant max-concurrent quota (§16 task 4 — COMPLETE)
+
+- **Date:** 2026-06-28
+- **Affected crate:** `brokkr-control`
+- **Outcome:** Per-tenant max-concurrent-jobs quota. `with_tenant_quota`
+  sets an optional limit; `execute` rejects admission over it with
+  `ExecutionError::QuotaExceeded(limit)` → gRPC `RESOURCE_EXHAUSTED`. This
+  **completes §16 task 4** (worker registry + matching + multi-worker
+  dispatch + leases + fair scheduling + quotas). 72 lib tests.
+
+### Decisions
+
+- **In-flight count = queued + leased, per tenant.** Counted from
+  admission until the `execute` call goes terminal. The check + increment
+  happen under one `Inner` lock so two concurrent submits can't both pass;
+  the decrement runs once after the await block (every terminal path).
+- **`None` = unlimited (default).** Existing constructors leave the quota
+  unset, so fixtures/Phase-1 paths are unaffected; the binary/tests opt in
+  via `with_tenant_quota`.
+- **Max-concurrent first.** Cheapest quota to enforce (a gauge); CPU-second
+  and storage quotas need usage accounting that doesn't exist yet and are
+  deferred (ADR 0010).
+
+## §16 task 4 — DONE
+
+Across I1–I17 (+ ADRs 0008/0009/0010): worker registry & heartbeat
+eviction → constraint matching & admission → multi-worker dispatch with
+`SimpleFifo`/`BinPacking` → global queue + leases (crash reassignment,
+expiry reaper, heartbeat renewal) → per-tenant virtual-time fair queuing →
+max-concurrent quotas. Both task-4 DoD items demonstrated: worker-crash
+recovery and two-tenant fair share.
+
+**Remaining Phase 4:** §16 task 8 (auth — mTLS worker↔control TLS flags
+exist; client tokens/mTLS verification to add) and the
+Bazel-compatibility test. The latter needs a real `bazel` client driving a
+runnable cluster end-to-end — likely **not** feasible in the WSL2/no-bazel
+dev env and a substantial lift; assess + surface to the owner before
+attempting. Then the Phase 4 exit-criteria wrap-up (`docs/plan.md` §11).
