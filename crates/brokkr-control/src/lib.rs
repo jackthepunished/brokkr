@@ -17,7 +17,7 @@ pub mod scheduling;
 pub mod services;
 pub mod worker_service;
 
-pub use auth::{AuthError, Authenticator, JwtAuth};
+pub use auth::{auth_interceptor, AuthError, Authenticator, JwtAuth};
 pub use fairqueue::FairQueue;
 pub use lease::LeaseTable;
 pub use matching::{eligible_workers, labels_satisfy_platform, worker_satisfies};

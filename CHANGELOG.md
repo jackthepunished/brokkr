@@ -827,3 +827,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transitive `time`/`simple_asn1` were pinned down (`simple_asn1` 0.6.2,
   `time` 0.3.36) to stay within MSRV 1.85 (newer `time` requires 1.88);
   lockfile-only, scoped to this dependency.
+- `brokkr-control` auth wired into the server (ADR 0011, completes the §16
+  task 8 client-auth path). `auth_interceptor` is a tonic interceptor that
+  validates the `authorization: Bearer` JWT and injects the authoritative
+  `TenantId` into request extensions; it guards the client-facing services
+  (CAS, ActionCache, Capabilities, Execution) while the internal
+  `WorkerService` stays mTLS-authenticated. A missing/invalid token →
+  `UNAUTHENTICATED` (code 16). The `Execution` handler now prefers the
+  injected tenant over the `x-brokkr-tenant` header (closing the ADR-0010
+  spoofing gap). `brokkr-control` gains `--auth-jwt-hmac-secret-file` /
+  `--auth-jwt-rsa-pem-file` / `--auth-jwt-issuer` / `--auth-jwt-audience` /
+  `--auth-jwt-tenant-claim` flags (via `Args::authenticator`); with no key
+  configured it runs open-mode with a loud `CLIENT AUTH DISABLED` warning
+  (mirrors the TLS posture). Worker↔control mTLS is enforced by tonic when
+  `--tls-client-ca` is set (client certs required). Three interceptor unit
+  tests + a 3-case gRPC integration test (`tests/auth.rs`: no token /
+  invalid token rejected, valid token accepted). Live OIDC/JWKS-URL
+  discovery remains a follow-up.

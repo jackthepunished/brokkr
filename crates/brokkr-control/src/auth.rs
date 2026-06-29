@@ -14,9 +14,12 @@
 //! public key). Live OIDC/JWKS-URL discovery is a deferred follow-up — see ADR
 //! 0011.
 
+use std::sync::Arc;
+
 use brokkr_common::{IdError, TenantId};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use thiserror::Error;
+use tonic::{Request, Status};
 
 /// Why a request failed authentication.
 #[derive(Debug, Error)]
@@ -132,6 +135,45 @@ impl Authenticator {
     }
 }
 
+/// Strip the `Bearer ` / `bearer ` prefix from an `authorization` value.
+fn strip_bearer(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+}
+
+/// Build a tonic interceptor that authenticates the `authorization: Bearer`
+/// token against `auth` and, on success, injects the authoritative
+/// [`TenantId`] into the request's extensions (the handler then prefers it over
+/// the `x-brokkr-tenant` header).
+///
+/// - Auth enabled + missing/invalid token → `UNAUTHENTICATED` (the request
+///   never reaches the handler).
+/// - Auth enabled + valid token → request passes with the tenant in extensions.
+/// - Open mode (`Disabled`) → request passes unchanged (tenant from header).
+///
+/// Apply it only to the client-facing services; the internal `WorkerService`
+/// is authenticated by mTLS instead.
+pub fn auth_interceptor(
+    auth: Arc<Authenticator>,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone {
+    move |mut req: Request<()>| {
+        let bearer = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(strip_bearer);
+        match auth.authenticate(bearer) {
+            Ok(Some(tenant)) => {
+                req.extensions_mut().insert(tenant);
+                Ok(req)
+            }
+            Ok(None) => Ok(req),
+            Err(e) => Err(Status::unauthenticated(e.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
 mod tests {
@@ -236,5 +278,47 @@ mod tests {
         let tok = hs256(secret, json!({ "tenant": "team-x", "exp": FAR_FUTURE }));
         let tenant = auth.authenticate(Some(&tok)).unwrap().unwrap();
         assert_eq!(tenant.as_str(), "team-x");
+    }
+
+    fn request_with_auth(value: Option<&str>) -> Request<()> {
+        let mut req = Request::new(());
+        if let Some(v) = value {
+            req.metadata_mut()
+                .insert("authorization", v.parse().unwrap());
+        }
+        req
+    }
+
+    #[test]
+    fn interceptor_injects_tenant_for_valid_token() {
+        let secret = b"s";
+        let auth = Arc::new(Authenticator::Jwt(Box::new(JwtAuth::hmac(
+            secret, "tenant",
+        ))));
+        let tok = hs256(secret, json!({ "tenant": "team-y", "exp": FAR_FUTURE }));
+        let mut interceptor = auth_interceptor(auth);
+        let req = interceptor(request_with_auth(Some(&format!("Bearer {tok}")))).unwrap();
+        let tenant = req.extensions().get::<TenantId>().unwrap();
+        assert_eq!(tenant.as_str(), "team-y");
+    }
+
+    #[test]
+    fn interceptor_rejects_missing_and_invalid_tokens() {
+        let auth = Arc::new(Authenticator::Jwt(Box::new(JwtAuth::hmac(b"s", "tenant"))));
+        let mut interceptor = auth_interceptor(auth);
+        // No authorization header.
+        let err = interceptor(request_with_auth(None)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        // Garbage token.
+        let err = interceptor(request_with_auth(Some("Bearer not-a-jwt"))).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn interceptor_open_mode_passes_through_without_tenant() {
+        let auth = Arc::new(Authenticator::Disabled);
+        let mut interceptor = auth_interceptor(auth);
+        let req = interceptor(request_with_auth(None)).unwrap();
+        assert!(req.extensions().get::<TenantId>().is_none());
     }
 }
