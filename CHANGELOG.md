@@ -844,6 +844,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests + a 3-case gRPC integration test (`tests/auth.rs`: no token /
   invalid token rejected, valid token accepted). Live OIDC/JWKS-URL
   discovery remains a follow-up.
+- `docs/journal/phase-4.md` — Phase 4 wrap-up + exit-criteria review
+  (`docs/plan.md` §11): shipped capabilities by task, the §16 DoD status
+  (fair-share ✅, crash-recovery ✅, Bazel-compat ❌ tracked gap), the
+  exit-criteria assessment, the deferred backlog, and a retrospective.
+  Phase 4 is complete except the Bazel-compatibility DoD (tracked gap —
+  needs a real `bazel` client + a runnable multi-process cluster).
 - `docs/operations/running-a-cluster.md` + `scripts/run-cluster.sh` — how
   to run a real two-process Brokkr cluster (`brokkr-control` +
   `brokkr-worker`) and submit a job with `brokk run`, plus TLS/auth notes.
