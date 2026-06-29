@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use brokkr_cas::{RedbActionCache, RedbCas};
 use brokkr_control::registry::WorkerRegistry;
 use brokkr_control::{
-    spawn_eviction_task, spawn_lease_reaper, ActionCacheService, CapabilitiesService, CasService,
-    ExecutionService, Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
+    auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
+    CapabilitiesService, CasService, ExecutionService, JwtAuth, Scheduler, SharedWorkerRegistry,
+    WorkerServiceImpl,
 };
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
@@ -48,6 +49,28 @@ struct Args {
     /// CA certificate for verifying client certificates (mTLS).
     #[arg(long, requires_all = ["tls_cert", "tls_key"])]
     tls_client_ca: Option<PathBuf>,
+
+    /// File holding the HMAC secret for validating client JWT bearer tokens
+    /// (HS256). Mutually exclusive with `--auth-jwt-rsa-pem-file`.
+    #[arg(long)]
+    auth_jwt_hmac_secret_file: Option<PathBuf>,
+
+    /// File holding the RSA public key (PEM) for validating client JWT bearer
+    /// tokens (RS256). Mutually exclusive with `--auth-jwt-hmac-secret-file`.
+    #[arg(long)]
+    auth_jwt_rsa_pem_file: Option<PathBuf>,
+
+    /// Required JWT issuer (`iss`), if set.
+    #[arg(long)]
+    auth_jwt_issuer: Option<String>,
+
+    /// Required JWT audience (`aud`), if set.
+    #[arg(long)]
+    auth_jwt_audience: Option<String>,
+
+    /// JWT claim that carries the tenant id.
+    #[arg(long, default_value = "tenant")]
+    auth_jwt_tenant_claim: String,
 }
 
 impl Args {
@@ -80,6 +103,40 @@ impl Args {
         }
 
         Ok(Some(cfg))
+    }
+
+    /// Build the client [`Authenticator`] from the `--auth-jwt-*` arguments.
+    /// With no key source configured this is `Disabled` (open mode); the caller
+    /// warns loudly in that case.
+    fn authenticator(&self) -> Result<Authenticator> {
+        let claim = self.auth_jwt_tenant_claim.clone();
+        let jwt = match (&self.auth_jwt_hmac_secret_file, &self.auth_jwt_rsa_pem_file) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "provide only one of --auth-jwt-hmac-secret-file / --auth-jwt-rsa-pem-file"
+            ),
+            (Some(path), None) => {
+                let secret = std::fs::read(path).context("reading auth HMAC secret file")?;
+                Some(JwtAuth::hmac(&secret, claim))
+            }
+            (None, Some(path)) => {
+                let pem = std::fs::read(path).context("reading auth RSA PEM file")?;
+                Some(JwtAuth::rsa_pem(&pem, claim).map_err(|e| anyhow::anyhow!("{e}"))?)
+            }
+            (None, None) => None,
+        };
+        let auth = match jwt {
+            Some(mut jwt) => {
+                if let Some(iss) = &self.auth_jwt_issuer {
+                    jwt = jwt.with_issuer(iss);
+                }
+                if let Some(aud) = &self.auth_jwt_audience {
+                    jwt = jwt.with_audience(aud);
+                }
+                Authenticator::Jwt(Box::new(jwt))
+            }
+            None => Authenticator::Disabled,
+        };
+        Ok(auth)
     }
 }
 
@@ -120,6 +177,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Client authentication (ADR 0011). Open mode (no JWT key configured)
+    // warns loudly, like the TLS-disabled posture.
+    let auth = Arc::new(args.authenticator()?);
+    if auth.is_enabled() {
+        tracing::warn!("CLIENT AUTH ENABLED — JWT bearer required on client RPCs");
+    } else {
+        tracing::warn!("CLIENT AUTH DISABLED — NOT FOR PRODUCTION USE");
+    }
+
     tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, "brokkr-control starting");
 
     let worker_service =
@@ -137,15 +203,26 @@ async fn main() -> Result<()> {
     if let Some(tls_cfg) = tls_cfg {
         server = server.tls_config(tls_cfg)?;
     }
+    // Client-facing services require client auth (the interceptor injects the
+    // authoritative tenant). The internal WorkerService is mTLS-authenticated,
+    // not token-gated.
     server
-        .add_service(ContentAddressableStorageServer::new(CasService::new(cas)))
-        .add_service(ActionCacheServer::new(ActionCacheService::new(
-            action_cache,
-        )))
-        .add_service(CapabilitiesServer::new(CapabilitiesService))
-        .add_service(ExecutionServer::new(ExecutionService::new(
-            scheduler.clone(),
-        )))
+        .add_service(ContentAddressableStorageServer::with_interceptor(
+            CasService::new(cas),
+            auth_interceptor(auth.clone()),
+        ))
+        .add_service(ActionCacheServer::with_interceptor(
+            ActionCacheService::new(action_cache),
+            auth_interceptor(auth.clone()),
+        ))
+        .add_service(CapabilitiesServer::with_interceptor(
+            CapabilitiesService,
+            auth_interceptor(auth.clone()),
+        ))
+        .add_service(ExecutionServer::with_interceptor(
+            ExecutionService::new(scheduler.clone()),
+            auth_interceptor(auth.clone()),
+        ))
         .add_service(WorkerServiceServer::new(worker_service))
         .serve(args.listen)
         .await

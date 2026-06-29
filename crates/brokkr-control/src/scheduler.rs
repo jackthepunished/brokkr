@@ -324,7 +324,7 @@ impl Scheduler {
 
     /// Deregister a worker whose stream closed. Any job it currently holds is
     /// requeued for reassignment to another worker (the §16 crash-recovery
-    /// path), bounded by [`MAX_ATTEMPTS`]; then a dispatch is attempted.
+    /// path), bounded by `MAX_ATTEMPTS`; then a dispatch is attempted.
     pub async fn disconnect_worker(self: &Arc<Self>, worker_id: &WorkerId) {
         let (requeued, give_up) = {
             let mut inner = self.inner.lock().await;
@@ -379,7 +379,7 @@ impl Scheduler {
 
     /// Fail each job in `job_ids` by dropping its result waiter (its `rx` then
     /// errors → `execute` returns an error). Used when a job exceeds
-    /// [`MAX_ATTEMPTS`] reassignments.
+    /// `MAX_ATTEMPTS` reassignments.
     async fn fail_jobs(&self, job_ids: Vec<JobId>) {
         for job_id in job_ids {
             self.waiters.lock().await.remove(&job_id);

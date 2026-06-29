@@ -54,7 +54,13 @@ impl ExecSvc for ExecutionService {
         &self,
         request: Request<rapi::ExecuteRequest>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
-        let tenant = tenant_from_metadata(request.metadata());
+        // Prefer the authoritative tenant injected by the auth interceptor
+        // (ADR 0011); fall back to the client-asserted header in open mode.
+        let tenant = request
+            .extensions()
+            .get::<TenantId>()
+            .cloned()
+            .unwrap_or_else(|| tenant_from_metadata(request.metadata()));
         let req = request.into_inner();
         let action_digest_proto = req
             .action_digest

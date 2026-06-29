@@ -839,3 +839,51 @@ authoritative `TenantId` into request extensions (rejecting with
 binary flags (key/secret, iss/aud, claim) with the open-mode startup
 warning. Worker↔control mTLS enforcement. Then the Bazel-compat assessment
 + Phase 4 exit-criteria wrap-up.
+
+## I19 — auth wired into the server (§16 task 8 — client auth COMPLETE)
+
+- **Date:** 2026-06-29
+- **Affected crate:** `brokkr-control`
+- **Outcome:** Client auth is enforced end-to-end. `auth_interceptor` (a
+  tonic interceptor) validates the `Bearer` JWT and injects the
+  authoritative `TenantId`; it guards the four client-facing services,
+  while `WorkerService` stays mTLS-only. `Execution` prefers the injected
+  tenant over the header. Binary `--auth-jwt-*` flags build the
+  `Authenticator`; open-mode warns loudly. 83 lib tests + a 3-case gRPC
+  integration test (`tests/auth.rs`).
+
+### Decisions
+
+- **Per-service `with_interceptor`, not a global layer.** Lets the
+  internal `WorkerService` opt out (it's mTLS-authed, not token-gated)
+  while every client-facing service is gated. The interceptor closure
+  captures `Arc<Authenticator>` (so it's `Clone`, as tonic requires).
+- **Tenant via request extensions.** The interceptor inserts the
+  authenticated `TenantId` into the request's extensions; the handler
+  reads it back and falls back to the header only in open mode. Keeps the
+  authoritative-tenant logic out of every handler.
+- **mTLS needs no new code.** tonic's `ServerTlsConfig::client_ca_root`
+  (already wired to `--tls-client-ca`) requires clients present a cert
+  signed by that CA — so worker↔control mTLS is enforced by configuring
+  the flag; documented rather than re-implemented.
+- **Integration test via `Capabilities`.** Picked the lightweight
+  `Capabilities` RPC (returns immediately, no scheduler/worker) to test
+  the interceptor at the gRPC layer without a full cluster — proves
+  no-token / bad-token → `UNAUTHENTICATED` and valid-token → `Ok`.
+
+### §16 task 8 status
+
+Client auth (JWT bearer, tenant from claim, authoritative) + worker mTLS
+enforcement are done. **Deferred:** live OIDC/JWKS-URL discovery + key
+rotation (needs an HTTP client; static/configured keys cover the core);
+deriving a worker identity from its client cert.
+
+### Remaining Phase 4
+
+- **Bazel-compatibility test** (§16 DoD "run a real `bazel` build"):
+  needs a `bazel` client + a runnable two-process cluster + REAPI
+  conformance closed. **Not feasible in this WSL2/no-bazel dev env** — to
+  be recorded as a tracked Phase-4 gap rather than attempted here
+  (stop-and-ask before any attempt).
+- **Phase 4 exit-criteria review** (`docs/plan.md` §11) + journal
+  retrospective: the next doc-focused increment.
