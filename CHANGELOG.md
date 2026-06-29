@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Reviewed the seccomp `socket` / `socketpair` allowance (issue #69) and
+  replaced the terse "netns blocks egress" comment with the full
+  rationale: the action's network namespace scopes abstract `AF_UNIX`
+  sockets (and blocks IP), the mount namespace hides host pathname
+  sockets, and `socketpair` is intra-process — so `SCM_RIGHTS` cannot
+  smuggle fds across the sandbox boundary. No behavioural change;
+  `socketpair` stays allowed because removing it would break legitimate
+  in-sandbox IPC for no security gain.
+
 ### Fixed
 - `brokkr-sandbox` host runner no longer swallows a panicked or
   cancelled stdout/stderr capture task. `JoinError` was discarded by
@@ -14,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no signal to the operator (issue #68). The join is now handled
   explicitly: on error it logs a `warn` naming the affected stream and
   falls back to an empty buffer.
+- `brokkr-worker` and `brokkr-sandbox` now bound how much of an action's
+  stdout/stderr they buffer. The worker's plain runner used
+  `Command::output()` and the sandbox host drained the runner pipes with
+  an unbounded `read_to_end`, so an action writing gigabytes to stdout
+  could OOM the worker (issue #67). Both paths now cap each stream at
+  50 MiB (`read_capped`), draining and dropping the excess with a `warn`
+  rather than buffering it.
 - `brokkr-sandbox::runner::seccomp` compiled with a stray `return`
   inside a single-arm `cfg` block which a newer clippy flagged as
   `needless_return`; replaced with bare expressions so all four
@@ -706,3 +723,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `BinPacking(2)`). `LocalityAware` is deferred — it needs the
   action's input-root passed into `Strategy::choose` (a trait-signature
   change) plus per-worker locality state, so it gets its own increment.
+- ADR 0009 — job leases, a global pending queue, and crash reassignment
+  (the §16 DoD "worker crash mid-job → job retried on another worker").
+  `docs/architecture/0009-leases-and-fair-scheduling.md`.
+- `brokkr-control::lease::LeaseTable<P>` (plan §16 task 4 foundation):
+  tracks active job leases (`JobId → {worker, deadline, payload}`),
+  generic over the re-dispatch payload and clock-injected. `complete`
+  resolves a lease on report (returns the payload, or `None` for a late
+  report to discard); `take_expired(now)` and `take_worker(id)` remove
+  and return the `(job_id, payload)` pairs to requeue on lease expiry /
+  worker disconnect. Pure bookkeeping; the dispatcher wiring that drives
+  it is the next increment. Seven unit tests.
+- `brokkr-control::Scheduler` rewritten around a global pending queue +
+  job leases + an event-driven dispatcher (ADR 0009), delivering the §16
+  DoD "worker crash mid-job → job retried on another worker". `execute`
+  now enqueues (the result waiter survives retries) and awaits under the
+  overall timeout; `try_dispatch` leases each queued job to an idle,
+  eligible, connected worker (capacity 1) chosen by the `Strategy`;
+  `report` completes the lease, wakes the waiter, and re-dispatches.
+  **Worker disconnect requeues the worker's in-flight job for reassignment
+  to another worker** (the crash-recovery path), bounded by
+  `MAX_ATTEMPTS = 5`; a late/duplicate report for a job with no active
+  lease is discarded (at-least-once, safe under determinism). Connect /
+  disconnect are now `Scheduler::connect_worker` / `disconnect_worker`
+  (the single `take_receiver` queue and `connected_workers()` accessor are
+  gone); `WorkerService.Stream` calls them. Dispatch state (connected
+  workers + pending queue + leases) lives under one mutex, so there is no
+  inter-lock ordering to get wrong. New scheduler test:
+  `disconnect_reassigns_in_flight_job_to_another_worker` (the DoD).
+  NOTE: under capacity-1, `BinPacking` spreads exactly like `SimpleFifo`
+  (a worker can't hold a second concurrent job); a per-worker-capacity
+  knob to re-activate packing is a follow-up. Lease-*expiry* reassignment
+  (slow worker, vs. disconnect) is also a follow-up; crash recovery via
+  disconnect is live.
+- `brokkr-control` lease-expiry reaper: `Scheduler::reap_expired_leases`
+  (and the test seam `reap_expired_at(now)`) requeues jobs whose lease has
+  expired — a worker that is still connected but went silent — and
+  re-dispatches them, bounded by `MAX_ATTEMPTS`. `spawn_lease_reaper`
+  drives it on an interval (wired into the `brokkr-control` binary at half
+  the lease window); a zero interval disables it. Jobs now carry a
+  per-attempt `lease_duration` capped at `min(action timeout,
+  DEFAULT_LEASE_DURATION = 60s)`, so a hung worker is retried before the
+  caller's deadline. The shared requeue logic (disconnect + expiry) is
+  factored into `Inner::requeue_taken`. One scheduler test
+  (`lease_expiry_requeues_and_redispatches_job`). NOTE: an
+  expired-but-connected worker is not yet excluded from the re-dispatch
+  (it may be re-picked); "reassign strictly elsewhere" needs lease renewal
+  / tried-worker tracking — a follow-up.
+- `brokkr-control` lease renewal via heartbeat: each worker heartbeat now
+  renews the leases that worker holds (`Scheduler::renew_worker_leases` →
+  `LeaseTable::renew_worker`), so a lease expires only when a worker stops
+  heartbeating (dead / partitioned) rather than merely running a long
+  action. This aligns lease lifetime with heartbeat liveness and resolves
+  the I13 caveat: a live, heartbeating worker never has its lease expire,
+  so it can't be re-picked; only a genuinely silent worker's job is
+  reassigned (and that worker is also evicted from the registry). No proto
+  or worker-side change — it reuses the existing `Heartbeat` RPC. Two
+  `LeaseTable::renew_worker` unit tests.
+- ADR 0010 — tenants + weighted fair scheduling: tenant id from a gRPC
+  metadata header (`x-brokkr-tenant`, default fallback) and virtual-time
+  Start-time Fair Queuing over per-tenant-tagged pending jobs.
+  `docs/architecture/0010-tenants-and-fair-scheduling.md`.
+- `brokkr_common::TenantId` — tenant identifier newtype (`Default` =
+  `"default"`, `DEFAULT_TENANT`), same validation as the other id
+  newtypes. Two unit tests.
+- `brokkr-control::fairqueue::FairQueue<J>` (plan §16 task 4 foundation):
+  a pure, generic Start-time Fair Queue. `push(tenant, job)` assigns an
+  SFQ virtual start tag (`start = max(virtual_time, last_finish[tenant])`,
+  tenant clock += `cost/weight`, unit cost); `slots()` + `take(index)` let
+  the scheduler dequeue the lowest-start-tag *dispatchable* job (respecting
+  worker eligibility); `pop()` / `set_weight` / `retain` round it out.
+  Seven unit tests (single-tenant FIFO, equal-tenant interleave,
+  weight-proportional service, eligibility-filtered take, idle-tenant
+  no-hoard). Wiring into the scheduler is the next increment.
+- `brokkr-control` fair scheduling wired end-to-end (ADR 0010, the §16
+  "two tenants get fair share" DoD): the scheduler's pending queue is now
+  the per-tenant `FairQueue`. The `Execution` service reads the tenant from
+  the `x-brokkr-tenant` request metadata header (default `"default"`) and
+  threads a `TenantId` into `Scheduler::execute` and each `PendingJob`;
+  `try_dispatch` dequeues the lowest-virtual-start-tag job that has an idle
+  eligible worker; requeue (disconnect / lease expiry) and timeout cleanup
+  re-tag / retain through the fair queue. New scheduler test
+  `two_tenants_share_a_worker_fairly` — two tenants' jobs interleave on one
+  worker rather than draining one-tenant-first. Per-tenant quotas
+  (max-concurrent) are the next increment.
+- `brokkr-control` per-tenant max-concurrent-jobs quota (ADR 0010,
+  completes §16 task 4). `Scheduler::with_tenant_quota` sets an optional
+  per-tenant limit (`None` = unlimited); `execute` counts a tenant's
+  in-flight jobs (queued + leased) and rejects admission over the limit
+  with the new typed `ExecutionError::QuotaExceeded(limit)` → gRPC
+  `RESOURCE_EXHAUSTED` (code 8), before the job is enqueued. The count is
+  incremented under the same lock as the enqueue (so concurrent submits
+  can't both slip past) and decremented when the `execute` call goes
+  terminal (success / timeout / failure), so completing a job frees the
+  slot. Two scheduler tests (over-quota rejects; completion frees the
+  slot). CPU-seconds/day and storage quotas remain follow-ups.
+- ADR 0011 — authentication: OIDC/JWT bearer for clients (tenant from a
+  claim, authoritative over the `x-brokkr-tenant` header), worker↔control
+  mTLS, open-mode-with-warning when unconfigured.
+  `docs/architecture/0011-auth.md`.
+- `brokkr-control::auth` (plan §16 task 8): JWT client-auth core.
+  `JwtAuth` validates a bearer token's signature (HS256 / RS256), `exp`,
+  and optional `iss`/`aud`, and reads the tenant from a configured claim;
+  `Authenticator` is either `Disabled` (open mode → tenant from header) or
+  `Jwt` (token's tenant claim is authoritative). Eight unit tests. The
+  server interceptor wiring is the next increment.
+- New dependency `jsonwebtoken` (9; MIT) for JWT validation — crypto via
+  `ring`, already in-tree through rustls/tonic TLS; no network I/O. Its
+  transitive `time`/`simple_asn1` were pinned down (`simple_asn1` 0.6.2,
+  `time` 0.3.36) to stay within MSRV 1.85 (newer `time` requires 1.88);
+  lockfile-only, scoped to this dependency.
+- `brokkr-control` auth wired into the server (ADR 0011, completes the §16
+  task 8 client-auth path). `auth_interceptor` is a tonic interceptor that
+  validates the `authorization: Bearer` JWT and injects the authoritative
+  `TenantId` into request extensions; it guards the client-facing services
+  (CAS, ActionCache, Capabilities, Execution) while the internal
+  `WorkerService` stays mTLS-authenticated. A missing/invalid token →
+  `UNAUTHENTICATED` (code 16). The `Execution` handler now prefers the
+  injected tenant over the `x-brokkr-tenant` header (closing the ADR-0010
+  spoofing gap). `brokkr-control` gains `--auth-jwt-hmac-secret-file` /
+  `--auth-jwt-rsa-pem-file` / `--auth-jwt-issuer` / `--auth-jwt-audience` /
+  `--auth-jwt-tenant-claim` flags (via `Args::authenticator`); with no key
+  configured it runs open-mode with a loud `CLIENT AUTH DISABLED` warning
+  (mirrors the TLS posture). Worker↔control mTLS is enforced by tonic when
+  `--tls-client-ca` is set (client certs required). Three interceptor unit
+  tests + a 3-case gRPC integration test (`tests/auth.rs`: no token /
+  invalid token rejected, valid token accepted). Live OIDC/JWKS-URL
+  discovery remains a follow-up.
+- `docs/journal/phase-4.md` — Phase 4 wrap-up + exit-criteria review
+  (`docs/plan.md` §11): shipped capabilities by task, the §16 DoD status
+  (fair-share ✅, crash-recovery ✅, Bazel-compat ❌ tracked gap), the
+  exit-criteria assessment, the deferred backlog, and a retrospective.
+  Phase 4 is complete except the Bazel-compatibility DoD (tracked gap —
+  needs a real `bazel` client + a runnable multi-process cluster).

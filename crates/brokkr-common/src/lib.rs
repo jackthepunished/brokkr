@@ -9,4 +9,4 @@ pub mod digest;
 pub mod ids;
 
 pub use digest::{Digest, DigestError};
-pub use ids::{IdError, JobId, WorkerId};
+pub use ids::{IdError, JobId, TenantId, WorkerId, DEFAULT_TENANT};
