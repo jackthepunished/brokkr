@@ -133,8 +133,8 @@ pub(super) async fn run_action(
         step: "take stderr",
         source: io::Error::other("child stderr already taken"),
     })?;
-    let stdout_task = tokio::spawn(read_to_end(stdout));
-    let stderr_task = tokio::spawn(read_to_end(stderr));
+    let stdout_task = tokio::spawn(read_capped(stdout, MAX_CAPTURED_OUTPUT_BYTES, "stdout"));
+    let stderr_task = tokio::spawn(read_capped(stderr, MAX_CAPTURED_OUTPUT_BYTES, "stderr"));
 
     // Write the JSON payload. EPIPE is tolerated — see M2 notes for why.
     let write_err = {
@@ -260,8 +260,44 @@ pub(super) async fn run_action(
     })
 }
 
-async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Vec<u8> {
+/// Maximum bytes captured from a single runner output stream before
+/// truncation.
+///
+/// A sandboxed action can write unbounded data to stdout/stderr; buffering it
+/// all on the host is an OOM vector (issue #67). Past the cap we keep draining
+/// the pipe (so the runner doesn't block on a full pipe) but discard the rest.
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
+
+/// Read from `r`, retaining at most `cap` bytes; drain and drop the excess
+/// with a one-time `warn`.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    cap: usize,
+    stream: &str,
+) -> Vec<u8> {
     let mut buf = Vec::new();
-    let _ = r.read_to_end(&mut buf).await;
+    let mut chunk = [0u8; 8192];
+    let mut warned = false;
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = (cap - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if buf.len() >= cap && !warned {
+                        warned = true;
+                        tracing::warn!(
+                            stream,
+                            cap,
+                            "captured runner output exceeded cap; truncating and draining the rest"
+                        );
+                    }
+                }
+                // Past the cap we keep looping to drain `r` without buffering.
+            }
+            Err(_) => break,
+        }
+    }
     buf
 }
