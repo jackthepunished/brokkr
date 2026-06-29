@@ -887,3 +887,110 @@ deriving a worker identity from its client cert.
   (stop-and-ask before any attempt).
 - **Phase 4 exit-criteria review** (`docs/plan.md` §11) + journal
   retrospective: the next doc-focused increment.
+
+## Phase 4 wrap-up & exit-criteria review
+
+Phase 4 turned the Phase-1 single-worker stub into a fault-tolerant,
+multi-tenant compute grid. Shipped across PRs #98–#116 and four ADRs.
+
+### What shipped (by §16 task)
+
+| Task | Capability | PRs |
+|------|------------|-----|
+| 1 | Worker registry: capabilities, heartbeat, eviction (`registry`, `Heartbeat` RPC, reaper) | #98 |
+| 2 | Constraint matching (`matching`) + platform admission control | #99 |
+| 3 | Multi-worker dispatch + pluggable `Strategy` (`SimpleFifo`, `BinPacking`) | #100, #101 |
+| 4a | Job leases: global queue, crash reassignment, expiry reaper, heartbeat renewal | #103, #107, #110, #111 |
+| 4b | Tenants + virtual-time fair queuing (`fairqueue`, SFQ) | #112, #113 |
+| 4c | Per-tenant max-concurrent quotas (`RESOURCE_EXHAUSTED`) | #114 |
+| 8 | Auth: OIDC/JWT client bearer (tenant authoritative) + worker mTLS | #115, #116 |
+
+ADRs: **0008** multi-worker scheduling, **0009** leases + global queue,
+**0010** tenants + fair scheduling, **0011** auth.
+
+### §16 Definition of Done
+
+- ✅ **Two tenants running concurrently each get fair share** — SFQ fair
+  queue; `two_tenants_share_a_worker_fairly`.
+- ✅ **Worker crash mid-job → job retried on another worker, completes** —
+  lease + disconnect requeue; `disconnect_reassigns_in_flight_job_to_another_worker`.
+- ❌ **A real `bazel build` against `brokk` succeeds** — **TRACKED GAP**
+  (see below).
+
+### Exit criteria (`docs/plan.md` §11)
+
+1. **All public APIs documented with rustdoc** — ✅ `brokkr-control` lib has
+   `#![deny(missing_docs)]`; CI `cargo doc -D warnings` is green (the
+   private-intra-doc-link slip was fixed in #116).
+2. **Unit tests ≥80% on logic-heavy code** — ✅ for the logic-heavy modules:
+   `registry`, `matching`, `scheduling` (strategies + connected set),
+   `lease`, `fairqueue` (SFQ), and `auth` are each unit-tested across their
+   branches; the scheduler's dispatch/lease/quota paths have focused tests.
+   (No line-coverage tool is wired into CI — claim is by inspection, not a
+   measured number; wiring `cargo-llvm-cov` is a deferred nicety.)
+3. **≥1 integration test per capability, end-to-end** — ✅ registry/heartbeat
+   (`membership.rs`, handler tests), dispatch + cache (`end_to_end.rs`,
+   `phase1_dod.rs` 200-RPC soak through the new dispatch), crash reassignment
+   + fair share + quotas (scheduler-level integration tests), auth
+   (`tests/auth.rs`, gRPC-level interceptor gating). All green on Linux CI.
+4. **Tracing spans cover new code paths** — ✅ spans on the new RPC handlers
+   (`register`, `heartbeat`, `execution::execute`, `control::dispatch`) and
+   `tokio::spawn`s use `.in_current_span()`.
+5. **Retrospective written** — ✅ this document.
+
+### Tracked gaps (not done)
+
+- **Bazel-compatibility test** (§16 task 9 / DoD). Needs a real `bazel`
+  client driving `brokk` as the remote executor, a runnable two-process
+  cluster (control + worker binaries), and any remaining REAPI conformance
+  closed. Not attempted: the dev environment has no Bazel and the cluster is
+  in-process-only today. **Owner decision needed** on when/where to run it.
+- **Runnable multi-node cluster binary.** The control plane binary exists,
+  but multi-worker dispatch is exercised via in-process fixtures; a real
+  two-process (or N-worker) gRPC integration test + a documented
+  cluster-bringup is deferred.
+
+### Deferred (intentional, behind seams already in place)
+
+`LocalityAware` strategy (needs a `Strategy::choose` signature change for
+input-root locality); per-worker capacity > 1 (re-activates `BinPacking`'s
+packing — under capacity-1 it equals `SimpleFifo`); soft/preferred platform
+constraints (needs a Brokkr convention/ADR); CPU-seconds-per-day + storage
+quotas (need usage accounting); live OIDC/JWKS-URL discovery + key rotation
+(static keys cover the core); worker re-register on `Heartbeat known=false`
+(`TODO(brokkr-410)`); SDK setting `x-brokkr-tenant` + bearer token; CLI flags
+for strategy / tenant weights / quotas.
+
+### What surprised / what was learned
+
+- **Capacity-1 leases quietly neutered `BinPacking`.** Introducing
+  one-lease-per-worker (ADR 0009) meant every candidate is idle-or-excluded,
+  so `BinPacking` and `SimpleFifo` coincide. Spreading now emerges from
+  *busy-exclusion*, not load counts. Pinned by a test and documented; a
+  per-worker-capacity knob is the lever to make `BinPacking` meaningful
+  again. Lesson: a later increment can silently degrade an earlier one's
+  value — write the test that asserts the degradation so it's deliberate.
+- **Lease lifetime = worker liveness was the unlock.** Tying lease renewal
+  to the existing heartbeat (I14) removed a whole class of problems (slow vs
+  dead worker, re-picking a just-expired worker) with *no* new RPC or
+  worker-side code — the cleanest change of the phase.
+- **One mutex over `{connected, pending, leases}`** made the dispatch core
+  tractable. The earlier instinct to split locks per concern would have
+  created an ordering minefield; a single `Inner` lock with the async send
+  done *outside* it was simpler and correct.
+- **The advisory DB moves under you.** `cargo deny` went red on `main`
+  mid-phase from newly-published RUSTSEC advisories on existing deps
+  (`anyhow`, `memmap2`), and the new `jsonwebtoken` dep dragged in a `time`
+  version whose only fix needed a higher MSRV — a three-way bind between a
+  dependency, the MSRV pin, and a live advisory feed. Lesson: adding a dep
+  is also a transitive-MSRV-and-advisory decision.
+- **WSL2 is a partial oracle.** The dev host can't run the full
+  `cargo test --workspace` (sandbox seccomp arg-filter tests need a real
+  kernel; some CRLF fmt noise), so verification was per-changed-crate with
+  Linux CI as the backstop. Honest per-crate green + CI caught the rest.
+
+### Phase 4 status: **complete except the Bazel-compat DoD (tracked gap).**
+
+Next is an owner decision: close out the deferred backlog / the Bazel gap,
+or move to Phase 5 (custom Raft) — which `docs/plan.md` and `CLAUDE.md`
+require explicit opt-in to begin.
