@@ -50,6 +50,10 @@ hex = "0.4"
 thiserror = "1"
 anyhow = "1"
 
+# Auth (ADR 0011) — JWT bearer validation; no network I/O. Crypto backend
+# (`ring`) is already in-tree via rustls/tonic TLS.
+jsonwebtoken = "9"
+
 # IDs
 uuid = { version = "1", features = ["v4"] }
 

@@ -8,7 +8,17 @@ targets = [
 version = 2
 yanked = "deny"
 unmaintained = "none"
-ignore = ["RUSTSEC-2026-0104"]
+ignore = [
+    "RUSTSEC-2026-0104",
+    # RUSTSEC-2026-0009: DoS via stack exhaustion in `time` date parsing. We
+    # pin `time` 0.3.36 because the fix (>=0.3.47) requires rustc 1.88 > our
+    # MSRV 1.85. `time` is reached only transitively via `simple_asn1` while
+    # `jsonwebtoken` parses operator-configured RSA public keys — trusted,
+    # non-attacker-controlled input, and RSA SPKI keys carry no ASN.1 dates, so
+    # the vulnerable date-parse path is effectively unreachable here. Drop this
+    # ignore once the MSRV moves to >= 1.88 and `time` can be unpinned (ADR 0011).
+    "RUSTSEC-2026-0009",
+]
 
 [licenses]
 version = 2

@@ -632,7 +632,10 @@ const DEFAULT_ALLOW: &[&str] = &[
     "futex", "futex_waitv", "set_robust_list", "get_robust_list",
     "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
     "poll", "ppoll", "select", "pselect6",
-    "socket", "socketpair",       // intentionally allowed; netns blocks egress
+    "socket", "socketpair",       // allowed; no external endpoint reachable —
+                                  // netns scopes abstract AF_UNIX + blocks IP,
+                                  // mount ns hides host pathname sockets, and
+                                  // socketpair is intra-process (issue #69)
     "uname", "sysinfo",
     "getrandom",
     // …iterate from real workloads; every addition needs a one-line
