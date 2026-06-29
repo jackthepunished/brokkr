@@ -844,3 +844,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests + a 3-case gRPC integration test (`tests/auth.rs`: no token /
   invalid token rejected, valid token accepted). Live OIDC/JWKS-URL
   discovery remains a follow-up.
+
+### Changed
+- `README.md` refreshed to reflect reality: Phases 0–4 complete (the stale
+  copy claimed only Phase 1 done with 2/3 in flight). Updates the status
+  blurb, the "what works today" walkthrough (multi-worker dispatch, leases,
+  fair scheduling, quotas, auth + a link to the cluster bring-up guide), the
+  per-crate responsibility table (sandbox now lists seccomp + capability
+  dropping + `pivot_root`; control lists the scheduler/leases/fair-queue/auth),
+  and the roadmap table (Phase 5 = next), with the Bazel-compat DoD and S3
+  cold tier / FUSE called out as tracked gaps.
