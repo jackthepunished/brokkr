@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-sandbox IPC for no security gain.
 
 ### Fixed
+- `brokkr-control` REAPI services (`ContentAddressableStorage`,
+  `ActionCache`, `Execution`, `Capabilities`) now reject any request
+  carrying a non-empty `instance_name` with `INVALID_ARGUMENT` instead
+  of silently serving it from the single default instance. Phase 1 has
+  no multi-tenant isolation, so accepting a caller-named instance was a
+  latent cross-instance access gap (issue #72). The SDK always sends an
+  empty `instance_name`, so this is transparent to existing clients.
 - `brokkr-worker` and `brokkr-sandbox` now bound how much of an action's
   stdout/stderr they buffer. The worker's plain runner used
   `Command::output()` and the sandbox host drained the runner pipes with

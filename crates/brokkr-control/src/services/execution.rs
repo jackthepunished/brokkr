@@ -10,7 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
-use super::proto_to_digest;
+use super::{proto_to_digest, validate_instance_name};
 use crate::scheduler::{ExecutionError, Scheduler};
 
 /// Tenant from the `x-brokkr-tenant` request metadata header, defaulting when
@@ -62,6 +62,7 @@ impl ExecSvc for ExecutionService {
             .cloned()
             .unwrap_or_else(|| tenant_from_metadata(request.metadata()));
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let action_digest_proto = req
             .action_digest
             .ok_or_else(|| Status::invalid_argument("missing action_digest"))?;
