@@ -861,3 +861,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the binaries built; spawns processes). Addresses the "runnable multi-node
   binary" gap from the Phase 4 wrap-up; the Bazel-compat DoD remains a
   tracked gap.
+
+### Changed
+- `README.md` refreshed to reflect reality: Phases 0–4 complete (the stale
+  copy claimed only Phase 1 done with 2/3 in flight). Updates the status
+  blurb, the "what works today" walkthrough (multi-worker dispatch, leases,
+  fair scheduling, quotas, auth + a link to the cluster bring-up guide), the
+  per-crate responsibility table (sandbox now lists seccomp + capability
+  dropping + `pivot_root`; control lists the scheduler/leases/fair-queue/auth),
+  and the roadmap table (Phase 5 = next), with the Bazel-compat DoD and S3
+  cold tier / FUSE called out as tracked gaps.
