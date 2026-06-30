@@ -18,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-sandbox IPC for no security gain.
 
 ### Fixed
+- `brokkr-control` REAPI services (`ContentAddressableStorage`,
+  `ActionCache`, `Execution`, `Capabilities`) now reject any request
+  carrying a non-empty `instance_name` with `INVALID_ARGUMENT` instead
+  of silently serving it from the single default instance. Phase 1 has
+  no multi-tenant isolation, so accepting a caller-named instance was a
+  latent cross-instance access gap (issue #72). The SDK always sends an
+  empty `instance_name`, so this is transparent to existing clients.
+- `brokkr-sandbox` host runner no longer swallows a panicked or
+  cancelled stdout/stderr capture task. `JoinError` was discarded by
+  `unwrap_or_default()`, so a crashed pump returned empty output with
+  no signal to the operator (issue #68). The join is now handled
+  explicitly: on error it logs a `warn` naming the affected stream and
+  falls back to an empty buffer.
+- `brokkr-sdk` no longer discards the `google.rpc.Status.code` on a
+  failed execution. The streamed `Operation` error path flattened the
+  code into an `anyhow!` string, and the `ExecuteResponse.status` path
+  stringified the structured `ExecuteError` — so callers could not tell
+  `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `DEADLINE_EXCEEDED` apart for
+  retry decisions (issue #62). Both paths now propagate the structured
+  `ExecuteError::Status { code, message }`, recoverable by downcasting
+  the returned `anyhow::Error`.
 - `brokkr-control` CAS service now bounds batch request sizes at the
   service boundary. `FindMissingBlobs`, `BatchReadBlobs`, and
   `BatchUpdateBlobs` previously iterated over an unbounded request, so a
@@ -859,3 +880,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit-criteria assessment, the deferred backlog, and a retrospective.
   Phase 4 is complete except the Bazel-compatibility DoD (tracked gap —
   needs a real `bazel` client + a runnable multi-process cluster).
+- `docs/operations/running-a-cluster.md` + `scripts/run-cluster.sh` — how
+  to run a real two-process Brokkr cluster (`brokkr-control` +
+  `brokkr-worker`) and submit a job with `brokk run`, plus TLS/auth notes.
+- `brokkr-control/tests/two_process_cluster.rs` — a two-process integration
+  test that spawns the real `brokkr-control` and `brokkr-worker` binaries as
+  separate OS processes and runs a job end-to-end through the `brokk` CLI,
+  proving cross-process registration/dispatch (the in-process fixtures only
+  exercise the gRPC path within one process). `#[ignore]` by default (needs
+  the binaries built; spawns processes). Addresses the "runnable multi-node
+  binary" gap from the Phase 4 wrap-up; the Bazel-compat DoD remains a
+  tracked gap.
+
+### Changed
+- `README.md` refreshed to reflect reality: Phases 0–4 complete (the stale
+  copy claimed only Phase 1 done with 2/3 in flight). Updates the status
+  blurb, the "what works today" walkthrough (multi-worker dispatch, leases,
+  fair scheduling, quotas, auth + a link to the cluster bring-up guide), the
+  per-crate responsibility table (sandbox now lists seccomp + capability
+  dropping + `pivot_root`; control lists the scheduler/leases/fair-queue/auth),
+  and the roadmap table (Phase 5 = next), with the Bazel-compat DoD and S3
+  cold tier / FUSE called out as tracked gaps.
