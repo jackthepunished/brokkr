@@ -18,44 +18,56 @@ storage, hermetic sandboxing, scheduling, and consensus — are implemented
 from scratch as the project's educational core. There is no Docker, no
 runc, no embedded etcd, no third-party Raft.
 
-> **Status:** Phase 1 complete; Phases 2 and 3 in flight. `brokk run`
-> executes commands end-to-end across a control plane + worker pair, with
-> action-cache hits on the second invocation. The `brokkr-sandbox` runner
-> isolates actions in their own user / mount / pid / network namespaces
-> and a per-action cgroup-v2 with wall-clock + memory + pids + cpu limits
-> and OOM detection (Phase 2, M1–M6). The CAS layer has gained
-> rendezvous-hashing replica routing, a bloom-filtered
-> `find_missing_blobs` fast path, a hot-LRU + warm tiered backend,
-> quorum replication, reference-counted GC, peer repair, and tree
-> materialisation (Phase 3, M0–M6a). **Not yet production-ready.**
+> **Status:** Phases 0–4 complete. A control plane schedules jobs across many
+> workers with **platform-constraint matching**, **pluggable strategies**,
+> **fault-tolerant job leases** (a crashed worker's job is reassigned and still
+> completes), **per-tenant virtual-time fair queuing**, **per-tenant quotas**,
+> and **JWT client auth + worker mTLS**. Actions run in a from-scratch
+> `brokkr-sandbox` (user/mount/pid/net/UTS namespaces, `pivot_root`, cgroup-v2
+> limits + OOM detection, seccomp-bpf, capability dropping). The CAS layer has
+> rendezvous-hashing replica routing, a bloom-filtered `find_missing_blobs`
+> fast path, a hot-LRU + warm tiered backend, quorum replication,
+> reference-counted GC, peer repair, and tree materialisation.
+> **Phase 5 (custom Raft for HA) is next. Not yet production-ready.**
 
 ## What works today
 
+Run a real two-process cluster and submit a job (see
+[`docs/operations/running-a-cluster.md`](docs/operations/running-a-cluster.md)
+for the full guide, TLS/auth, and the `scripts/run-cluster.sh` helper):
+
 ```sh
-# Terminal 1: control plane (gRPC server, in-memory CAS + action cache).
+# Terminal 1: control plane (gRPC server, redb-backed CAS + action cache).
 cargo run -p brokkr-control -- --listen 127.0.0.1:7878 --data-dir /tmp/brokkr
 
-# Terminal 2: a worker that registers and pulls jobs.
+# Terminal 2: a worker that registers, advertises os/arch, and pulls jobs.
+# (Run this on more machines to grow the grid; jobs spread + fair-share.)
 cargo run -p brokkr-worker  -- --control http://127.0.0.1:7878
 
 # Terminal 3: submit a job.
-cargo run -p brokkr-cli -- run -- /bin/echo "hello world"
+cargo run -p brokkr-cli -- run --control http://127.0.0.1:7878 -- /bin/echo "hello world"
 # → hello world
 # → [brokk] exit=0 cache_hit=false
 
-cargo run -p brokkr-cli -- run -- /bin/echo "hello world"
+cargo run -p brokkr-cli -- run --control http://127.0.0.1:7878 -- /bin/echo "hello world"
 # → hello world
 # → [brokk] exit=0 cache_hit=true   ← served from the action cache
 ```
 
 Behind the scenes that one command:
-1. hashes a REAPI `Action` + `Command` and uploads them to the CAS,
+1. hashes a REAPI `Action` + `Command` and uploads the missing blobs to the CAS,
 2. calls `Execute`, which streams a `google.longrunning.Operation`,
-3. dispatches a `brokkr.v1.Job` to the worker over a bidi gRPC stream,
-4. spawns the process on the worker, captures stdout/stderr,
+3. the scheduler matches the action's platform to an eligible worker, picks one
+   via the active strategy, and **leases** the job to it,
+4. dispatches a `brokkr.v1.Job` over a bidi gRPC stream; the worker runs it in
+   the sandbox and captures stdout/stderr,
 5. uploads the outputs back to the CAS,
 6. records the result in the action cache (only on `exit_code == 0`),
 7. returns an `ExecuteResponse` to the client.
+
+If the worker dies mid-job, its lease is reassigned to another eligible worker
+and the job still completes. With auth enabled, clients present a JWT bearer
+token whose tenant claim drives fair scheduling and quotas.
 
 ## Architecture
 
@@ -81,12 +93,12 @@ Brokkr is a workspace of nine crates with a strict DAG dependency graph.
 
 | Crate              | Responsibility                                                                   |
 | ------------------ | -------------------------------------------------------------------------------- |
-| `brokkr-common`    | Shared `Digest` newtype, error helpers, IDs. Universal dep, kept tiny.           |
-| `brokkr-proto`     | Vendored REAPI v2 protos + internal `brokkr.v1` worker dispatch protocol.        |
-| `brokkr-cas`       | `Cas` trait, in-memory + `redb`-backed CAS, action cache.                        |
-| `brokkr-control`   | Tonic gRPC server: REAPI services + scheduler + worker stream.                   |
-| `brokkr-worker`    | Worker daemon: registers, pulls jobs, runs them, uploads outputs.                |
-| `brokkr-sandbox`   | Linux user/mount/pid/net namespaces + cgroup-v2 from scratch — no runc, no Docker (seccomp lands later in Phase 2). |
+| `brokkr-common`    | Shared `Digest` / `WorkerId` / `JobId` / `TenantId` newtypes, error helpers. Universal dep, kept tiny. |
+| `brokkr-proto`     | Vendored REAPI v2 protos + internal `brokkr.v1` worker dispatch + membership protocols. |
+| `brokkr-cas`       | `Cas` trait; in-memory + `redb` CAS + action cache; HRW ring, bloom filter, tiered backend, quorum replication, GC, peer repair, tree materialisation. |
+| `brokkr-control`   | Tonic gRPC server: REAPI services + worker registry + multi-worker scheduler (matching, strategies, leases, fair queue, quotas) + JWT/mTLS auth. |
+| `brokkr-worker`    | Worker daemon: registers, heartbeats, pulls jobs, runs them in the sandbox, uploads outputs. |
+| `brokkr-sandbox`   | Linux user/mount/pid/net/UTS namespaces + `pivot_root` + cgroup-v2 + seccomp-bpf + capability dropping, from scratch — no runc, no Docker. |
 | `brokkr-sdk`       | Ergonomic Rust client for the REAPI surface.                                     |
 | `brokkr-cli`       | The `brokk` command-line interface.                                              |
 | `brokkr-test-utils`| Internal test helpers (not published).                                           |
@@ -104,8 +116,8 @@ Brokkr aims for correctness > performance > ergonomics, in that order.
 - **No off-the-shelf Raft.** Phase 5 implements consensus from scratch.
 - **Public APIs use `bytes::Bytes`, not `Vec<u8>`.** All IDs are newtypes.
 - **CI gate**: `cargo fmt --check`, `cargo clippy --workspace
-  --all-targets -- -D warnings`, `cargo test --workspace` on Linux
-  x86_64 + aarch64.
+  --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc`, and
+  `cargo deny` on Linux x86_64 + aarch64.
 
 ## Roadmap
 
@@ -115,11 +127,15 @@ The full plan lives in [`docs/plan.md`](docs/plan.md). At a glance:
 | ----- | --------------------------- | --------------------------------------------------- |
 | 0     | Bootstrap                   | done                                                |
 | 1     | First end-to-end slice      | done                                                |
-| 2     | Hermetic Linux sandboxing   | in progress (M1–M6 done; seccomp + M7+ remaining)   |
-| 3     | Distributed CAS (sharded)   | in progress (M0–M6a done; cold tier + FUSE next)    |
-| 4     | Scheduler + multi-tenancy   | planned                                             |
-| 5     | Consensus + HA (custom Raft)| planned                                             |
-| 6+    | Web UI, FUSE inputs, RBE+   | planned                                             |
+| 2     | Hermetic Linux sandboxing   | done (namespaces, cgroups, seccomp, caps)           |
+| 3     | Distributed CAS (sharded)   | done (HRW, bloom, tiered, replication, GC, repair, tree) |
+| 4     | Scheduler + multi-tenancy   | done (dispatch, strategies, leases, fair-share, quotas, auth)¹ |
+| 5     | Consensus + HA (custom Raft)| next                                                |
+| 6+    | Web UI / operator TUI, FUSE inputs, RBE+ | planned                                |
+
+¹ Phase 4's REAPI **Bazel-compatibility** end-to-end test (a real `bazel build`
+against `brokk`) and the S3 cold tier / FUSE lazy materialisation are tracked
+gaps — see the [Phase 4 retrospective](docs/journal/phase-4.md).
 
 Phase retrospectives are committed to [`docs/journal/`](docs/journal/) at
 the close of each phase.
@@ -133,7 +149,8 @@ rustup show
 # Build everything.
 cargo build --workspace
 
-# Run the full test suite (gRPC end-to-end + sandbox smoke + CAS unit tests).
+# Run the test suite (gRPC end-to-end + sandbox + CAS + scheduler/auth tests).
+# Sandbox tests need a Linux host with unprivileged user namespaces.
 cargo test --workspace
 
 # Lint (CI runs the same).
@@ -148,11 +165,15 @@ There is also a [`justfile`](justfile) with `fmt`, `lint`, `test`, `ci`,
 
 - [`docs/plan.md`](docs/plan.md) — vision, architecture, roadmap,
   engineering practice. Single source of truth.
+- [`docs/operations/running-a-cluster.md`](docs/operations/running-a-cluster.md)
+  — run a real control + worker cluster, submit jobs, enable TLS/auth.
 - [`docs/phase-2-plan.md`](docs/phase-2-plan.md) — hermetic sandbox design
   (threat model, re-exec runner, per-subsystem milestones).
 - [`docs/phase-3-plan.md`](docs/phase-3-plan.md) — distributed CAS design
   (HRW routing, tiered storage, replication, GC, FUSE).
-- [`docs/architecture/`](docs/architecture/) — Architecture Decision Records.
+- [`docs/architecture/`](docs/architecture/) — Architecture Decision Records
+  (incl. 0008 multi-worker scheduling, 0009 leases, 0010 tenants/fair
+  scheduling, 0011 auth).
 - [`docs/journal/`](docs/journal/) — phase retrospectives + per-milestone
   journals.
 - [`CHANGELOG.md`](CHANGELOG.md) — every notable change since bootstrap.
