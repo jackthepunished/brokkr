@@ -16,6 +16,7 @@
 //!   and feeds the result through `Sandbox::run`.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use anyhow::{anyhow, Result};
 use brokkr_proto::reapi_v2 as rapi;
@@ -25,6 +26,7 @@ use brokkr_sandbox::{
 };
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 /// Outcome of running a `Command`.
@@ -150,16 +152,84 @@ async fn run_plain(command: &rapi::Command) -> Result<RunOutcome> {
     for env in &command.environment_variables {
         cmd.env(&env.name, &env.value);
     }
-    let output = cmd
-        .output()
+    // Pipe stdout/stderr so we can bound how much we buffer. `Command::output`
+    // drains both streams to EOF with no limit, so an action that writes
+    // gigabytes to stdout would OOM the worker (issue #67).
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| anyhow!("spawning {argv0}: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("child stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("child stderr was not piped"))?;
+    // Drain both pipes concurrently with `wait` so a child that fills one pipe
+    // cannot deadlock against us while we wait on the other.
+    let stdout_task = tokio::spawn(read_capped(stdout, MAX_CAPTURED_OUTPUT_BYTES, "stdout"));
+    let stderr_task = tokio::spawn(read_capped(stderr, MAX_CAPTURED_OUTPUT_BYTES, "stderr"));
+    let status = child
+        .wait()
         .await
-        .map_err(|e| anyhow!("spawning {argv0}: {e}"))?;
-    let exit_code = output.status.code().unwrap_or(-1);
+        .map_err(|e| anyhow!("waiting for {argv0}: {e}"))?;
+    let stdout = stdout_task
+        .await
+        .map_err(|e| anyhow!("stdout capture task failed: {e}"))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| anyhow!("stderr capture task failed: {e}"))?;
+    let exit_code = status.code().unwrap_or(-1);
     Ok(RunOutcome {
         exit_code,
-        stdout: Bytes::from(output.stdout),
-        stderr: Bytes::from(output.stderr),
+        stdout: Bytes::from(stdout),
+        stderr: Bytes::from(stderr),
     })
+}
+
+/// Maximum bytes captured from a single output stream before truncation.
+///
+/// A malicious or runaway action can write unbounded data to stdout/stderr;
+/// buffering all of it in worker memory is an OOM vector (issue #67). Past
+/// this cap we keep draining the pipe (so the child doesn't block on a full
+/// pipe) but discard the excess.
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
+
+/// Read from `r`, retaining at most `cap` bytes.
+///
+/// Bytes past `cap` are drained and dropped (with a one-time `warn`) instead
+/// of buffered, so the child can keep writing and exit cleanly.
+async fn read_capped<R: AsyncRead + Unpin>(mut r: R, cap: usize, stream: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut warned = false;
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = (cap - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if buf.len() >= cap && !warned {
+                        warned = true;
+                        tracing::warn!(
+                            stream,
+                            cap,
+                            "captured output exceeded cap; truncating and draining the rest"
+                        );
+                    }
+                }
+                // Past the cap we keep looping to drain `r` without buffering.
+            }
+            Err(e) => {
+                tracing::warn!(stream, error = %e, "error reading captured output; stopping");
+                break;
+            }
+        }
+    }
+    buf
 }
 
 async fn run_sandboxed(runner: &SandboxRunner, command: &rapi::Command) -> Result<RunOutcome> {
@@ -224,5 +294,31 @@ pub fn proto_digest(bytes: &[u8]) -> rapi::Digest {
     rapi::Digest {
         hash: hex::encode(Sha256::digest(bytes)),
         size_bytes: bytes.len() as i64,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use super::{read_capped, MAX_CAPTURED_OUTPUT_BYTES};
+
+    #[tokio::test]
+    async fn read_capped_truncates_at_cap() {
+        let data = [b'x'; 100];
+        let out = read_capped(&data[..], 10, "stdout").await;
+        assert_eq!(out.len(), 10);
+        assert!(out.iter().all(|&b| b == b'x'));
+    }
+
+    #[tokio::test]
+    async fn read_capped_returns_all_when_under_cap() {
+        let data = [b'y'; 5];
+        let out = read_capped(&data[..], 10, "stderr").await;
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn default_cap_is_fifty_mib() {
+        assert_eq!(MAX_CAPTURED_OUTPUT_BYTES, 50 * 1024 * 1024);
     }
 }
