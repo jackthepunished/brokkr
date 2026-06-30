@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry decisions (issue #62). Both paths now propagate the structured
   `ExecuteError::Status { code, message }`, recoverable by downcasting
   the returned `anyhow::Error`.
+- `brokkr-control` CAS service now bounds batch request sizes at the
+  service boundary. `FindMissingBlobs`, `BatchReadBlobs`, and
+  `BatchUpdateBlobs` previously iterated over an unbounded request, so a
+  client could exhaust control-plane memory with one giant batch (issue
+  #66). A new `BatchLimits` config (default 1000 blobs/request, 4 MiB
+  payload — matching the advertised `max_batch_total_size_bytes`) is
+  enforced before allocation; oversized requests are rejected with
+  `INVALID_ARGUMENT`. Construct with `CasService::with_limits` to
+  override.
 - `brokkr-worker` and `brokkr-sandbox` now bound how much of an action's
   stdout/stderr they buffer. The worker's plain runner used
   `Command::output()` and the sandbox host drained the runner pipes with

@@ -12,15 +12,57 @@ use tonic::{Request, Response, Status};
 
 use super::{digest_to_proto, proto_to_digest, validate_instance_name};
 
+/// Per-request bounds for the CAS batch RPCs, enforced at the service boundary
+/// so a malicious or buggy client cannot exhaust control-plane memory with a
+/// single oversized request (issue #66).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLimits {
+    /// Maximum number of blobs in one `FindMissingBlobs`, `BatchReadBlobs`,
+    /// or `BatchUpdateBlobs` request.
+    pub max_blobs_per_request: usize,
+    /// Maximum total payload bytes in one `BatchUpdateBlobs` request.
+    pub max_request_bytes: usize,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        // `max_request_bytes` mirrors the `max_batch_total_size_bytes` the
+        // `Capabilities` service advertises (4 MiB), so the server enforces
+        // exactly the bound it tells clients to respect.
+        Self {
+            max_blobs_per_request: 1000,
+            max_request_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
 /// REAPI `ContentAddressableStorage` service backed by a [`Cas`].
 pub struct CasService<C: Cas> {
     backend: Arc<C>,
+    limits: BatchLimits,
 }
 
 impl<C: Cas> CasService<C> {
-    /// Wrap a CAS backend into a tonic service.
+    /// Wrap a CAS backend into a tonic service with default [`BatchLimits`].
     pub fn new(backend: Arc<C>) -> Self {
-        Self { backend }
+        Self::with_limits(backend, BatchLimits::default())
+    }
+
+    /// Wrap a CAS backend with explicit per-request [`BatchLimits`].
+    pub fn with_limits(backend: Arc<C>, limits: BatchLimits) -> Self {
+        Self { backend, limits }
+    }
+
+    /// Reject a batch whose blob count exceeds
+    /// [`BatchLimits::max_blobs_per_request`].
+    fn check_blob_count(&self, count: usize) -> Result<(), Status> {
+        if count > self.limits.max_blobs_per_request {
+            return Err(Status::invalid_argument(format!(
+                "batch has {count} blobs, exceeding the per-request limit of {}",
+                self.limits.max_blobs_per_request
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -33,6 +75,7 @@ impl<C: Cas> CasSvc for CasService<C> {
         let span = tracing::info_span!("cas::find_missing_blobs");
         let req = request.into_inner();
         validate_instance_name(&req.instance_name)?;
+        self.check_blob_count(req.blob_digests.len())?;
         let digests: Vec<super::Digest> = req
             .blob_digests
             .iter()
@@ -58,6 +101,14 @@ impl<C: Cas> CasSvc for CasService<C> {
         let req = request.into_inner();
         validate_instance_name(&req.instance_name)?;
         let request_count = req.requests.len();
+        self.check_blob_count(request_count)?;
+        let total_bytes: usize = req.requests.iter().map(|r| r.data.len()).sum();
+        if total_bytes > self.limits.max_request_bytes {
+            return Err(Status::invalid_argument(format!(
+                "batch payload is {total_bytes} bytes, exceeding the per-request limit of {}",
+                self.limits.max_request_bytes
+            )));
+        }
 
         // Verify each entry's declared digest against its bytes *before*
         // we hand the batch to the backend. The backend re-verifies (issue
@@ -137,6 +188,7 @@ impl<C: Cas> CasSvc for CasService<C> {
         let req = request.into_inner();
         validate_instance_name(&req.instance_name)?;
         let digest_count = req.digests.len();
+        self.check_blob_count(digest_count)?;
         let digests: Vec<super::Digest> = req
             .digests
             .iter()
