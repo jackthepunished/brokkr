@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no signal to the operator (issue #68). The join is now handled
   explicitly: on error it logs a `warn` naming the affected stream and
   falls back to an empty buffer.
+- `brokkr-sdk` no longer discards the `google.rpc.Status.code` on a
+  failed execution. The streamed `Operation` error path flattened the
+  code into an `anyhow!` string, and the `ExecuteResponse.status` path
+  stringified the structured `ExecuteError` — so callers could not tell
+  `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `DEADLINE_EXCEEDED` apart for
+  retry decisions (issue #62). Both paths now propagate the structured
+  `ExecuteError::Status { code, message }`, recoverable by downcasting
+  the returned `anyhow::Error`.
 - `brokkr-worker` and `brokkr-sandbox` now bound how much of an action's
   stdout/stderr they buffer. The worker's plain runner used
   `Command::output()` and the sandbox host drained the runner pipes with
