@@ -850,6 +850,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit-criteria assessment, the deferred backlog, and a retrospective.
   Phase 4 is complete except the Bazel-compatibility DoD (tracked gap —
   needs a real `bazel` client + a runnable multi-process cluster).
+- `docs/operations/running-a-cluster.md` + `scripts/run-cluster.sh` — how
+  to run a real two-process Brokkr cluster (`brokkr-control` +
+  `brokkr-worker`) and submit a job with `brokk run`, plus TLS/auth notes.
+- `brokkr-control/tests/two_process_cluster.rs` — a two-process integration
+  test that spawns the real `brokkr-control` and `brokkr-worker` binaries as
+  separate OS processes and runs a job end-to-end through the `brokk` CLI,
+  proving cross-process registration/dispatch (the in-process fixtures only
+  exercise the gRPC path within one process). `#[ignore]` by default (needs
+  the binaries built; spawns processes). Addresses the "runnable multi-node
+  binary" gap from the Phase 4 wrap-up; the Bazel-compat DoD remains a
+  tracked gap.
 
 ### Changed
 - `README.md` refreshed to reflect reality: Phases 0–4 complete (the stale
