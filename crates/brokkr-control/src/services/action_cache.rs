@@ -6,7 +6,7 @@ use brokkr_cas::ActionCache;
 use brokkr_proto::reapi_v2::{self as rapi, action_cache_server::ActionCache as AcSvc};
 use tonic::{Request, Response, Status};
 
-use super::proto_to_digest;
+use super::{proto_to_digest, validate_instance_name};
 
 /// REAPI [`ActionCache`] service backed by a [`brokkr_cas::ActionCache`].
 pub struct ActionCacheService<A: ActionCache> {
@@ -28,6 +28,7 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
     ) -> Result<Response<rapi::ActionResult>, Status> {
         let span = tracing::info_span!("action_cache::get_action_result");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let digest = proto_to_digest(
             req.action_digest
                 .as_ref()
@@ -54,6 +55,7 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
     ) -> Result<Response<rapi::ActionResult>, Status> {
         let span = tracing::info_span!("action_cache::update_action_result");
         let req = request.into_inner();
+        validate_instance_name(&req.instance_name)?;
         let digest = proto_to_digest(
             req.action_digest
                 .as_ref()

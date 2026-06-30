@@ -3,6 +3,8 @@
 use brokkr_proto::reapi_v2::{self as rapi, capabilities_server::Capabilities as CapSvc};
 use tonic::{Request, Response, Status};
 
+use super::validate_instance_name;
+
 /// REAPI `Capabilities` service. Returns a static, Phase-1-appropriate set.
 #[derive(Default)]
 pub struct CapabilitiesService;
@@ -11,9 +13,10 @@ pub struct CapabilitiesService;
 impl CapSvc for CapabilitiesService {
     async fn get_capabilities(
         &self,
-        _request: Request<rapi::GetCapabilitiesRequest>,
+        request: Request<rapi::GetCapabilitiesRequest>,
     ) -> Result<Response<rapi::ServerCapabilities>, Status> {
         let span = tracing::info_span!("capabilities::get_capabilities");
+        validate_instance_name(&request.into_inner().instance_name)?;
         let _enter = span.enter();
         let caps = rapi::ServerCapabilities {
             cache_capabilities: Some(rapi::CacheCapabilities {
