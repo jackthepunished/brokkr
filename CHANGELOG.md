@@ -901,3 +901,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropping + `pivot_root`; control lists the scheduler/leases/fair-queue/auth),
   and the roadmap table (Phase 5 = next), with the Bazel-compat DoD and S3
   cold tier / FUSE called out as tracked gaps.
+
+## Phase 5 (in progress)
+
+### Added
+- `docs/raft-notes.md` — from-the-paper implementation notes for the custom
+  Raft engine (`docs/plan.md` §17 task 1): server states & terms, persistent
+  vs. volatile state, leader election with randomized timeouts, the RequestVote
+  and AppendEntries RPCs, the election restriction, log repair, snapshots +
+  InstallSnapshot, joint-consensus membership, client linearizability, and the
+  five safety properties. Calls out the **Figure-8 current-term commit rule**
+  (§5.4.2) as the load-bearing safety subtlety and pins a Figure-8 regression
+  test for milestone I4. Maps each concept to its Brokkr milestone (I2–I9) and
+  to the Phase 5 definition-of-done.
