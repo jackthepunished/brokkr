@@ -61,3 +61,60 @@ I10 wrap-up + §11 exit-criteria review.
   sign-off, then scaffold the `brokkr-raft` crate (Transport trait + tonic &
   turmoil impls, redb log schema, `Term`/`LogIndex`/`NodeId` newtypes). The ADR
   needs explicit owner approval **before** any implementation.
+
+## I1 — ADR 0013 + `brokkr-raft` scaffold (§17 task 2)
+
+- **Date:** 2026-07-02
+- **Affected:** new `crates/brokkr-raft`; `crates/brokkr-proto` (new
+  `raft.proto`); workspace `Cargo.toml` (member + `turmoil` dev-dep).
+- **Outcome:** the from-scratch Raft crate's foundation is in place — the pieces
+  the consensus state machine (I3–I4) is built on, each with tests in the same
+  commit. Owner signed off on the four ADR 0013 decisions via `AskUserQuestion`
+  before any code was written.
+
+### Decisions (ADR 0013, all owner-approved)
+
+- **D1 redb schema:** two tables in one `raft.redb`/node — `log` (`u64` index →
+  protobuf-encoded `LogEntry`) and `meta` (`&str` → hard state). Entries are
+  stored in the same protobuf they take on the wire, so a leader replicates
+  stored bytes without re-encoding. `commitIndex`/`lastApplied` stay volatile.
+- **D2 transport:** a dedicated `brokkr/v1/raft.proto` (`RaftService`) plus an
+  async `Transport` trait. Ships `TonicTransport` (production gRPC) and
+  `InMemoryTransport` (deterministic, socket-free) — the latter is the substrate
+  for the I2–I4 consensus tests. The tonic-over-`turmoil` fault-injection path is
+  I5, once a running node exists to serve; ADR 0013 scopes it there.
+- **D3 randomness:** a hand-rolled seeded SplitMix64 PRNG (`rng::Rng`) — **no new
+  dependency**, fully reproducible under simulation.
+- **D4 concurrency:** a single-task actor / `tokio::select!` event loop
+  (documented for I3; no locks on Raft state).
+
+### Notes
+
+- **Persist-before-respond is designed in, proven in I2.** Every `RaftLog`
+  mutator commits its redb transaction before returning. The rigorous
+  crash-consistency tests and the wiring into the node's reply path are I2; this
+  milestone lands the schema and primitives with round-trip + reopen-persistence
+  tests.
+- **`turmoil` is exercised, not just declared.** An integration test frames
+  `brokkr-raft`'s real wire types (protobuf `RequestVote`/reply) over turmoil's
+  simulated TCP and asserts a reproducible outcome — so the dev-dep earns its
+  place and the I5 suite has a working substrate.
+- **Conflict fast-backtrack hint reserved on the wire now.** `AppendEntriesReply`
+  carries `conflict_term`/`conflict_index` from the start (cheap to add to the
+  proto, used by the I4 log-repair optimization) so we never need a wire change
+  for it later.
+- **Verified per-crate in WSL2:** `brokkr-raft` is green on `fmt --check`,
+  `clippy --all-targets -D warnings`, 29 unit + 2 turmoil integration tests, and
+  `RUSTDOCFLAGS=-Dwarnings cargo doc`. `brokkr-proto` and the downstream
+  `brokkr-control` still compile with the added proto.
+
+### TODOs
+
+- I5: wire the tonic stack over `turmoil` (custom connector + `serve_with_incoming`)
+  for partition/delay/reorder fault injection.
+
+### Next
+
+- **I2:** persistent state on redb with the strict persist-before-respond
+  discipline and crash tests (kill mid-write, assert no torn vote / consistent
+  `(currentTerm, votedFor, log)` on recovery).

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/brokkr-common",
     "crates/brokkr-proto",
+    "crates/brokkr-raft",
     "crates/brokkr-cas",
     "crates/brokkr-control",
     "crates/brokkr-worker",
@@ -42,6 +43,9 @@ bincode = "1"
 # Storage
 redb = "2"
 
+# Deterministic network simulation (Phase 5 Raft testing; plan §7/§21)
+turmoil = "0.6"
+
 # Hashing
 sha2 = "0.10"
 hex = "0.4"
@@ -79,6 +83,7 @@ memmap2 = "0.9"
 # Internal crates
 brokkr-common = { path = "crates/brokkr-common", version = "0.1.0" }
 brokkr-proto = { path = "crates/brokkr-proto", version = "0.1.0" }
+brokkr-raft = { path = "crates/brokkr-raft", version = "0.1.0" }
 brokkr-cas = { path = "crates/brokkr-cas", version = "0.1.0" }
 brokkr-control = { path = "crates/brokkr-control", version = "0.1.0" }
 brokkr-worker = { path = "crates/brokkr-worker", version = "0.1.0" }

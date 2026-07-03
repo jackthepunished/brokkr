@@ -1,6 +1,8 @@
 # 0003 — Embedded KV store: redb
 
-- **Status:** accepted
+- **Status:** accepted; single-node replication assumption superseded by
+  [0013](0013-custom-raft.md) (Phase 5). redb remains the local storage engine —
+  0013 replaces only the "single-process, no replication" property with Raft.
 - **Date:** 2026-04-30
 - **Deciders:** Brokkr maintainers
 
