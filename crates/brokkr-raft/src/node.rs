@@ -218,12 +218,18 @@ impl RaftNode {
     /// The universal rule (`docs/raft-notes.md` §2.2): if `term` exceeds our
     /// own, adopt it, revert to follower, and clear the vote — persisting the
     /// new hard state. Returns whether a step-down occurred.
-    fn observe_term(&mut self, term: Term) -> Result<bool, RaftError> {
+    fn observe_term(&mut self, term: Term, now: Instant) -> Result<bool, RaftError> {
         if term > self.hard.current_term {
             self.hard = self.hard.stepped_to(term);
             self.role = Role::Follower;
             self.leader_id = None;
             self.log.save_hard_state(&self.hard)?;
+            // Re-arm the election timer. A node that just stepped down is a fresh
+            // follower in the new term; a leader's `election_deadline` is stale
+            // (leaders track only the heartbeat timer), so without this the very
+            // next `tick` would immediately start an election and fight the node
+            // that just demonstrated the higher term.
+            self.arm_election_timer(now);
             Ok(true)
         } else {
             Ok(false)
@@ -253,11 +259,12 @@ impl RaftNode {
             return self.become_leader(now);
         }
 
+        let (last_log_index, last_log_term) = self.log.last_index_and_term()?;
         let request = RequestVote {
             term: new_term,
             candidate_id: self.id.clone(),
-            last_log_index: self.log.last_index()?,
-            last_log_term: self.log.last_term()?,
+            last_log_index,
+            last_log_term,
         };
         Ok(self
             .peers
@@ -279,11 +286,12 @@ impl RaftNode {
     }
 
     fn heartbeats(&self) -> Result<Vec<Outbound>, RaftError> {
+        let (prev_log_index, prev_log_term) = self.log.last_index_and_term()?;
         let request = AppendEntries {
             term: self.hard.current_term,
             leader_id: self.id.clone(),
-            prev_log_index: self.log.last_index()?,
-            prev_log_term: self.log.last_term()?,
+            prev_log_index,
+            prev_log_term,
             entries: Vec::new(),
             leader_commit: self.commit_index,
         };
@@ -315,7 +323,7 @@ impl RaftNode {
         request: RequestVote,
         now: Instant,
     ) -> Result<RequestVoteResponse, RaftError> {
-        self.observe_term(request.term)?;
+        self.observe_term(request.term, now)?;
         let term = self.hard.current_term;
 
         // Rule 1: reject a stale term.
@@ -361,8 +369,7 @@ impl RaftNode {
         candidate_last_term: Term,
         candidate_last_index: LogIndex,
     ) -> Result<bool, RaftError> {
-        let our_term = self.log.last_term()?;
-        let our_index = self.log.last_index()?;
+        let (our_index, our_term) = self.log.last_index_and_term()?;
         Ok((candidate_last_term, candidate_last_index) >= (our_term, our_index))
     }
 
@@ -375,7 +382,7 @@ impl RaftNode {
         response: RequestVoteResponse,
         now: Instant,
     ) -> Result<Vec<Outbound>, RaftError> {
-        if self.observe_term(response.term)? {
+        if self.observe_term(response.term, now)? {
             return Ok(Vec::new()); // stepped down; no longer a candidate
         }
         // Ignore replies from an old term.
@@ -411,7 +418,7 @@ impl RaftNode {
         request: AppendEntries,
         now: Instant,
     ) -> Result<AppendEntriesResponse, RaftError> {
-        self.observe_term(request.term)?;
+        self.observe_term(request.term, now)?;
         let term = self.hard.current_term;
 
         // Reject a stale leader.
@@ -449,9 +456,9 @@ impl RaftNode {
         &mut self,
         _from: NodeId,
         response: AppendEntriesResponse,
-        _now: Instant,
+        now: Instant,
     ) -> Result<(), RaftError> {
-        self.observe_term(response.term)?;
+        self.observe_term(response.term, now)?;
         Ok(())
     }
 }
@@ -745,6 +752,46 @@ mod tests {
         assert_eq!(c.leaders(), vec![0]);
         assert!(c.nodes[1].is_follower() && c.nodes[2].is_follower());
         assert_eq!(c.nodes[0].current_term(), Term::new(1));
+    }
+
+    #[test]
+    fn a_stepped_down_leader_does_not_immediately_re_elect() {
+        let t0 = Instant::now();
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        c.tick_and_deliver(0, t0 + Duration::from_secs(1));
+        assert!(c.nodes[0].is_leader());
+
+        // Long past its (stale) election deadline, a follower's heartbeat reply
+        // carries a higher term, forcing the leader to step down.
+        let now = t0 + Duration::from_secs(30);
+        c.nodes[0]
+            .handle_append_entries_response(
+                nid("n1"),
+                AppendEntriesResponse {
+                    term: Term::new(2),
+                    success: false,
+                    conflict_term: Term::ZERO,
+                    conflict_index: LogIndex::ZERO,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(c.nodes[0].is_follower());
+        assert_eq!(c.nodes[0].current_term(), Term::new(2));
+
+        // The election timer was re-armed on step-down, so an immediate tick must
+        // NOT start a fresh election (which would fight the higher-term node).
+        let outs = c.nodes[0].tick(now).unwrap();
+        assert!(
+            outs.is_empty(),
+            "a just-stepped-down node must wait a full timeout"
+        );
+        assert!(c.nodes[0].is_follower());
+        assert_eq!(
+            c.nodes[0].current_term(),
+            Term::new(2),
+            "no churn: term stays 2"
+        );
     }
 
     #[test]

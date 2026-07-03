@@ -104,7 +104,7 @@ I10 wrap-up + §11 exit-criteria review.
   proto, used by the I4 log-repair optimization) so we never need a wire change
   for it later.
 - **Verified per-crate in WSL2:** `brokkr-raft` is green on `fmt --check`,
-  `clippy --all-targets -D warnings`, 29 unit + 2 turmoil integration tests, and
+  `clippy --all-targets -- -D warnings`, 29 unit + 2 turmoil integration tests, and
   `RUSTDOCFLAGS=-Dwarnings cargo doc`. `brokkr-proto` and the downstream
   `brokkr-control` still compile with the added proto.
 
@@ -162,7 +162,7 @@ I10 wrap-up + §11 exit-criteria review.
 
 ### Verified per-crate in WSL2
 
-`brokkr-raft` green on `fmt --check`, `clippy --all-targets -D warnings`,
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
 **37 unit + 4 integration** tests (incl. the subprocess crash test), and
 `RUSTDOCFLAGS=-Dwarnings cargo doc`.
 
@@ -219,7 +219,7 @@ I10 wrap-up + §11 exit-criteria review.
 
 ### Verified per-crate in WSL2
 
-`brokkr-raft` green on `fmt --check`, `clippy --all-targets -D warnings`,
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
 **47 unit + 4 integration** tests, and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
 
 ### Next
