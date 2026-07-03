@@ -937,3 +937,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 31 tests (newtype/PRNG/storage/wire round-trips + an integration test
     exercising the wire types over `turmoil`'s deterministic simulated network).
     The `turmoil` dev-dependency (plan §7/§21) is added here.
+
+### Changed
+- `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
+  hard state (`currentTerm` + `votedFor`) is now modelled by `HardState` and
+  written **atomically as a unit** via `RaftLog::save_hard_state` in a single
+  durable redb transaction, replacing the separate `set_current_term` /
+  `set_voted_for` writes. This closes a **torn-vote** hazard: a crash between
+  bumping the term and clearing the vote could otherwise leave a new term paired
+  with a stale vote and let a node vote twice in one term (violating Election
+  Safety). Crash-consistency is proven by tests: an uncommitted write is
+  invisible after reopen, term-step clears the vote atomically, and a committed
+  hard state survives a real process abort (`tests/crash_consistency.rs`
+  re-execs the test binary as a child that commits then `abort()`s).
