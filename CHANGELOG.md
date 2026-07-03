@@ -937,6 +937,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 31 tests (newtype/PRNG/storage/wire round-trips + an integration test
     exercising the wire types over `turmoil`'s deterministic simulated network).
     The `turmoil` dev-dependency (plan §7/§21) is added here.
+- `brokkr-raft` leader election (milestone I3, `docs/plan.md` §17): the
+  `RaftNode` consensus state machine with `RequestVote` (`docs/raft-notes.md`
+  §4.2), the `(lastLogTerm, lastLogIndex)` **election restriction** comparator
+  (§6), randomized 150–300 ms election timeouts driven by an **injected clock +
+  the seeded PRNG** (§4.1), the universal "higher term ⇒ step down + clear vote"
+  rule persisted before responding (§2.2), vote counting to a majority, and
+  heartbeat-driven election suppression. `RaftNode` is a synchronous single-owner
+  state machine (no locks, ADR 0013 D4): callers drive it with `tick` and
+  `handle_*` and it returns the messages to send, which makes elections
+  deterministically testable without an async runtime. Eight election tests
+  (single-node self-elect; 3-node happy election; the up-to-date comparator's
+  five cases; grant-then-deny a second candidate; stale-term rejection; a leader
+  stepping down on a higher term; heartbeats suppressing elections; and a **2–2
+  split vote in term 1 resolving to a single leader in term 2**) run
+  deterministically over an in-process cluster harness with fixed seeds.
 
 ### Changed
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft

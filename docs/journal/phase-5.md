@@ -173,3 +173,58 @@ I10 wrap-up + §11 exit-criteria review.
   election timeouts with an **injected clock + seeded RNG**, and the "higher term
   ⇒ step down + clear vote" pre-check wired onto `save_hard_state`. Node logic
   tested against `InMemoryTransport`.
+
+## I3 — leader election (§17 task 2)
+
+- **Date:** 2026-07-03
+- **Affected:** `crates/brokkr-raft` (`node.rs` new).
+- **Outcome:** the `RaftNode` consensus state machine now elects leaders. It
+  implements `RequestVote` (persist-before-respond), the election restriction,
+  randomized timeouts, the universal higher-term step-down, majority vote
+  counting, and heartbeat-driven election suppression — all proven with eight
+  deterministic tests, including a **2–2 split vote resolving in the next term**.
+
+### Decisions / notes
+
+- **Functional core, imperative shell — the key testability decision.** ADR 0013
+  D4 mandates a single-task actor with no locks. Rather than build the async
+  event loop first (hard to test deterministically without turmoil), I factored
+  the node into a **synchronous, single-owner state machine**: `tick(now)` drives
+  time and `handle_*(req, now)` drive RPCs, each *returning* the messages to send
+  rather than performing I/O. This is the etcd/tikv-style "Ready" pattern. It
+  does not contradict D4 — the actor loop (I5) will own exactly this state and
+  call these methods — but it lets the tests drive whole clusters by hand with an
+  **injected clock + seeded RNG**, no async runtime, fully reproducible. The
+  async shell (wiring to `Transport` + a real timer) lands with the simulation
+  suite (I5) where simulated time can exercise it.
+- **The election restriction is one line, and it's a total order.** "Candidate is
+  at least as up-to-date" reduces to `(cand_last_term, cand_last_index) >=
+  (our_last_term, our_last_index)` via tuple ordering (§6). Tested across all five
+  cases (higher term wins; equal-and-equal grants; equal-term-longer wins;
+  equal-term-shorter denies; lower-term denies even if longer).
+- **Persist-before-respond, enforced through `save_hard_state`.** Every path that
+  changes term or vote — `observe_term` (step down), `start_election` (bump +
+  self-vote), granting a vote — writes the atomic `HardState` from I2 *before*
+  returning the reply. `observe_term` is the single choke point for the
+  "higher term ⇒ follower + clear vote" rule, called at the top of every handler.
+- **Heartbeats are the minimal AppendEntries for I3.** A new leader emits empty
+  `AppendEntries`; followers reset their election timers on receipt, which is what
+  keeps a stable leader from being unseated. The log-consistency check, conflict
+  truncation, entry append, commit advance, and the no-op-on-election are all
+  explicitly deferred to I4 (marked `TODO(I4)` in `handle_append_entries`).
+- **Split-vote test is the proof that randomized timeouts work.** Four nodes,
+  two candidates in term 1 splitting the vote 2–2 (no majority); then the
+  earliest-expiring node re-campaigns in term 2 and wins. This is exactly the
+  §4.1 mechanism, made deterministic by seeding the per-node RNG.
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -D warnings`,
+**47 unit + 4 integration** tests, and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I4:** log replication — `AppendEntries` consistency check (steps 2–5,
+  `docs/raft-notes.md` §5.1), `nextIndex`/`matchIndex` with conflict back-off,
+  the leader commit rule gated on `log[N].term == currentTerm`, the start-of-term
+  no-op entry, and the mandatory **Figure-8 regression test** (§7).
