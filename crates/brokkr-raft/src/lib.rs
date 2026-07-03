@@ -22,13 +22,20 @@
 //! - [`transport`] — the async [`Transport`] trait and its request/reply types,
 //!   with a production [`TonicTransport`] and an in-process
 //!   [`InMemoryTransport`] for deterministic tests (ADR 0013 D2).
+//! - [`node`] — the [`RaftNode`] consensus state machine. Milestone I3
+//!   implements **leader election**: `RequestVote`, the election restriction,
+//!   randomized timeouts (injected clock + seeded RNG), and heartbeat-driven
+//!   election suppression. Log replication follows in I4.
 //!
-//! The consensus state machine (leader election, log replication, safety) is
-//! added in milestones I3–I4; it is intentionally absent here.
+//! [`RaftNode`] is a synchronous, single-owner state machine (no locks, ADR 0013
+//! D4): callers drive it with `tick` (time) and `handle_*` (RPCs), and it
+//! returns the messages to send. The async event-loop shell that wires it to a
+//! [`Transport`] and a real clock arrives with the simulation suite (I5).
 
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod node;
 pub mod rng;
 pub mod state;
 pub mod storage;
@@ -36,6 +43,7 @@ pub mod transport;
 pub mod types;
 
 pub use error::RaftError;
+pub use node::{Config, Outbound, RaftNode};
 pub use rng::Rng;
 pub use state::HardState;
 pub use storage::RaftLog;

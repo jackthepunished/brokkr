@@ -120,6 +120,24 @@ impl RaftLog {
         Ok(self.get(last)?.map(|e| e.term).unwrap_or(Term::ZERO))
     }
 
+    /// The last entry's `(index, term)`, or `(ZERO, ZERO)` for an empty log, in a
+    /// **single** read transaction. Hot paths (heartbeats, `RequestVote`,
+    /// replication) need both together; calling `last_index()` then `last_term()`
+    /// would re-read the log two or three times.
+    pub fn last_index_and_term(&self) -> Result<(LogIndex, Term), RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        let last = table.last().map_err(stor)?;
+        let result = match last {
+            Some((key, value)) => (
+                LogIndex::new(key.value()),
+                LogEntry::decode(value.value())?.term,
+            ),
+            None => (LogIndex::ZERO, Term::ZERO),
+        };
+        Ok(result)
+    }
+
     /// Removes every entry with index `>= from` (conflict truncation,
     /// `docs/raft-notes.md` §5.1 step 3). Truncation only ever happens on
     /// followers; a leader never deletes its own entries.
