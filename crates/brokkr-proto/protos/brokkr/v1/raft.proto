@@ -1,0 +1,105 @@
+// Brokkr internal Raft consensus protocol (Phase 5, ADR 0013).
+//
+// The from-scratch Raft implementation in `brokkr-raft` uses this service for
+// all peer-to-peer traffic. Three RPCs, straight from the Raft paper (Figure 2)
+// plus the snapshot RPC from §7; see `docs/raft-notes.md`. This is an internal
+// surface — clients never speak it; they reach the control plane over REAPI and
+// are redirected to the leader (I8).
+syntax = "proto3";
+
+package brokkr.v1;
+
+// A single entry in the replicated log.
+//
+// `command` is opaque to Raft — the state machine interprets it. Stored on disk
+// protobuf-encoded (ADR 0013 D1), so a leader replicates the stored bytes over
+// `AppendEntries` without re-encoding.
+message LogEntry {
+  // Leader's term when the entry was created.
+  uint64 term = 1;
+  // 1-based position in the log.
+  uint64 index = 2;
+  // Opaque state-machine command.
+  bytes command = 3;
+}
+
+// RequestVote (Raft §5.2). Sent by a candidate to gather votes.
+message RequestVoteRequest {
+  // Candidate's term.
+  uint64 term = 1;
+  // Candidate requesting the vote.
+  string candidate_id = 2;
+  // Index of the candidate's last log entry (0 if empty).
+  uint64 last_log_index = 3;
+  // Term of the candidate's last log entry (0 if empty).
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteReply {
+  // Voter's current term, for the candidate to update itself.
+  uint64 term = 1;
+  // True iff the vote was granted.
+  bool vote_granted = 2;
+}
+
+// AppendEntries (Raft §5.3). Sent by the leader to replicate entries and as an
+// empty heartbeat.
+message AppendEntriesRequest {
+  // Leader's term.
+  uint64 term = 1;
+  // So a follower can redirect clients.
+  string leader_id = 2;
+  // Index of the log entry immediately preceding the new ones.
+  uint64 prev_log_index = 3;
+  // Term of `prev_log_index`.
+  uint64 prev_log_term = 4;
+  // Entries to store (empty for heartbeat).
+  repeated LogEntry entries = 5;
+  // Leader's commitIndex.
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesReply {
+  // Follower's current term, for the leader to update itself.
+  uint64 term = 1;
+  // True iff the follower's log matched at prev_log_index/prev_log_term.
+  bool success = 2;
+  // Conflict-fast-backtrack hint (raft-notes §5.3 optimization): the term of the
+  // conflicting entry, and the first index the follower stores for that term.
+  // Zero when there was no term conflict. Lets the leader skip a whole term per
+  // round trip instead of decrementing nextIndex by one.
+  uint64 conflict_term = 3;
+  uint64 conflict_index = 4;
+}
+
+// InstallSnapshot (Raft §7). Sent by the leader to a follower that has fallen so
+// far behind that the leader has already discarded the next entry it needs.
+message InstallSnapshotRequest {
+  // Leader's term.
+  uint64 term = 1;
+  // So a follower can redirect clients.
+  string leader_id = 2;
+  // The snapshot replaces all entries up through this index.
+  uint64 last_included_index = 3;
+  // Term of `last_included_index`.
+  uint64 last_included_term = 4;
+  // Byte offset where this chunk is positioned in the snapshot file.
+  uint64 offset = 5;
+  // Raw snapshot chunk, starting at `offset`.
+  bytes data = 6;
+  // True if this is the last chunk.
+  bool done = 7;
+}
+
+message InstallSnapshotReply {
+  // Follower's current term, for the leader to update itself.
+  uint64 term = 1;
+}
+
+// Peer-to-peer Raft RPCs. Every reply carries the responder's term so a stale
+// sender steps down (raft-notes §2.2).
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotReply);
+}

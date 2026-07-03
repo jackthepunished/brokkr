@@ -914,3 +914,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (§5.4.2) as the load-bearing safety subtlety and pins a Figure-8 regression
   test for milestone I4. Maps each concept to its Brokkr milestone (I2–I9) and
   to the Phase 5 definition-of-done.
+- ADR 0013 — custom Raft consensus for the metadata store. Records the four
+  design decisions (owner-approved): redb schema (two tables, protobuf-encoded
+  log entries), transport (`brokkr/v1/raft.proto` + an async `Transport` trait),
+  randomness (a hand-rolled seeded PRNG, no new dependency), and concurrency (a
+  single-task actor / event loop). Partially supersedes ADR 0003 (redb stays as
+  the local engine; only the single-node assumption is replaced).
+- `brokkr-raft` crate scaffold (milestone I1, `docs/plan.md` §17):
+  - `Term`, `LogIndex`, and `NodeId` newtypes plus `LogEntry`, with lossless
+    conversions to/from the wire protobuf (`brokkr.v1.LogEntry`).
+  - `RaftError` typed error enum.
+  - `Rng` — a seeded SplitMix64 PRNG for reproducible election-timeout jitter.
+  - `RaftLog` — the redb-backed two-table log + hard-state store (`append`,
+    `get`, `last_index`/`last_term`, `truncate_from`, `current_term`/
+    `voted_for`); every mutator commits before returning.
+  - `Transport`/`RaftRpc` traits with a production `TonicTransport`, a
+    deterministic in-process `InMemoryTransport`, and a `RaftServiceAdapter`
+    bridging a handler to the generated tonic server.
+  - `brokkr/v1/raft.proto` — `RaftService` (RequestVote, AppendEntries,
+    InstallSnapshot) with a conflict fast-backtrack hint on the AppendEntries
+    reply.
+  - 31 tests (newtype/PRNG/storage/wire round-trips + an integration test
+    exercising the wire types over `turmoil`'s deterministic simulated network).
+    The `turmoil` dev-dependency (plan §7/§21) is added here.

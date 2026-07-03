@@ -1,0 +1,28 @@
+[package]
+name = "brokkr-raft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "From-scratch Raft consensus for the Brokkr control plane (Phase 5, ADR 0013)."
+
+[lints]
+workspace = true
+
+[dependencies]
+brokkr-proto.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+prost.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+turmoil.workspace = true
