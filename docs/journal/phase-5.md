@@ -118,3 +118,50 @@ I10 wrap-up + §11 exit-criteria review.
 - **I2:** persistent state on redb with the strict persist-before-respond
   discipline and crash tests (kill mid-write, assert no torn vote / consistent
   `(currentTerm, votedFor, log)` on recovery).
+
+## I2 — persistent state + crash consistency (§17 task 2)
+
+- **Date:** 2026-07-03
+- **Affected:** `crates/brokkr-raft` (`state.rs` new; `storage.rs`).
+- **Outcome:** the Raft hard state is now crash-safe. `HardState`
+  (`currentTerm` + `votedFor`) is written **atomically as a unit** through
+  `RaftLog::save_hard_state` (one redb transaction), and crash-consistency is
+  proven by tests rather than assumed.
+
+### Decisions / notes
+
+- **The torn-vote hazard is the whole point of I2.** I1 wrote `currentTerm` and
+  `votedFor` in *separate* transactions. A crash between "bump term to T" and
+  "clear vote" could recover as `(T, old-candidate)` — a vote cast in a term the
+  node never legitimately voted in, which can produce **two leaders in one term**
+  (Election Safety violation, `docs/raft-notes.md` §3, §8). I2 collapses the two
+  writes into one atomic commit via `HardState`, so that intermediate state is
+  unreachable. `HardState::stepped_to(term)` encodes the "advance term ⇒ clear
+  vote" transition in the value itself.
+- **Persist-before-respond is now tested two ways.**
+  - *Uncommitted writes are invisible* (`uncommitted_write_is_invisible_after_reopen`):
+    a write that is begun but never committed (the crash-before-fsync case) leaves
+    no trace after reopen — redb rolls it back. This is the deterministic proof of
+    the safety model.
+  - *Committed writes survive a real crash* (`tests/crash_consistency.rs`): the
+    test re-execs its own binary as a child that commits a hard state and then
+    calls `std::process::abort()` (a stand-in for power loss). The parent reopens
+    and asserts the committed state is intact and uncorrupted.
+- **API simplified, not just extended.** `set_current_term` / `set_voted_for`
+  were removed (they made the non-atomic hazard *easy to write*); the only way to
+  persist hard state now is the atomic `save_hard_state`. `commitIndex` /
+  `lastApplied` remain volatile by design (recomputed on restart).
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -D warnings`,
+**37 unit + 4 integration** tests (incl. the subprocess crash test), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I3:** leader election — `RequestVote` handler, the `(lastLogTerm,
+  lastLogIndex)` up-to-date comparator (election restriction), randomized
+  election timeouts with an **injected clock + seeded RNG**, and the "higher term
+  ⇒ step down + clear vote" pre-check wired onto `save_hard_state`. Node logic
+  tested against `InMemoryTransport`.

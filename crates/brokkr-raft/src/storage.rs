@@ -11,16 +11,19 @@
 //! so a leader replicates stored bytes without re-encoding.
 //!
 //! Every mutating method commits its redb transaction before returning — the
-//! foundation of the **persist-before-respond** rule (`docs/raft-notes.md` §3).
-//! The rigorous crash-consistency tests and the wiring into the node's reply
-//! path are milestone I2; this module provides the schema and the primitive
-//! operations they build on.
+//! **persist-before-respond** rule (`docs/raft-notes.md` §3). Hard state
+//! (`currentTerm` + `votedFor`) is written atomically as a unit via
+//! [`RaftLog::save_hard_state`] so a crash can never expose a torn vote. The
+//! crash-consistency tests below (uncommitted writes are invisible; committed
+//! state survives a real process abort in `tests/crash_consistency.rs`) prove
+//! this. Wiring these primitives into the node's reply path is milestone I3.
 
 use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::error::RaftError;
+use crate::state::HardState;
 use crate::types::{LogEntry, LogIndex, NodeId, Term};
 
 /// Log table: 1-based index → protobuf-encoded [`LogEntry`].
@@ -137,9 +140,41 @@ impl RaftLog {
         Ok(())
     }
 
-    /// Persists `currentTerm`.
-    pub fn set_current_term(&self, term: Term) -> Result<(), RaftError> {
-        self.put_meta(META_CURRENT_TERM, &term.get().to_le_bytes())
+    /// Atomically persists the hard state (`currentTerm` **and** `votedFor`) in
+    /// a single durable transaction, then returns. Because both fields commit
+    /// together, a crash can never expose a torn `(term, vote)` pair
+    /// (`docs/raft-notes.md` §3, [`HardState`]). This is the core
+    /// persist-before-respond primitive.
+    pub fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError> {
+        let term_bytes = state.current_term.get().to_le_bytes();
+        let write = self.db.begin_write().map_err(stor)?;
+        {
+            let mut table = write.open_table(META_TABLE).map_err(stor)?;
+            table
+                .insert(META_CURRENT_TERM, &term_bytes[..])
+                .map_err(stor)?;
+            match &state.voted_for {
+                Some(id) => {
+                    table
+                        .insert(META_VOTED_FOR, id.as_str().as_bytes())
+                        .map_err(stor)?;
+                }
+                None => {
+                    table.remove(META_VOTED_FOR).map_err(stor)?;
+                }
+            }
+        }
+        write.commit().map_err(stor)?;
+        Ok(())
+    }
+
+    /// Loads the persisted hard state, defaulting to [`HardState::new`] (term 0,
+    /// no vote) on a fresh store.
+    pub fn load_hard_state(&self) -> Result<HardState, RaftError> {
+        Ok(HardState {
+            current_term: self.current_term()?,
+            voted_for: self.voted_for()?,
+        })
     }
 
     /// Loads `currentTerm`, or [`Term::ZERO`] if never set.
@@ -147,14 +182,6 @@ impl RaftLog {
         match self.get_meta(META_CURRENT_TERM)? {
             Some(bytes) => Ok(Term::new(u64_from_le(&bytes)?)),
             None => Ok(Term::ZERO),
-        }
-    }
-
-    /// Persists `votedFor` (`Some` to record a vote, `None` to clear it).
-    pub fn set_voted_for(&self, node: Option<&NodeId>) -> Result<(), RaftError> {
-        match node {
-            Some(id) => self.put_meta(META_VOTED_FOR, id.as_str().as_bytes()),
-            None => self.remove_meta(META_VOTED_FOR),
         }
     }
 
@@ -168,26 +195,6 @@ impl RaftLog {
             }
             None => Ok(None),
         }
-    }
-
-    fn put_meta(&self, key: &str, value: &[u8]) -> Result<(), RaftError> {
-        let write = self.db.begin_write().map_err(stor)?;
-        {
-            let mut table = write.open_table(META_TABLE).map_err(stor)?;
-            table.insert(key, value).map_err(stor)?;
-        }
-        write.commit().map_err(stor)?;
-        Ok(())
-    }
-
-    fn remove_meta(&self, key: &str) -> Result<(), RaftError> {
-        let write = self.db.begin_write().map_err(stor)?;
-        {
-            let mut table = write.open_table(META_TABLE).map_err(stor)?;
-            table.remove(key).map_err(stor)?;
-        }
-        write.commit().map_err(stor)?;
-        Ok(())
     }
 
     fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, RaftError> {
@@ -226,6 +233,13 @@ mod tests {
             LogIndex::new(index),
             Bytes::from_static(cmd),
         )
+    }
+
+    fn hard(term: u64, voted: Option<&str>) -> HardState {
+        HardState {
+            current_term: Term::new(term),
+            voted_for: voted.map(|v| NodeId::new(v).unwrap()),
+        }
     }
 
     #[test]
@@ -267,17 +281,11 @@ mod tests {
             let log = RaftLog::open(&path).unwrap();
             log.append_all(&[entry(3, 1, b"x"), entry(3, 2, b"y")])
                 .unwrap();
-            log.set_current_term(Term::new(3)).unwrap();
-            log.set_voted_for(Some(&NodeId::new("node-b").unwrap()))
-                .unwrap();
+            log.save_hard_state(&hard(3, Some("node-b"))).unwrap();
         }
         let log = RaftLog::open(&path).unwrap();
         assert_eq!(log.last_index().unwrap(), LogIndex::new(2));
-        assert_eq!(log.current_term().unwrap(), Term::new(3));
-        assert_eq!(
-            log.voted_for().unwrap(),
-            Some(NodeId::new("node-b").unwrap())
-        );
+        assert_eq!(log.load_hard_state().unwrap(), hard(3, Some("node-b")));
     }
 
     #[test]
@@ -303,18 +311,76 @@ mod tests {
     }
 
     #[test]
-    fn hard_state_defaults_and_clears() {
+    fn hard_state_defaults_to_zero_no_vote() {
         let (_dir, log) = temp_log();
+        assert_eq!(log.load_hard_state().unwrap(), HardState::new());
         assert_eq!(log.current_term().unwrap(), Term::ZERO);
         assert_eq!(log.voted_for().unwrap(), None);
+    }
 
-        log.set_current_term(Term::new(9)).unwrap();
-        let id = NodeId::new("candidate-1").unwrap();
-        log.set_voted_for(Some(&id)).unwrap();
-        assert_eq!(log.current_term().unwrap(), Term::new(9));
-        assert_eq!(log.voted_for().unwrap(), Some(id));
+    #[test]
+    fn hard_state_round_trips() {
+        let (_dir, log) = temp_log();
+        log.save_hard_state(&hard(9, Some("candidate-1"))).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(9, Some("candidate-1")));
+    }
 
-        log.set_voted_for(None).unwrap();
-        assert_eq!(log.voted_for().unwrap(), None);
+    #[test]
+    fn stepping_to_higher_term_clears_vote_atomically() {
+        let (_dir, log) = temp_log();
+        // Voted for A in term 5.
+        log.save_hard_state(&hard(5, Some("A"))).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+
+        // Step to term 6: the vote must be gone, never (6, Some("A")).
+        let stepped = log.load_hard_state().unwrap().stepped_to(Term::new(6));
+        log.save_hard_state(&stepped).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(6, None));
+    }
+
+    #[test]
+    fn uncommitted_write_is_invisible_after_reopen() {
+        // Persist-before-respond: a write that is never committed (as if the
+        // process crashed before the commit fsync) must leave no trace. Only
+        // committed state is ever observable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.save_hard_state(&hard(5, Some("A"))).unwrap(); // committed
+
+            // Begin a write that bumps the term to 999, then drop it WITHOUT
+            // committing — redb rolls it back exactly as a crash would.
+            let write = log.db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(META_TABLE).unwrap();
+                let bogus = 999u64.to_le_bytes();
+                table.insert(META_CURRENT_TERM, &bogus[..]).unwrap();
+            }
+            drop(write); // no commit
+
+            // The live handle still sees only the committed state.
+            assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+        }
+
+        // Reopen from disk: the uncommitted term 999 never happened.
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+    }
+
+    #[test]
+    fn committed_log_and_hard_state_recover_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.append_all(&[entry(2, 1, b"a"), entry(2, 2, b"b")])
+                .unwrap();
+            log.save_hard_state(&hard(2, Some("leader"))).unwrap();
+        }
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(2));
+        assert_eq!(log.last_term().unwrap(), Term::new(2));
+        assert_eq!(log.load_hard_state().unwrap(), hard(2, Some("leader")));
     }
 }
