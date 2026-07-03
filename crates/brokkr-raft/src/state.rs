@@ -35,7 +35,17 @@ impl HardState {
     /// atomic "step down to a higher term" transition (`docs/raft-notes.md`
     /// §2.2). Clearing the vote in the same value is what makes a torn vote
     /// impossible once this is persisted atomically.
+    ///
+    /// `term` must be strictly greater than the current term: Raft terms are
+    /// monotonic and only ever advance. A `debug_assert` guards this invariant
+    /// in debug/test builds without affecting release behavior.
     pub fn stepped_to(&self, term: Term) -> Self {
+        debug_assert!(
+            term > self.current_term,
+            "stepped_to must advance the term (monotonic invariant): {} -> {}",
+            self.current_term,
+            term
+        );
         HardState {
             current_term: term,
             voted_for: None,
@@ -81,5 +91,15 @@ mod tests {
         let voted = hs.voting_for(NodeId::new("cand").unwrap());
         assert_eq!(voted.current_term, Term::new(3));
         assert_eq!(voted.voted_for, Some(NodeId::new("cand").unwrap()));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "monotonic")]
+    fn stepped_to_backward_term_panics_in_debug() {
+        // Terms are monotonic; stepping to a lower term is a misuse the
+        // debug_assert must catch in debug/test builds.
+        let hs = HardState::new().stepped_to(Term::new(5));
+        let _ = hs.stepped_to(Term::new(3));
     }
 }

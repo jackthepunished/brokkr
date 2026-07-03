@@ -151,6 +151,14 @@ I10 wrap-up + §11 exit-criteria review.
   were removed (they made the non-atomic hazard *easy to write*); the only way to
   persist hard state now is the atomic `save_hard_state`. `commitIndex` /
   `lastApplied` remain volatile by design (recomputed on restart).
+- **Atomic *read*, too (Copilot review catch).** The write is atomic, but the
+  first cut of `load_hard_state` composed `current_term()` and `voted_for()` —
+  two separate read transactions, so a concurrent `save_hard_state` could
+  interleave and hand back a `(term, vote)` pair that was never committed
+  together. Fixed to read both keys in one read transaction; a concurrent
+  writer/reader stress test (`load_hard_state_reads_a_consistent_pair_under_concurrent_writes`)
+  guards it. Also added a `debug_assert` in `HardState::stepped_to` enforcing the
+  monotonic-term invariant.
 
 ### Verified per-crate in WSL2
 

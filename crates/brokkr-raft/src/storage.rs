@@ -170,10 +170,30 @@ impl RaftLog {
 
     /// Loads the persisted hard state, defaulting to [`HardState::new`] (term 0,
     /// no vote) on a fresh store.
+    ///
+    /// Both keys are read within a **single** redb read transaction, so the
+    /// returned `(currentTerm, votedFor)` pair is always a consistent committed
+    /// snapshot: a concurrent [`RaftLog::save_hard_state`] can never interleave
+    /// between the two reads to yield a torn pair (e.g. an old term with a new
+    /// vote). Reading them in separate transactions would reintroduce exactly
+    /// the torn-state hazard this atomicity exists to prevent.
     pub fn load_hard_state(&self) -> Result<HardState, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        let current_term = match table.get(META_CURRENT_TERM).map_err(stor)? {
+            Some(guard) => Term::new(u64_from_le(guard.value())?),
+            None => Term::ZERO,
+        };
+        let voted_for = match table.get(META_VOTED_FOR).map_err(stor)? {
+            Some(guard) => {
+                let s = std::str::from_utf8(guard.value()).map_err(stor)?;
+                Some(NodeId::new(s)?)
+            }
+            None => None,
+        };
         Ok(HardState {
-            current_term: self.current_term()?,
-            voted_for: self.voted_for()?,
+            current_term,
+            voted_for,
         })
     }
 
@@ -366,6 +386,52 @@ mod tests {
         // Reopen from disk: the uncommitted term 999 never happened.
         let log = RaftLog::open(&path).unwrap();
         assert_eq!(log.load_hard_state().unwrap(), hard(5, Some("A")));
+    }
+
+    #[test]
+    fn load_hard_state_reads_a_consistent_pair_under_concurrent_writes() {
+        // Regression test for the torn-read hazard: `load_hard_state` must read
+        // both keys in ONE transaction. The writer only ever commits pairs where
+        // (term is odd) <=> (a vote is recorded). A non-atomic reader (two
+        // separate read transactions) could observe an (odd, None) or
+        // (even, Some) pair that was never committed together; the invariant
+        // below would then fail.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(RaftLog::open(dir.path().join("raft.redb")).unwrap());
+        log.save_hard_state(&hard(0, None)).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let log = Arc::clone(&log);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                for term in 1u64..=400 {
+                    let voted = if term % 2 == 1 { Some("n") } else { None };
+                    log.save_hard_state(&hard(term, voted)).unwrap();
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Read continuously for the whole write window (plus a minimum count).
+        let mut reads = 0u32;
+        while !done.load(Ordering::SeqCst) || reads < 200 {
+            let hs = log.load_hard_state().unwrap();
+            let term_is_odd = hs.current_term.get() % 2 == 1;
+            assert_eq!(
+                term_is_odd,
+                hs.voted_for.is_some(),
+                "torn read: term={} voted_for={:?}",
+                hs.current_term.get(),
+                hs.voted_for
+            );
+            reads += 1;
+        }
+        writer.join().unwrap();
     }
 
     #[test]
