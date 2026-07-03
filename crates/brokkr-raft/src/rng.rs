@@ -86,6 +86,24 @@ mod tests {
     }
 
     #[test]
+    fn matches_canonical_splitmix64_vectors() {
+        // Known-answer test pinning the output to Vigna's reference SplitMix64
+        // (<http://prng.di.unimi.it/splitmix64.c>). Vectors were computed
+        // independently (Python) from the reference algorithm, so this proves
+        // the gamma (0x9e37_79b9_7f4a_7b15) and mix constants are the canonical
+        // ones and guards them against accidental edits.
+        let mut r0 = Rng::seed_from_u64(0);
+        assert_eq!(r0.next_u64(), 0xc375_cf7a_bd03_aee6);
+        assert_eq!(r0.next_u64(), 0xa8b5_1449_6612_6884);
+        assert_eq!(r0.next_u64(), 0x65e2_a333_5d27_f5e8);
+
+        let mut r42 = Rng::seed_from_u64(42);
+        assert_eq!(r42.next_u64(), 0x7d4f_200e_51b7_48b4);
+        assert_eq!(r42.next_u64(), 0xf87c_f367_d2f9_dfd7);
+        assert_eq!(r42.next_u64(), 0xdb31_f29f_4414_ed5f);
+    }
+
+    #[test]
     fn gen_range_is_bounded() {
         let mut r = Rng::seed_from_u64(7);
         for _ in 0..10_000 {

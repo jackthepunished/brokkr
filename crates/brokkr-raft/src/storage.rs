@@ -75,7 +75,7 @@ impl RaftLog {
             let mut table = write.open_table(LOG_TABLE).map_err(stor)?;
             for entry in entries {
                 table
-                    .insert(entry.index.get(), entry.encode().as_slice())
+                    .insert(entry.index.get(), entry.encode().as_ref())
                     .map_err(stor)?;
             }
         }

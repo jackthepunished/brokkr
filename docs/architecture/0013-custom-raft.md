@@ -41,7 +41,7 @@ will depend on it (I8). Four design decisions:
 
 Each node owns one `raft.redb` file with two tables:
 
-```
+```text
 raft.redb
 ├─ TABLE "log":  u64  → &[u8]   // protobuf-encoded LogEntry { term, index, command }
 └─ TABLE "meta": &str → &[u8]   // hard state: "current_term", "voted_for",

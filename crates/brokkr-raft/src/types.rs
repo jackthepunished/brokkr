@@ -11,9 +11,9 @@ use std::fmt;
 use bytes::Bytes;
 use prost::Message;
 
-use crate::error::RaftError;
-
 use brokkr_proto::brokkr::v1 as pb;
+
+use crate::error::RaftError;
 
 /// Maximum byte length of a [`NodeId`].
 pub const NODE_ID_MAX_LEN: usize = 128;
@@ -165,8 +165,8 @@ impl LogEntry {
     }
 
     /// Encodes the entry to its protobuf wire/disk form (ADR 0013 D1).
-    pub fn encode(&self) -> Vec<u8> {
-        pb::LogEntry::from(self).encode_to_vec()
+    pub fn encode(&self) -> Bytes {
+        Bytes::from(pb::LogEntry::from(self).encode_to_vec())
     }
 
     /// Decodes an entry from its protobuf wire/disk form.

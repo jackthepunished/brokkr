@@ -426,6 +426,7 @@ impl fmt::Debug for TonicTransport {
 
 #[async_trait]
 impl Transport for TonicTransport {
+    #[tracing::instrument(level = "debug", skip(self, req), fields(peer = %to, term = req.term.get()))]
     async fn request_vote(
         &self,
         to: &NodeId,
@@ -438,6 +439,7 @@ impl Transport for TonicTransport {
         Ok(reply.into_inner().into())
     }
 
+    #[tracing::instrument(level = "debug", skip(self, req), fields(peer = %to, term = req.term.get(), entries = req.entries.len()))]
     async fn append_entries(
         &self,
         to: &NodeId,
@@ -450,6 +452,7 @@ impl Transport for TonicTransport {
         Ok(reply.into_inner().into())
     }
 
+    #[tracing::instrument(level = "debug", skip(self, req), fields(peer = %to, term = req.term.get(), last_included = req.last_included_index.get()))]
     async fn install_snapshot(
         &self,
         to: &NodeId,
@@ -490,8 +493,16 @@ impl<H: RaftRpc> RaftServiceAdapter<H> {
     }
 }
 
+// Manual `Debug` (the wrapped `H: RaftRpc` handler is not required to be `Debug`).
+impl<H: RaftRpc> fmt::Debug for RaftServiceAdapter<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RaftServiceAdapter").finish_non_exhaustive()
+    }
+}
+
 #[tonic::async_trait]
 impl<H: RaftRpc + 'static> RaftService for RaftServiceAdapter<H> {
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn request_vote(
         &self,
         request: Request<pb::RequestVoteRequest>,
@@ -506,6 +517,7 @@ impl<H: RaftRpc + 'static> RaftService for RaftServiceAdapter<H> {
         Ok(Response::new(resp.into()))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn append_entries(
         &self,
         request: Request<pb::AppendEntriesRequest>,
@@ -520,6 +532,7 @@ impl<H: RaftRpc + 'static> RaftService for RaftServiceAdapter<H> {
         Ok(Response::new(resp.into()))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn install_snapshot(
         &self,
         request: Request<pb::InstallSnapshotRequest>,
