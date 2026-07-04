@@ -96,6 +96,20 @@ impl RaftLog {
         }
     }
 
+    /// Returns every entry with index `>= from`, in ascending order — the batch a
+    /// leader replicates to a follower starting at its `nextIndex`
+    /// (`docs/raft-notes.md` §5.3).
+    pub fn entries_from(&self, from: LogIndex) -> Result<Vec<LogEntry>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        let mut entries = Vec::new();
+        for item in table.range(from.get()..).map_err(stor)? {
+            let (_key, value) = item.map_err(stor)?;
+            entries.push(LogEntry::decode(value.value())?);
+        }
+        Ok(entries)
+    }
+
     /// The highest index present, or [`LogIndex::ZERO`] for an empty log.
     pub fn last_index(&self) -> Result<LogIndex, RaftError> {
         let read = self.db.begin_read().map_err(stor)?;

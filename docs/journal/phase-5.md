@@ -228,3 +228,65 @@ I10 wrap-up + §11 exit-criteria review.
   `docs/raft-notes.md` §5.1), `nextIndex`/`matchIndex` with conflict back-off,
   the leader commit rule gated on `log[N].term == currentTerm`, the start-of-term
   no-op entry, and the mandatory **Figure-8 regression test** (§7).
+
+## I4 — log replication + the Figure-8 rule (§17 task 2)
+
+- **Date:** 2026-07-04
+- **Affected:** `crates/brokkr-raft` (`node.rs`, `storage.rs`, `transport.rs`,
+  `error.rs`); `crates/brokkr-proto` (additive `match_index` field on
+  `AppendEntriesReply`).
+- **Outcome:** leaders now replicate their log and advance the commit index
+  **safely** — the Figure-8 current-term commit rule is implemented and proven by
+  a regression test. This is the safety centerpiece of the whole phase.
+
+### Decisions / notes
+
+- **The current-term commit gate is the one line that matters.**
+  `advance_commit_index` walks candidate indices top-down and commits the largest
+  `N` that a majority holds **and** whose `log[N].term == currentTerm`. Without
+  that second clause a leader would commit a prior-term entry the moment it sits
+  on a majority — exactly the Figure-8 data-loss bug. The
+  `figure_8_prior_term_entry_not_committed_by_replica_count` test reproduces the
+  hazard end-to-end: n0 (term 1) puts entry A on the majority `{n0,n1}` without
+  learning it (so A is uncommitted); n1 then wins term 2 and *re-replicates* A (a
+  term-1 entry) to the whole cluster; the test asserts `commit_index == 0` at
+  that point — A is on a majority but must not commit — and only after n1
+  proposes a term-2 entry B that reaches a majority does commit jump to 2,
+  sweeping A in indirectly. Remove the current-term clause and this test fails.
+- **Conflict-only truncation, never blind truncation.** `append_new_entries`
+  keeps any incoming entry we already store at the same term and truncates *only*
+  on a genuine term conflict, then appends the rest. A dedicated test
+  (`idempotent_append_does_not_truncate_a_matching_suffix`) guards against the
+  classic "truncate to prev_log_index then append" bug that a delayed/duplicated
+  `AppendEntries` would otherwise use to erase a committed suffix.
+- **`matchIndex` reported in the reply, not inferred.** Rather than have the
+  leader remember what it sent (fragile under async), the follower reports, on
+  success, the highest index it now matches (`prev_log_index + entries.len()`) via
+  a new `AppendEntriesReply.match_index` field. The leader sets
+  `matchIndex[peer]` from it — correct in both the synchronous test harness and
+  the future async driver.
+- **Back-off converges via the follower's conflict hint.** On a failed check the
+  follower returns the first index of the conflicting term (or `last+1` if its
+  log is too short); the leader jumps `nextIndex` there and retries. The
+  `lagging_follower_catches_up_via_backoff` test drives an empty follower to a
+  three-entry log through this loop.
+- **Start-of-term no-op deferred, deliberately.** Raft recommends appending a
+  no-op on election so the leader can commit and learn its commit index sooner
+  (and to make lease-free reads safe). It is a read-safety / latency
+  optimization, **not** required for replication safety, and including it would
+  force the Figure-8 test to catch a transient rather than a clean state. It is
+  deferred to the linearizable-read work (I8); `become_leader` documents this.
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
+**56 unit + 4 integration** tests, and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
+`brokkr-proto` and the downstream `brokkr-control` compile with the additive
+proto field.
+
+### Next
+
+- **I5:** the `turmoil` simulation suite — the **async event-loop shell** that
+  wires `RaftNode` to a `Transport` and a real timer, then the tonic-over-turmoil
+  transport, driving partitions / message reorder / crash-mid-write against a
+  running cluster with a **linearizability** oracle over committed entries.

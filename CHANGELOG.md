@@ -952,6 +952,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stepping down on a higher term; heartbeats suppressing elections; and a **2–2
   split vote in term 1 resolving to a single leader in term 2**) run
   deterministically over an in-process cluster harness with fixed seeds.
+- `brokkr-raft` log replication (milestone I4, `docs/plan.md` §17): the leader
+  replicates its log to followers and advances the commit index safely.
+  - The `AppendEntries` receiver now runs the full five-step consistency check
+    (`docs/raft-notes.md` §5.1): reject a stale term; reject if the log has no
+    entry at `prev_log_index` matching `prev_log_term` (returning a conflict
+    fast-backtrack hint, §5.3); truncate only on a genuine conflict; append new
+    entries; and advance the commit index to `min(leaderCommit, last new index)`.
+  - The leader tracks per-peer `nextIndex`/`matchIndex`, replicates entries from
+    `nextIndex`, advances both on success, and backs off on failure using the
+    follower's conflict hint until the logs converge. A new `match_index` field
+    on `AppendEntriesReply` lets the leader learn a follower's replicated prefix.
+  - The leader commit rule advances `commitIndex` to the largest `N` with a
+    majority of `matchIndex ≥ N` **and `log[N].term == currentTerm`** — the
+    **Figure-8** current-term rule (§7) that prevents committing a prior-term
+    entry by replica count. A client `propose` appends to the leader's log and
+    replicates; a single-node cluster commits immediately.
+  - Nine replication tests, including a faithful **Figure-8 regression test**: a
+    prior-term entry re-replicated onto a majority by a later leader is *not*
+    committed by replica count, and commits only once a current-term entry
+    commits over it. Also covered: leader→follower replication + commit, conflict
+    truncation (no duplication), a matching suffix not being truncated by a stale
+    request, the too-short-log rejection + hint, a lagging follower catching up
+    via back-off, single-node immediate commit, and `propose` on a follower
+    returning `NotLeader`.
+  - The recommended start-of-term **no-op** entry is deferred to the
+    linearizable-read work (I8); it is a read-safety / commit-latency
+    optimization, not a replication-safety requirement.
 
 ### Changed
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
