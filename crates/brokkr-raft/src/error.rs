@@ -28,6 +28,14 @@ pub enum RaftError {
     /// An RPC was addressed to a peer this node does not know about.
     #[error("unknown peer: {0}")]
     UnknownPeer(String),
+
+    /// A client `propose` reached a node that is not the leader. The caller
+    /// should redirect to `leader` (if known).
+    #[error("not the leader (current leader: {leader:?})")]
+    NotLeader {
+        /// The leader this node currently recognizes, if any.
+        leader: Option<String>,
+    },
 }
 
 impl From<prost::DecodeError> for RaftError {

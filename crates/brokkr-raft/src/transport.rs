@@ -90,6 +90,10 @@ pub struct AppendEntriesResponse {
     /// Conflict fast-backtrack hint: first index the follower holds for
     /// `conflict_term`.
     pub conflict_index: LogIndex,
+    /// On success, the highest log index the follower now has that matches the
+    /// leader (`prev_log_index + entries.len()`); the leader sets
+    /// `matchIndex[follower]` to this. [`LogIndex::ZERO`] on failure.
+    pub match_index: LogIndex,
 }
 
 /// An `InstallSnapshot` call (Raft §7).
@@ -197,6 +201,7 @@ impl From<AppendEntriesResponse> for pb::AppendEntriesReply {
             success: r.success,
             conflict_term: r.conflict_term.get(),
             conflict_index: r.conflict_index.get(),
+            match_index: r.match_index.get(),
         }
     }
 }
@@ -208,6 +213,7 @@ impl From<pb::AppendEntriesReply> for AppendEntriesResponse {
             success: p.success,
             conflict_term: Term::new(p.conflict_term),
             conflict_index: LogIndex::new(p.conflict_index),
+            match_index: LogIndex::new(p.match_index),
         }
     }
 }
@@ -616,6 +622,7 @@ mod tests {
             success: false,
             conflict_term: Term::new(7),
             conflict_index: LogIndex::new(12),
+            match_index: LogIndex::ZERO,
         };
         let proto = pb::AppendEntriesReply::from(resp);
         let back = AppendEntriesResponse::from(proto);
@@ -658,6 +665,7 @@ mod tests {
                 success: true,
                 conflict_term: Term::ZERO,
                 conflict_index: req.prev_log_index,
+                match_index: req.prev_log_index,
             })
         }
 

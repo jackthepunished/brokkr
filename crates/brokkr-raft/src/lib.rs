@@ -23,14 +23,17 @@
 //!   with a production [`TonicTransport`] and an in-process
 //!   [`InMemoryTransport`] for deterministic tests (ADR 0013 D2).
 //! - [`node`] — the [`RaftNode`] consensus state machine. Milestone I3
-//!   implements **leader election**: `RequestVote`, the election restriction,
-//!   randomized timeouts (injected clock + seeded RNG), and heartbeat-driven
-//!   election suppression. Log replication follows in I4.
+//!   implements **leader election** (`RequestVote`, the election restriction,
+//!   randomized timeouts, heartbeat suppression); milestone I4 adds **log
+//!   replication**: the `AppendEntries` consistency check with conflict-only
+//!   truncation, per-peer `nextIndex`/`matchIndex` back-off, a client `propose`,
+//!   and the current-term commit rule (the **Figure-8** safety property).
 //!
 //! [`RaftNode`] is a synchronous, single-owner state machine (no locks, ADR 0013
-//! D4): callers drive it with `tick` (time) and `handle_*` (RPCs), and it
-//! returns the messages to send. The async event-loop shell that wires it to a
-//! [`Transport`] and a real clock arrives with the simulation suite (I5).
+//! D4): callers drive it with `tick` (time), `handle_*` (RPCs), and `propose`
+//! (client writes), and it returns the messages to send. The async event-loop
+//! shell that wires it to a [`Transport`] and a real clock arrives with the
+//! simulation suite (I5).
 
 #![deny(missing_docs)]
 

@@ -70,6 +70,10 @@ message AppendEntriesReply {
   // round trip instead of decrementing nextIndex by one.
   uint64 conflict_term = 3;
   uint64 conflict_index = 4;
+  // On success, the highest log index the follower now has that is guaranteed to
+  // match the leader (prev_log_index + len(entries)). The leader sets
+  // matchIndex[follower] to this. Zero on failure.
+  uint64 match_index = 5;
 }
 
 // InstallSnapshot (Raft §7). Sent by the leader to a follower that has fallen so
