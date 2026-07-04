@@ -979,6 +979,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The recommended start-of-term **no-op** entry is deferred to the
     linearizable-read work (I8); it is a read-safety / commit-latency
     optimization, not a replication-safety requirement.
+- `brokkr-raft` deterministic fault-injection simulation (milestone I5a,
+  `docs/plan.md` §17 task 3): `tests/simulation.rs` drives a cluster of
+  synchronous `RaftNode`s through a seeded network scheduler — message
+  latency/reorder/loss, network partitions, and process crashes with restart
+  from the persisted `RaftLog` — all reproducible from a fixed seed. A
+  linearizability oracle asserts **State Machine Safety** (`docs/raft-notes.md`
+  §8): every live node's committed log is a prefix of every other's, checked
+  after every step. Five scenarios: replication under latency; a minority
+  partition that cannot commit, healing consistently; leader crash → re-election
+  with no committed entry lost; a crashed follower restarting and catching up
+  from disk; and a 60-round soak interleaving writes with random
+  partitions/crashes/restarts that never diverges. (The `turmoil`-based async
+  driver with the real tonic transport is the companion milestone I5b.)
 
 ### Changed
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft

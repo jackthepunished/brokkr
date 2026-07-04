@@ -290,3 +290,60 @@ proto field.
   wires `RaftNode` to a `Transport` and a real timer, then the tonic-over-turmoil
   transport, driving partitions / message reorder / crash-mid-write against a
   running cluster with a **linearizability** oracle over committed entries.
+
+## I5a — deterministic fault-injection simulator (§17 task 3)
+
+- **Date:** 2026-07-04
+- **Affected:** `crates/brokkr-raft` (`tests/simulation.rs`, new).
+- **Owner decision:** asked how to build I5 (plan says "turmoil", but
+  `RaftNode`'s `std::time` clock doesn't advance under turmoil). Owner chose
+  **both** a deterministic simulator *and* the full turmoil async driver, with
+  **tonic-over-turmoil** as the transport. I split I5 into **I5a** (this: the
+  deterministic simulator — highest safety value, lowest risk, no clock/async
+  refactor) and **I5b** (next: the async `RaftDriver` + clock abstraction +
+  tonic-over-turmoil).
+- **Outcome:** a seeded, in-process discrete-event simulator drives a cluster of
+  synchronous `RaftNode`s through message latency/reorder/loss, partitions, and
+  crash/restart, and a linearizability oracle proves **State Machine Safety**
+  after every step. Five scenarios pass, headlined by a 60-round soak that
+  interleaves writes with random faults and never diverges.
+
+### Decisions / notes
+
+- **Why a deterministic simulator, not (only) turmoil.** turmoil runs real async
+  code over a simulated network, which is realism I5b will add — but for the
+  *safety* oracle, a hand-rolled discrete-event scheduler is both more
+  controllable (I can script an exact partition or crash instant) and more
+  reproducible (one seed fixes latency, reorder, and the fault sequence), and it
+  drives the existing synchronous `RaftNode` **with no clock or async refactor**.
+  It reuses the node's `tick`/`handle_*`/`propose` return-the-messages design
+  directly.
+- **The oracle is committed-prefix agreement.** `assert_no_divergence` checks, for
+  every pair of live nodes, that the shorter committed log is a prefix of the
+  longer — i.e. no committed index ever holds different commands on two nodes
+  (State Machine Safety, `docs/raft-notes.md` §8). It is asserted after *every*
+  round of the soak, not just at the end, so a transient divergence cannot slip
+  through.
+- **Crash = drop volatile, keep disk.** `crash(i)` drops the `RaftNode` (closing
+  its redb file) but keeps the temp path; `restart(i)` reopens the *same* file,
+  so `currentTerm`/`votedFor`/`log` survive and `commitIndex` is recovered by
+  replication — exactly the real crash-recovery contract from I2, now exercised
+  under a live cluster.
+- **Partitions drop, they don't buffer.** A message between two nodes in
+  different partition groups is silently lost at delivery; healing lets *new*
+  messages flow. This models a clean network partition and lets the minority side
+  demonstrably fail to commit.
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
+**56 unit + 9 integration** tests (5 new simulation scenarios), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I5b:** the async `RaftDriver` (a `RaftNode` in a tokio task, timer-driven
+  `tick`, inbound RPCs over a channel, outbound via a `Transport`) + a clock
+  abstraction so the node runs on turmoil's sim clock, wired to the real
+  **tonic-over-turmoil** transport (ADR 0013 D2), with a multi-node turmoil
+  cluster test under partitions/latency.
