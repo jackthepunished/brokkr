@@ -27,6 +27,11 @@ use brokkr_raft::{
     RaftNode, RaftRpc, RequestVote, RequestVoteResponse, Rng, Transport,
 };
 
+/// The node id for cluster member `i` (nodes are named `n0`, `n1`, …).
+fn node_id(i: usize) -> NodeId {
+    NodeId::new(format!("n{i}")).unwrap()
+}
+
 /// Shared wiring: a registry of every node's handle plus the current partition
 /// groups. All nodes' transports share it, so it can be populated after the
 /// drivers are built (breaking the driver↔transport cycle) and mutated to inject
@@ -45,11 +50,7 @@ impl Fabric {
     fn partition(&self, groups: &[&[usize]]) {
         *self.groups.lock().unwrap() = groups
             .iter()
-            .map(|g| {
-                g.iter()
-                    .map(|i| NodeId::new(format!("n{i}")).unwrap())
-                    .collect()
-            })
+            .map(|g| g.iter().map(|&i| node_id(i)).collect())
             .collect();
     }
 
@@ -118,9 +119,7 @@ impl Transport for Switchboard {
 /// Spins up an `n`-node cluster of drivers over a shared [`Fabric`], keeping the
 /// temp dirs alive for the caller.
 fn cluster(n: usize) -> (Fabric, Vec<RaftHandle>, Vec<tempfile::TempDir>) {
-    let ids: Vec<NodeId> = (0..n)
-        .map(|i| NodeId::new(format!("n{i}")).unwrap())
-        .collect();
+    let ids: Vec<NodeId> = (0..n).map(node_id).collect();
     let fabric = Fabric::default();
     let mut handles = Vec::new();
     let mut dirs = Vec::new();
@@ -145,7 +144,13 @@ fn cluster(n: usize) -> (Fabric, Vec<RaftHandle>, Vec<tempfile::TempDir>) {
         fabric.register(ids[i].clone(), handle.clone());
         handles.push(handle);
         dirs.push(dir);
-        tokio::spawn(async move { driver.run().await });
+        // Surface a driver-loop failure instead of letting it masquerade as
+        // "no leader found" in a later assertion.
+        tokio::spawn(async move {
+            if let Err(e) = driver.run().await {
+                panic!("raft driver task exited with error: {e}");
+            }
+        });
     }
     (fabric, handles, dirs)
 }

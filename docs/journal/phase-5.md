@@ -343,10 +343,10 @@ proto field.
 ### Next
 
 - **I5b:** the async `RaftDriver` (a `RaftNode` in a tokio task, timer-driven
-  `tick`, inbound RPCs over a channel, outbound via a `Transport`) + a clock
-  abstraction so the node runs on turmoil's sim clock, wired to the real
-  **tonic-over-turmoil** transport (ADR 0013 D2), with a multi-node turmoil
-  cluster test under partitions/latency.
+  `tick`, inbound RPCs over a channel, outbound via a `Transport`), tested on a
+  simulated clock. *(As it turned out, the "clock abstraction" was a one-liner —
+  `tokio::time::Instant::now().into_std()` — and the real tonic-over-turmoil
+  transport was split off into **I5c**; see the I5b entry below.)*
 
 ## I5b — async RaftDriver (event-loop shell) (§17 task 3)
 

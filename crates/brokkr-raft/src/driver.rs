@@ -75,7 +75,7 @@ enum PeerReply {
 /// A cloneable handle to a running [`RaftDriver`]. It is both the inbound-RPC
 /// sink (it implements [`RaftRpc`], so a server can forward peer RPCs to the
 /// node) and the client interface ([`RaftHandle::propose`], [`RaftHandle::status`]).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RaftHandle {
     inbound: mpsc::Sender<Inbound>,
     proposals: mpsc::Sender<Proposal>,
