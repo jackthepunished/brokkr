@@ -992,6 +992,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from disk; and a 60-round soak interleaving writes with random
   partitions/crashes/restarts that never diverges. (The `turmoil`-based async
   driver with the real tonic transport is the companion milestone I5b.)
+- `brokkr-raft` async event-loop driver (milestone I5b, `docs/plan.md` §17): the
+  `RaftDriver` runs the synchronous `RaftNode` as a single `tokio` task — a
+  `tokio::select!` loop over a periodic tick, inbound RPCs (via a channel),
+  replies to its own outbound RPCs, and client proposals — dispatching each
+  `Outbound` on a detached task through an injected `Transport`. The node is
+  touched only inside the loop, so there is one writer and **no locks** (ADR 0013
+  D4). A cloneable `RaftHandle` is both the inbound-RPC sink (it implements
+  `RaftRpc`, so a server forwards peer RPCs to the node) and the client interface
+  (`propose`, `status`). The driver reads "now" from `tokio::time`, so it runs on
+  real time in production and on **simulated** time under `tokio::time::pause()`
+  or `turmoil`. Two async tests on the paused clock exercise a real multi-node
+  cluster deterministically: a 3-node cluster elects a leader and commits a
+  proposal; a 5-node cluster's minority-partitioned leader cannot advance its
+  commit index and the cluster re-forms one leader on heal. (The real
+  **tonic-over-turmoil** transport + `turmoil` cluster test is a follow-up; it
+  needs new dev-dependencies — `hyper-util` etc. — which are pending owner
+  approval.)
 
 ### Changed
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft

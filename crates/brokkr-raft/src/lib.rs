@@ -37,6 +37,7 @@
 
 #![deny(missing_docs)]
 
+pub mod driver;
 pub mod error;
 pub mod node;
 pub mod rng;
@@ -45,6 +46,7 @@ pub mod storage;
 pub mod transport;
 pub mod types;
 
+pub use driver::{DriverStatus, RaftDriver, RaftHandle};
 pub use error::RaftError;
 pub use node::{Config, Outbound, RaftNode};
 pub use rng::Rng;
@@ -52,6 +54,6 @@ pub use state::HardState;
 pub use storage::RaftLog;
 pub use transport::{
     AppendEntries, AppendEntriesResponse, InMemoryTransport, InstallSnapshot,
-    InstallSnapshotResponse, RequestVote, RequestVoteResponse, TonicTransport, Transport,
+    InstallSnapshotResponse, RaftRpc, RequestVote, RequestVoteResponse, TonicTransport, Transport,
 };
 pub use types::{LogEntry, LogIndex, NodeId, Term};

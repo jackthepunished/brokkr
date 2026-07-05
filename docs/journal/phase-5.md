@@ -347,3 +347,51 @@ proto field.
   abstraction so the node runs on turmoil's sim clock, wired to the real
   **tonic-over-turmoil** transport (ADR 0013 D2), with a multi-node turmoil
   cluster test under partitions/latency.
+
+## I5b — async RaftDriver (event-loop shell) (§17 task 3)
+
+- **Date:** 2026-07-06
+- **Affected:** `crates/brokkr-raft` (`driver.rs` new, `tests/driver.rs` new,
+  `lib.rs`, `Cargo.toml` dev-deps).
+- **Outcome:** the synchronous `RaftNode` now runs as a real async task. The
+  `RaftDriver` is the imperative shell — one `tokio::select!` loop, no locks —
+  and it works end-to-end on a real async runtime, proven deterministically on
+  `tokio`'s paused clock (election + commit + minority-partition + heal).
+
+### Decisions / notes
+
+- **Clock: `tokio::time::Instant::now().into_std()`.** `RaftNode.tick`/`handle_*`
+  take `now: std::time::Instant`, and the driver sources it from `tokio::time`.
+  Under `tokio::time::pause()` (and under `turmoil`) that follows the *simulated*
+  clock, so no `Clock` trait or `RaftNode` refactor was needed — the abstraction
+  the owner worried about turned out to be a one-liner. The tests advance the
+  paused clock in small steps, yielding between them so async message round-trips
+  progress; timing is fully reproducible.
+- **One writer, no locks.** The node lives inside the select loop; inbound RPCs,
+  proposals, tick, and replies-to-our-RPCs are the four arms. Outbounds are sent
+  on detached tasks that funnel the peer's reply back into the loop via an
+  unbounded channel — so the node is mutated from exactly one place (ADR 0013 D4
+  honored at the async layer).
+- **`RaftHandle` is both server sink and client.** It implements `RaftRpc`
+  (a tonic/`turmoil` server forwards peer RPCs straight to the node) and exposes
+  `propose`/`status`. This is what the tonic-over-turmoil server side will wrap.
+- **tonic-over-turmoil needs new dependencies — a STOP-AND-ASK.** tonic 0.12 runs
+  on hyper 1.0, so bridging `turmoil::net::TcpStream` into tonic's client
+  connector and server `serve_with_incoming` requires `hyper-util` (`TokioIo`)
+  and probably `tower`/`http-body-util` as **new dev-dependencies**. Per the
+  hard "any dep beyond `turmoil` = stop and ask" rule, this milestone ships the
+  driver (tested on the paused clock + an in-process transport) and defers the
+  real tonic-over-turmoil integration until the owner approves those deps (or
+  chooses framed-protobuf-over-turmoil, which needs none and is proven in
+  `tests/turmoil_wire.rs`).
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
+**56 unit + 11 integration** tests (2 new async driver tests), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I5c:** the real **tonic-over-turmoil** transport + a `turmoil` multi-node
+  cluster test — pending the dependency decision above.
