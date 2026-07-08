@@ -19,8 +19,38 @@ message LogEntry {
   uint64 term = 1;
   // 1-based position in the log.
   uint64 index = 2;
-  // Opaque state-machine command.
+  // Opaque state-machine command (meaningful when `kind` is COMMAND).
   bytes command = 3;
+  // Entry discriminator (I7). COMMAND is the proto3 default, so entries
+  // written before this field existed keep decoding as commands.
+  EntryKind kind = 4;
+  // The cluster configuration, present iff `kind` is CONFIG.
+  ClusterConfig config = 5;
+}
+
+// The kind of a log entry (I7, membership changes).
+enum EntryKind {
+  // `command` holds an opaque state-machine command (the default).
+  ENTRY_KIND_COMMAND = 0;
+  // A leader's start-of-term no-op (reserved for the linearizable-read path).
+  ENTRY_KIND_NOOP = 1;
+  // `config` holds a cluster membership configuration.
+  ENTRY_KIND_CONFIG = 2;
+}
+
+// A cluster membership configuration (I7, joint consensus — Raft §6 /
+// thesis ch. 4). Configurations travel *in the log itself*: appending a
+// CONFIG entry is what changes the membership a node uses.
+message ClusterConfig {
+  // Voting members (during a joint change these are C_new's voters).
+  repeated string voters = 1;
+  // C_old's voters while the joint configuration C_old,new is in flight;
+  // empty otherwise. When non-empty, agreement requires a majority of BOTH
+  // `voters` and `old_voters`.
+  repeated string old_voters = 2;
+  // Non-voting members being caught up before promotion (thesis ch. 4).
+  // Replicated to, never counted toward quorum.
+  repeated string learners = 3;
 }
 
 // RequestVote (Raft §5.2). Sent by a candidate to gather votes.

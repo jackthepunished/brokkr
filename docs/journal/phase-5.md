@@ -514,3 +514,59 @@ soak re-run at `snapshot_threshold = 16`), and
   `EntryPayload::ConfChange`, config applied on append (rolled back on
   truncation, P10), learner catch-up gate, one in-flight change at a time.
   `SnapshotMeta` gains the cluster configuration then.
+
+## I7a — entry payloads & cluster configurations (§17 task 5, groundwork)
+
+- **Date:** 2026-07-08
+- **Affected:** `crates/brokkr-proto` (`raft.proto`: `EntryKind`,
+  `ClusterConfig`, `LogEntry` fields 4–5), `crates/brokkr-raft` (`types.rs`
+  `EntryPayload`/`ClusterConfig` + fallible decode, `transport.rs` entry
+  conversion, `lib.rs`; test touch-ups in `node.rs`, `storage.rs`,
+  `tests/simulation.rs`).
+- **Outcome:** the log can carry configurations. I7 is split like I5 was:
+  **I7a** (this) = types + wire/disk encoding + quorum math, no consensus
+  behavior change; **I7b** = joint-consensus machinery (config-on-append +
+  P10 rollback, dual-majority elections and commits, propose/commit of
+  C_old,new → C_new, `SnapshotMeta` gains the config); **I7c** = learners +
+  catch-up gate + membership churn in the fault campaign.
+
+### Decisions / notes
+
+- **Backward compatibility is the load-bearing constraint.** `EntryKind`
+  rides field 4 with `COMMAND = 0` (the proto3 default), so every entry an
+  I6-era node wrote decodes bit-identically as a command — pinned by a test
+  that decodes the exact pre-I7 field-1–3 encoding. No migration, no version
+  flag.
+- **Decode is now fallible.** `From<pb::LogEntry>` became `TryFrom`: an
+  unknown kind, a CONFIG entry missing its config, or an invalid node id is
+  a `Codec`/`InvalidNodeId` error at the boundary instead of a silently
+  mangled entry. `AppendEntries` conversion propagates it.
+- **Quorum math is a pure function, tested now.** `ClusterConfig::has_quorum`
+  implements §6's rule — strict majority of `voters` AND of `old_voters`
+  when joint; learners never count; an empty voter set never has quorum. I7b
+  wires it into elections and `advance_commit_index`; landing it first means
+  the trickiest arithmetic ships with focused unit tests before any wiring
+  can obscure it.
+- **The sim oracle ignores non-command payloads** (`LogEntry::command()`
+  returns `None` for `Noop`/`Config`): only commands contribute to applied
+  history, which is exactly how the I8 state machine will treat them.
+- **`Noop` is declared but never produced** — the start-of-term no-op stays
+  deferred to the read path (the I4 decision stands); the variant exists so
+  the wire format is settled once.
+
+### Verified per-crate in WSL2
+
+`brokkr-proto` and `brokkr-raft` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, tests (**79 unit + 17 integration**;
+10 new unit: payload/config round-trips, pre-I7 decode compatibility,
+fallible-decode rejections, quorum properties, config-entry disk round-trip),
+and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I7b:** the joint-consensus machinery — track the active config from the
+  log (applied on append, rolled back on truncation, P10), replace the fixed
+  `peers` set with config-derived replication targets, route elections and
+  commits through `has_quorum`, `propose_conf_change` (one in flight;
+  C_old,new commits → append C_new; a leader excluded by a committed C_new
+  steps down), and `SnapshotMeta` gains the config.
