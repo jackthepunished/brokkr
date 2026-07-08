@@ -33,6 +33,10 @@ tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
+# tonic-over-turmoil test glue (dev-only; Phase 5 I5c). Versions match tonic
+# 0.12's hyper 1.0 stack.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.4", features = ["util"] }
 
 # Serialization
 bytes = "1"

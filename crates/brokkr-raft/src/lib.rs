@@ -54,6 +54,7 @@ pub use state::HardState;
 pub use storage::RaftLog;
 pub use transport::{
     AppendEntries, AppendEntriesResponse, InMemoryTransport, InstallSnapshot,
-    InstallSnapshotResponse, RaftRpc, RequestVote, RequestVoteResponse, TonicTransport, Transport,
+    InstallSnapshotResponse, RaftRpc, RaftServiceAdapter, RequestVote, RequestVoteResponse,
+    TonicTransport, Transport,
 };
 pub use types::{LogEntry, LogIndex, NodeId, Term};

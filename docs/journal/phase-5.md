@@ -395,3 +395,61 @@ proto field.
 
 - **I5c:** the real **tonic-over-turmoil** transport + a `turmoil` multi-node
   cluster test — pending the dependency decision above.
+
+## I5c — tonic-over-turmoil cluster tests (§17 task 3)
+
+- **Date:** 2026-07-08
+- **Affected:** `crates/brokkr-raft` (`tests/turmoil_cluster.rs` new, `lib.rs`
+  re-export, `Cargo.toml` dev-deps), workspace `Cargo.toml` + `Cargo.lock`.
+- **Outcome:** the gap I5b left open is closed. A real 3-node cluster —
+  `RaftDriver`s over the **production `TonicTransport`** — runs with every
+  Raft RPC crossing `turmoil`'s simulated network as genuine gRPC/HTTP2.
+  Election, replicated commit, a minority-partitioned leader that cannot
+  commit, failover to a higher-term leader, and post-heal convergence
+  (step-down + overwrite of the uncommitted minority entry) all hold on the
+  real wire.
+
+### Decisions / notes
+
+- **The glue is dev-only, ~60 lines, no production change.** Server side: a
+  `TurmoilIo` newtype (delegating `AsyncRead`/`AsyncWrite`, implementing
+  tonic's `Connected`) feeds `serve_with_incoming` from a
+  `turmoil::net::TcpListener` via an accept-pump into a `ReceiverStream`.
+  Client side: `Endpoint::connect_with_connector_lazy` with a
+  `tower::service_fn` that opens a `turmoil::net::TcpStream` wrapped in
+  `hyper_util::rt::TokioIo` (the same pattern as tonic 0.12's UDS example).
+  `TonicTransport` and `RaftServiceAdapter` are used exactly as production
+  will use them; `RaftServiceAdapter` is now re-exported from the crate root.
+- **HTTP/2 keepalive is load-bearing, not decoration.** First run failed:
+  after `turmoil::repair`, the healed cluster never re-integrated the deposed
+  leader. Cause: turmoil partitions **drop packets silently** (I5a note), so
+  an h2 connection that was alive when the partition started never surfaces a
+  socket error — tonic pins the dead connection and every RPC on it just
+  times out, forever. `http2_keep_alive_interval` + `keep_alive_timeout` +
+  `keep_alive_while_idle` on the peer `Endpoint`s makes hyper declare the
+  connection dead, and the lazy channel redials. **Carry this into I9:** the
+  production HA control plane's peer channels need the same keepalive
+  settings, or a real-world partition heals into the same wedge.
+- **Deps trimmed from the approved set.** `http-body-util` turned out
+  unnecessary; `brokkr-proto`/`prost`/`tonic` were already regular
+  dependencies (visible to integration tests). Net new: `hyper-util`
+  (`tokio` feature) + `tower` (`util`) in the workspace, and
+  `hyper-util`/`tower`/`tokio-stream` as `brokkr-raft` dev-deps.
+- **Observation stays out-of-band.** As in the driver tests, `RaftHandle`s in
+  a shared registry are used for `status()`/`propose` — only Raft traffic is
+  subject to the simulated network, which is exactly what
+  `turmoil::partition`/`repair` manipulate. A client-facing RPC surface is
+  I8/I9 scope.
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
+**56 unit + 13 integration** tests (2 new tonic-over-turmoil scenarios), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I6:** snapshots / log compaction (plan §17 task 4) — `InstallSnapshot`
+  is already stubbed in the wire types and `RaftRpc`; the driver's
+  `install_snapshot` handler currently rejects with "not implemented until
+  I6".
