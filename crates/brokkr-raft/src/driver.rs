@@ -22,6 +22,7 @@
 //! under `turmoil` or `tokio::time::pause()` — which is what makes the
 //! multi-node tests deterministic.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use crate::transport::{
     AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, RaftRpc,
     RequestVote, RequestVoteResponse, Transport,
 };
-use crate::types::{LogIndex, NodeId, SnapshotMeta, Term};
+use crate::types::{ClusterConfig, LogIndex, NodeId, SnapshotMeta, Term};
 
 /// A point-in-time snapshot of a driver's node state, for observability/tests.
 #[derive(Debug, Clone)]
@@ -53,6 +54,8 @@ pub struct DriverStatus {
     pub leader: Option<NodeId>,
     /// The node's installed snapshot metadata, if any (I6).
     pub snapshot: Option<SnapshotMeta>,
+    /// The cluster configuration currently in force (I7b).
+    pub config: ClusterConfig,
 }
 
 /// Work delivered into the driver's event loop.
@@ -61,6 +64,7 @@ enum Inbound {
     AppendEntries(AppendEntries, oneshot::Sender<AppendEntriesResponse>),
     InstallSnapshot(InstallSnapshot, oneshot::Sender<InstallSnapshotResponse>),
     Compact(Bytes, oneshot::Sender<Result<SnapshotMeta, RaftError>>),
+    ConfChange(BTreeSet<NodeId>, oneshot::Sender<Result<(), RaftError>>),
     Status(oneshot::Sender<DriverStatus>),
 }
 
@@ -111,6 +115,13 @@ impl RaftHandle {
     /// machine's `snapshot()` callback.
     pub async fn compact(&self, data: Bytes) -> Result<SnapshotMeta, RaftError> {
         self.query(|tx| Inbound::Compact(data, tx)).await?
+    }
+
+    /// Begins a joint-consensus membership change to `new_voters` (I7b).
+    /// Resolves once the leader has appended C_old,new; the C_new phase and
+    /// any step-down happen automatically as commits advance.
+    pub async fn propose_conf_change(&self, new_voters: BTreeSet<NodeId>) -> Result<(), RaftError> {
+        self.query(|tx| Inbound::ConfChange(new_voters, tx)).await?
     }
 
     async fn query<R>(
@@ -206,7 +217,7 @@ impl<T: Transport + 'static> RaftDriver<T> {
                     }
                     maybe = self.proposals.recv() => {
                         let Some(prop) = maybe else { break };
-                        match self.node.propose(prop.command) {
+                        match self.node.propose(prop.command, Self::now()) {
                             Ok(outs) => {
                                 self.dispatch(outs);
                                 let _ = prop.reply.send(Ok(()));
@@ -268,6 +279,17 @@ impl<T: Transport + 'static> RaftDriver<T> {
             Inbound::Compact(data, reply) => {
                 let _ = reply.send(self.node.compact(data));
             }
+            Inbound::ConfChange(new_voters, reply) => {
+                match self.node.propose_conf_change(new_voters, now) {
+                    Ok(outs) => {
+                        self.dispatch(outs);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
             Inbound::Status(reply) => {
                 let status = DriverStatus {
                     is_leader: self.node.is_leader(),
@@ -276,6 +298,7 @@ impl<T: Transport + 'static> RaftDriver<T> {
                     last_log_index: self.node.last_log_index()?,
                     leader: self.node.leader_id().cloned(),
                     snapshot: self.node.snapshot_meta(),
+                    config: self.node.active_config().clone(),
                 };
                 let _ = reply.send(status);
             }

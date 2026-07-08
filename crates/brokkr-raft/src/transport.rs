@@ -32,7 +32,7 @@ use brokkr_proto::brokkr::v1::raft_service_client::RaftServiceClient;
 use brokkr_proto::brokkr::v1::raft_service_server::{RaftService, RaftServiceServer};
 
 use crate::error::RaftError;
-use crate::types::{LogEntry, LogIndex, NodeId, Term};
+use crate::types::{ClusterConfig, LogEntry, LogIndex, NodeId, Term};
 
 // ---------------------------------------------------------------------------
 // Internal request/reply types
@@ -113,6 +113,10 @@ pub struct InstallSnapshot {
     pub data: Bytes,
     /// Whether this is the final chunk.
     pub done: bool,
+    /// The cluster configuration in effect at `last_included_index` (I7b) —
+    /// the snapshot replaces config entries too, so the receiver learns its
+    /// membership from here.
+    pub config: ClusterConfig,
 }
 
 /// The reply to an [`InstallSnapshot`].
@@ -232,6 +236,7 @@ impl From<InstallSnapshot> for pb::InstallSnapshotRequest {
             offset: r.offset,
             data: r.data.to_vec(),
             done: r.done,
+            config: Some(pb::ClusterConfig::from(&r.config)),
         }
     }
 }
@@ -247,6 +252,12 @@ impl TryFrom<pb::InstallSnapshotRequest> for InstallSnapshot {
             offset: p.offset,
             data: Bytes::from(p.data),
             done: p.done,
+            // Absent from a pre-I7b sender: the empty ("unknown") config.
+            config: p
+                .config
+                .map(ClusterConfig::try_from)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 }
@@ -605,6 +616,13 @@ mod tests {
 
     #[test]
     fn install_snapshot_wire_round_trips() {
+        // A joint config with learners exercises every ClusterConfig field
+        // across the wire (I7b).
+        let config = ClusterConfig {
+            voters: [node("a"), node("b")].into_iter().collect(),
+            old_voters: Some([node("c")].into_iter().collect()),
+            learners: [node("l")].into_iter().collect(),
+        };
         let is = InstallSnapshot {
             term: Term::new(6),
             leader_id: node("leader"),
@@ -613,6 +631,7 @@ mod tests {
             offset: 4096,
             data: Bytes::from_static(b"snapshot-chunk"),
             done: true,
+            config,
         };
         let proto = pb::InstallSnapshotRequest::from(is.clone());
         let back = InstallSnapshot::try_from(proto).unwrap();
@@ -737,6 +756,7 @@ mod tests {
             offset: 0,
             data: Bytes::new(),
             done: true,
+            config: ClusterConfig::default(),
         };
         let is_resp = transport.install_snapshot(&node("peer"), is).await.unwrap();
         assert_eq!(is_resp.term, Term::new(2));

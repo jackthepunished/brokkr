@@ -41,6 +41,11 @@ pub enum RaftError {
     /// missing snapshot, or an unsupported chunked `InstallSnapshot`).
     #[error("snapshot error: {0}")]
     Snapshot(String),
+
+    /// A membership change was rejected (one already in flight, or an empty
+    /// or unchanged voter set).
+    #[error("configuration change rejected: {0}")]
+    ConfChange(String),
 }
 
 impl From<prost::DecodeError> for RaftError {

@@ -123,6 +123,10 @@ message InstallSnapshotRequest {
   bytes data = 6;
   // True if this is the last chunk.
   bool done = 7;
+  // The cluster configuration in effect at `last_included_index` (I7b) —
+  // snapshots replace config entries too, so the receiver must learn the
+  // membership from here.
+  ClusterConfig config = 8;
 }
 
 message InstallSnapshotReply {

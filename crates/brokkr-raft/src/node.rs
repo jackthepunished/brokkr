@@ -37,7 +37,7 @@ use crate::transport::{
     AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, RequestVote,
     RequestVoteResponse,
 };
-use crate::types::{LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+use crate::types::{ClusterConfig, EntryPayload, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 /// Timing parameters for a node. Defaults match the paper's 150–300 ms election
 /// window (`docs/raft-notes.md` §4.1).
@@ -118,12 +118,99 @@ pub enum Outbound {
     },
 }
 
+/// Tracks the cluster configurations visible in the log (I7b, Raft §6).
+///
+/// The paper's rule: a server uses the **latest configuration in its log** —
+/// committed or not — for all decisions, from the moment the entry is
+/// *appended*. Truncating a conflicting suffix therefore rolls the active
+/// configuration back (P10, the nastiest edge), and compaction folds config
+/// entries into the snapshot's config.
+#[derive(Debug, Clone)]
+struct ConfigTracker {
+    /// The configuration as of the snapshot / bootstrap.
+    base: ClusterConfig,
+    /// The log index `base` corresponds to (the snapshot index, or 0).
+    base_index: LogIndex,
+    /// Config entries still present in the log, ascending by index.
+    in_log: Vec<(LogIndex, ClusterConfig)>,
+}
+
+impl ConfigTracker {
+    fn new(base: ClusterConfig, base_index: LogIndex) -> Self {
+        ConfigTracker {
+            base,
+            base_index,
+            in_log: Vec::new(),
+        }
+    }
+
+    /// The configuration currently in force (the latest in the log).
+    fn active(&self) -> &ClusterConfig {
+        self.in_log.last().map(|(_, c)| c).unwrap_or(&self.base)
+    }
+
+    /// The index of the entry that produced the active configuration.
+    fn latest_index(&self) -> LogIndex {
+        self.in_log
+            .last()
+            .map(|(i, _)| *i)
+            .unwrap_or(self.base_index)
+    }
+
+    /// The configuration in effect at `index` (for snapshotting).
+    fn config_at(&self, index: LogIndex) -> &ClusterConfig {
+        self.in_log
+            .iter()
+            .rev()
+            .find(|(i, _)| *i <= index)
+            .map(|(_, c)| c)
+            .unwrap_or(&self.base)
+    }
+
+    /// Records a config entry appended at `index`. Anything previously known
+    /// at or beyond `index` is superseded (an overwrite is truncate+append).
+    fn on_append(&mut self, index: LogIndex, config: ClusterConfig) {
+        self.in_log.retain(|(i, _)| *i < index);
+        self.in_log.push((index, config));
+    }
+
+    /// P10: truncating the suffix from `from` rolls back any configuration
+    /// the truncated entries carried.
+    fn on_truncate(&mut self, from: LogIndex) {
+        self.in_log.retain(|(i, _)| *i < from);
+    }
+
+    /// Folds every config entry a snapshot at `to` covers into the base.
+    fn on_compact(&mut self, to: LogIndex) {
+        self.base = self.config_at(to).clone();
+        self.base_index = to;
+        self.in_log.retain(|(i, _)| *i > to);
+    }
+
+    /// Adopts an installed snapshot's configuration as the new base; when the
+    /// whole log was discarded, any tracked config entries go with it.
+    fn on_install_snapshot(&mut self, config: ClusterConfig, index: LogIndex, log_wiped: bool) {
+        // An empty config comes from a pre-I7b sender: keep the current base
+        // rather than adopting a voterless cluster.
+        if !config.voters.is_empty() {
+            self.base = config;
+        }
+        self.base_index = index;
+        if log_wiped {
+            self.in_log.clear();
+        } else {
+            self.in_log.retain(|(i, _)| *i > index);
+        }
+    }
+}
+
 /// A Raft node: the consensus state machine for one server.
 #[derive(Debug)]
 pub struct RaftNode {
     id: NodeId,
-    /// The other members of the cluster (self is excluded).
-    peers: Vec<NodeId>,
+    /// The cluster configurations visible in the log; `configs.active()` is
+    /// the membership every decision uses (I7b, Raft §6).
+    configs: ConfigTracker,
     role: Role,
     /// Durable log + hard state.
     log: RaftLog,
@@ -140,6 +227,10 @@ pub struct RaftNode {
     snapshot: Option<SnapshotMeta>,
     /// The leader this node currently recognizes, if any.
     leader_id: Option<NodeId>,
+    /// When this node last heard from a valid leader (volatile). Backs the
+    /// thesis §4.2.3 vote guard that keeps removed servers (I7b) from
+    /// disrupting the cluster they left.
+    last_leader_contact: Option<Instant>,
     rng: Rng,
     config: Config,
     /// When, if still not a leader, this node will start an election.
@@ -151,6 +242,10 @@ pub struct RaftNode {
 impl RaftNode {
     /// Creates a follower, recovering persisted hard state from `log`, and arms
     /// the first (randomized) election timer relative to `now`.
+    ///
+    /// `peers` seeds the **bootstrap** configuration (voters = `peers` +
+    /// self). It only matters until a configuration is learned from the
+    /// snapshot or a log entry — those always take precedence (Raft §6).
     pub fn new(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -164,17 +259,43 @@ impl RaftNode {
         // P9: everything a snapshot covers is committed and applied; the commit
         // index must never regress below it across a restart.
         let commit_floor = snapshot
+            .as_ref()
             .map(|m| m.last_included_index)
             .unwrap_or(LogIndex::ZERO);
+
+        let bootstrap = {
+            let mut voters: BTreeSet<NodeId> = peers.into_iter().collect();
+            voters.insert(id.clone());
+            ClusterConfig::single(voters)
+        };
+        let (base, base_index) = match &snapshot {
+            // A pre-I7b snapshot has an empty ("unknown") config: fall back
+            // to the bootstrap membership.
+            Some(m) if !m.config.voters.is_empty() => (m.config.clone(), m.last_included_index),
+            Some(m) => (bootstrap, m.last_included_index),
+            None => (bootstrap, LogIndex::ZERO),
+        };
+        let mut configs = ConfigTracker::new(base, base_index);
+        // Recover config entries surviving in the log (startup-only scan).
+        let first = log.first_index()?;
+        if first != LogIndex::ZERO {
+            for entry in log.entries_from(first)? {
+                if let EntryPayload::Config(c) = &entry.payload {
+                    configs.on_append(entry.index, c.clone());
+                }
+            }
+        }
+
         let mut node = RaftNode {
             id,
-            peers,
+            configs,
             role: Role::Follower,
             log,
             hard,
             commit_index: commit_floor,
             snapshot,
             leader_id: None,
+            last_leader_contact: None,
             rng,
             config,
             election_deadline: now,
@@ -244,7 +365,13 @@ impl RaftNode {
 
     /// The installed snapshot's metadata, if any (I6).
     pub fn snapshot_meta(&self) -> Option<SnapshotMeta> {
-        self.snapshot
+        self.snapshot.clone()
+    }
+
+    /// The cluster configuration currently in force — the latest one in the
+    /// log, committed or not (I7b, Raft §6).
+    pub fn active_config(&self) -> &ClusterConfig {
+        self.configs.active()
     }
 
     /// The installed snapshot (metadata + opaque blob), if any. The blob is
@@ -262,8 +389,34 @@ impl RaftNode {
     /// The index of the last entry the current snapshot covers (ZERO if none).
     fn snapshot_index(&self) -> LogIndex {
         self.snapshot
+            .as_ref()
             .map(|m| m.last_included_index)
             .unwrap_or(LogIndex::ZERO)
+    }
+
+    /// Every member the leader replicates to: voters of both configurations
+    /// (when joint) plus learners, excluding self.
+    fn replication_targets(&self) -> Vec<NodeId> {
+        let active = self.configs.active();
+        let mut members: BTreeSet<NodeId> = active.voters.iter().cloned().collect();
+        if let Some(old) = &active.old_voters {
+            members.extend(old.iter().cloned());
+        }
+        members.extend(active.learners.iter().cloned());
+        members.remove(&self.id);
+        members.into_iter().collect()
+    }
+
+    /// Every member whose vote can count: voters of both configurations when
+    /// joint (learners never vote), excluding self.
+    fn vote_targets(&self) -> Vec<NodeId> {
+        let active = self.configs.active();
+        let mut voters: BTreeSet<NodeId> = active.voters.iter().cloned().collect();
+        if let Some(old) = &active.old_voters {
+            voters.extend(old.iter().cloned());
+        }
+        voters.remove(&self.id);
+        voters.into_iter().collect()
     }
 
     /// The term at `index`: from the log entry if present, or from the
@@ -274,7 +427,7 @@ impl RaftNode {
         if let Some(entry) = self.log.get(index)? {
             return Ok(Some(entry.term));
         }
-        match self.snapshot {
+        match &self.snapshot {
             Some(meta) if meta.last_included_index == index => Ok(Some(meta.last_included_term)),
             _ => Ok(None),
         }
@@ -340,8 +493,9 @@ impl RaftNode {
     // --- elections --------------------------------------------------------
 
     /// Starts an election (candidate rules, `docs/raft-notes.md` §4): bump the
-    /// term, vote for self (persisted), and request votes from all peers. A
-    /// single-node cluster wins immediately.
+    /// term, vote for self (persisted), and request votes from every voter in
+    /// the active configuration (I7b — learners are never asked). A cluster
+    /// whose sole voter is this node wins immediately.
     fn start_election(&mut self, now: Instant) -> Result<Vec<Outbound>, RaftError> {
         let new_term = self.hard.current_term.next();
         // Advance the term (clearing any prior vote), then vote for ourselves,
@@ -351,12 +505,14 @@ impl RaftNode {
 
         let mut votes = BTreeSet::new();
         votes.insert(self.id.clone());
+        let self_quorum = self.configs.active().has_quorum(&votes);
         self.role = Role::Candidate { votes };
         self.leader_id = None;
         self.arm_election_timer(now);
 
-        // A one-node cluster is its own majority.
-        if self.is_majority(1) {
+        // A cluster whose quorum is satisfied by this node alone (e.g. a
+        // single-voter bootstrap) elects immediately.
+        if self_quorum {
             return self.become_leader(now);
         }
 
@@ -368,10 +524,10 @@ impl RaftNode {
             last_log_term,
         };
         Ok(self
-            .peers
-            .iter()
+            .vote_targets()
+            .into_iter()
             .map(|peer| Outbound::RequestVote {
-                to: peer.clone(),
+                to: peer,
                 request: request.clone(),
             })
             .collect())
@@ -381,9 +537,9 @@ impl RaftNode {
         let last = self.log.last_index()?;
         let mut next_index = BTreeMap::new();
         let mut match_index = BTreeMap::new();
-        for peer in &self.peers {
+        for peer in self.replication_targets() {
             next_index.insert(peer.clone(), last.next());
-            match_index.insert(peer.clone(), LogIndex::ZERO);
+            match_index.insert(peer, LogIndex::ZERO);
         }
         self.role = Role::Leader(LeaderState {
             next_index,
@@ -401,14 +557,15 @@ impl RaftNode {
         self.replicate_all()
     }
 
-    /// Builds an `AppendEntries` for every peer starting at its `nextIndex`. An
-    /// up-to-date peer receives an empty (heartbeat) request.
+    /// Builds an `AppendEntries` for every replication target starting at its
+    /// `nextIndex`. An up-to-date peer receives an empty (heartbeat) request.
     fn replicate_all(&self) -> Result<Vec<Outbound>, RaftError> {
         let Role::Leader(state) = &self.role else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::with_capacity(self.peers.len());
-        for peer in &self.peers {
+        let targets = self.replication_targets();
+        let mut out = Vec::with_capacity(targets.len());
+        for peer in &targets {
             out.push(self.append_entries_for(peer, state)?);
         }
         Ok(out)
@@ -441,6 +598,7 @@ impl RaftNode {
                     offset: 0,
                     data,
                     done: true,
+                    config: meta.config,
                 },
             });
         }
@@ -476,13 +634,25 @@ impl RaftNode {
         Ok(vec![self.append_entries_for(peer, state)?])
     }
 
-    fn cluster_size(&self) -> usize {
-        self.peers.len() + 1
-    }
-
-    /// Whether `count` votes constitute a strict majority of the whole cluster.
-    fn is_majority(&self, count: usize) -> bool {
-        count * 2 > self.cluster_size()
+    /// Aligns the leader's per-peer bookkeeping with the active configuration
+    /// (I7b): new members start optimistic (`next = last + 1`, `match = 0`);
+    /// members no longer named by any configuration in force are dropped and
+    /// stop being replicated to.
+    fn refresh_leader_state(&mut self) -> Result<(), RaftError> {
+        let targets: BTreeSet<NodeId> = self.replication_targets().into_iter().collect();
+        let optimistic_next = self.log.last_index()?.next();
+        if let Role::Leader(state) = &mut self.role {
+            state.next_index.retain(|peer, _| targets.contains(peer));
+            state.match_index.retain(|peer, _| targets.contains(peer));
+            for target in targets {
+                state
+                    .next_index
+                    .entry(target.clone())
+                    .or_insert(optimistic_next);
+                state.match_index.entry(target).or_insert(LogIndex::ZERO);
+            }
+        }
+        Ok(())
     }
 
     // --- RequestVote (§4.2) ----------------------------------------------
@@ -494,6 +664,21 @@ impl RaftNode {
         request: RequestVote,
         now: Instant,
     ) -> Result<RequestVoteResponse, RaftError> {
+        // Thesis §4.2.3 (leader stickiness): a server that believes a current
+        // leader exists — it is one, or heard from one within the minimum
+        // election timeout — disregards RequestVote entirely: it neither
+        // updates its term nor grants. Without this, a server *removed* by a
+        // membership change (I7b) keeps timing out and its ever-higher terms
+        // would depose the legitimate leader of the cluster it left. A stale
+        // minority leader still steps down via AppendEntries traffic, so
+        // liveness is unharmed.
+        if self.leader_is_current(now) {
+            return Ok(RequestVoteResponse {
+                term: self.hard.current_term,
+                vote_granted: false,
+            });
+        }
+
         self.observe_term(request.term, now)?;
         let term = self.hard.current_term;
 
@@ -531,6 +716,19 @@ impl RaftNode {
         }
     }
 
+    /// Whether this node believes a current leader exists (thesis §4.2.3): it
+    /// is the leader itself, or it heard from one within the minimum election
+    /// timeout.
+    fn leader_is_current(&self, now: Instant) -> bool {
+        if self.is_leader() {
+            return true;
+        }
+        self.last_leader_contact.is_some_and(|contact| {
+            now.checked_duration_since(contact).unwrap_or_default()
+                < self.config.min_election_timeout
+        })
+    }
+
     /// The election restriction (`docs/raft-notes.md` §6): the candidate's log is
     /// at least as up-to-date as ours iff its last `(term, index)` is
     /// lexicographically `>=` ours — a later last-term wins, ties break on the
@@ -545,8 +743,9 @@ impl RaftNode {
     }
 
     /// Handles a peer's reply to our `RequestVote`. If it carries a higher term
-    /// we step down; if it grants a vote and we reach a majority we become
-    /// leader (and emit initial heartbeats).
+    /// we step down; if it grants a vote and the active configuration's quorum
+    /// is reached — majorities in **both** voter sets while a joint change is
+    /// in flight (I7b, Raft §6) — we become leader.
     pub fn handle_request_vote_response(
         &mut self,
         from: NodeId,
@@ -561,17 +760,18 @@ impl RaftNode {
             return Ok(Vec::new());
         }
 
-        let cluster = self.cluster_size();
-        let reached_majority = if let Role::Candidate { votes } = &mut self.role {
+        let reached_quorum = if let Role::Candidate { votes } = &mut self.role {
             if response.vote_granted {
                 votes.insert(from);
             }
-            votes.len() * 2 > cluster
+            // `has_quorum` only counts voters, so stray grants from nodes
+            // outside the configuration can never elect us.
+            self.configs.active().has_quorum(votes)
         } else {
             false
         };
 
-        if reached_majority {
+        if reached_quorum {
             self.become_leader(now)
         } else {
             Ok(Vec::new())
@@ -603,6 +803,7 @@ impl RaftNode {
         // campaigning, and suppress our own election timer.
         self.role = Role::Follower;
         self.leader_id = Some(request.leader_id.clone());
+        self.last_leader_contact = Some(now);
         self.arm_election_timer(now);
 
         // Step 2: our log must contain an entry at prev_log_index whose term
@@ -708,16 +909,31 @@ impl RaftNode {
                 Some(existing) if existing.term == entry.term => continue,
                 Some(_) => {
                     self.log.truncate_from(entry.index)?;
+                    // P10: the truncated suffix may have carried config
+                    // entries — the active configuration rolls back with it.
+                    self.configs.on_truncate(entry.index);
                     self.log.append_all(&entries[i..])?;
+                    self.note_appended_configs(&entries[i..]);
                     return Ok(());
                 }
                 None => {
                     self.log.append_all(&entries[i..])?;
+                    self.note_appended_configs(&entries[i..]);
                     return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    /// Configurations apply the moment they are appended (Raft §6): record
+    /// every config entry in `entries` in the tracker.
+    fn note_appended_configs(&mut self, entries: &[LogEntry]) {
+        for entry in entries {
+            if let EntryPayload::Config(c) = &entry.payload {
+                self.configs.on_append(entry.index, c.clone());
+            }
+        }
     }
 
     // --- AppendEntries leader side (§5.3, §7) -----------------------------
@@ -742,12 +958,11 @@ impl RaftNode {
 
         if response.success {
             self.record_match(&from, response.match_index);
-            self.advance_commit_index()?;
+            let mut outs = self.advance_commit_index(now)?;
             if self.peer_is_behind(&from)? {
-                self.replicate_to(&from)
-            } else {
-                Ok(Vec::new())
+                outs.extend(self.replicate_to(&from)?);
             }
+            Ok(outs)
         } else {
             self.back_off(&from, response.conflict_index);
             self.replicate_to(&from)
@@ -787,30 +1002,36 @@ impl RaftNode {
     }
 
     /// The leader commit rule (`docs/raft-notes.md` §7 — the **Figure-8 rule**):
-    /// advance `commitIndex` to the largest `N` with `N > commitIndex`, a
-    /// majority of servers (this leader plus peers with `matchIndex ≥ N`) holding
-    /// index `N`, **and** `log[N].term == currentTerm`. That last clause is the
-    /// whole point: a leader must never commit an entry from a *previous* term by
-    /// replica count — such entries commit only indirectly, once a current-term
-    /// entry commits over them.
-    fn advance_commit_index(&mut self) -> Result<(), RaftError> {
+    /// advance `commitIndex` to the largest `N` with `N > commitIndex`, the
+    /// active configuration's **quorum** holding index `N` (majorities in both
+    /// voter sets while a joint change is in flight — I7b, Raft §6; learners
+    /// never count), **and** `log[N].term == currentTerm`. That last clause is
+    /// the whole point: a leader must never commit an entry from a *previous*
+    /// term by replica count — such entries commit only indirectly, once a
+    /// current-term entry commits over them.
+    ///
+    /// A moved commit index may demand configuration follow-ups (the returned
+    /// messages): a committed C_old,new makes the leader append C_new, and a
+    /// committed C_new that excludes the leader makes it step down.
+    fn advance_commit_index(&mut self, now: Instant) -> Result<Vec<Outbound>, RaftError> {
         let current_term = self.hard.current_term;
         let last = self.log.last_index()?;
-        let cluster = self.cluster_size();
         let new_commit = {
             let state = match &self.role {
                 Role::Leader(s) => s,
-                _ => return Ok(()),
+                _ => return Ok(Vec::new()),
             };
             let mut found = self.commit_index;
             let mut n = last;
             while n > self.commit_index {
-                let replicas = 1 + self
-                    .peers
+                let mut acks: BTreeSet<NodeId> = state
+                    .match_index
                     .iter()
-                    .filter(|p| state.match_index.get(*p).copied().unwrap_or(LogIndex::ZERO) >= n)
-                    .count();
-                if replicas * 2 > cluster {
+                    .filter(|(_, m)| **m >= n)
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                acks.insert(self.id.clone());
+                if self.configs.active().has_quorum(&acks) {
                     let term_n = self.log.get(n)?.map(|e| e.term).unwrap_or(Term::ZERO);
                     if term_n == current_term {
                         found = n;
@@ -821,8 +1042,66 @@ impl RaftNode {
             }
             found
         };
+        if new_commit == self.commit_index {
+            return Ok(Vec::new());
+        }
         self.commit_index = new_commit;
-        Ok(())
+        self.after_commit_config_actions(now)
+    }
+
+    /// Leader-side reactions to a moved commit index (I7b, Raft §6):
+    /// - the joint C_old,new committed → append and replicate C_new;
+    /// - C_new committed and this leader is not in it → step down.
+    fn after_commit_config_actions(&mut self, now: Instant) -> Result<Vec<Outbound>, RaftError> {
+        if !self.is_leader() {
+            return Ok(Vec::new());
+        }
+        // Only a *committed* latest configuration triggers anything.
+        if self.configs.latest_index() > self.commit_index {
+            return Ok(Vec::new());
+        }
+        let active = self.configs.active().clone();
+        if active.is_joint() {
+            // Phase two of the change: the joint config is committed, so the
+            // cluster can safely move to C_new alone.
+            let final_config = ClusterConfig {
+                voters: active.voters,
+                old_voters: None,
+                learners: active.learners,
+            };
+            return self.append_config_entry(final_config, now);
+        }
+        if !active.voters.contains(&self.id) {
+            // A committed C_new excludes us: our job is done; step down.
+            self.role = Role::Follower;
+            self.leader_id = None;
+            self.arm_election_timer(now);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Appends a configuration entry to the leader's own log — it takes
+    /// effect immediately (applied on append) — and replicates it.
+    fn append_config_entry(
+        &mut self,
+        config: ClusterConfig,
+        now: Instant,
+    ) -> Result<Vec<Outbound>, RaftError> {
+        let index = self.log.last_index()?.next();
+        let entry = LogEntry::with_payload(
+            self.hard.current_term,
+            index,
+            EntryPayload::Config(config.clone()),
+        );
+        self.log.append(&entry)?;
+        self.configs.on_append(index, config);
+        self.refresh_leader_state()?;
+        // The new entry may already satisfy quorum (e.g. every added member
+        // is caught up); recursion is bounded because the follow-up either
+        // steps down or finds a non-joint committed config containing us.
+        let mut outs = self.advance_commit_index(now)?;
+        outs.extend(self.replicate_all()?);
+        Ok(outs)
     }
 
     // --- snapshots (I6, Raft §7) -------------------------------------------
@@ -859,6 +1138,7 @@ impl RaftNode {
         // A valid leader for this term, exactly as in `handle_append_entries`.
         self.role = Role::Follower;
         self.leader_id = Some(request.leader_id.clone());
+        self.last_leader_contact = Some(now);
         self.arm_election_timer(now);
 
         // Stale snapshot: nothing it covers is news to us.
@@ -871,20 +1151,25 @@ impl RaftNode {
         let meta = SnapshotMeta {
             last_included_index: request.last_included_index,
             last_included_term: request.last_included_term,
+            config: request.config.clone(),
         };
         let basis_matches = self.log.get(meta.last_included_index)?.map(|e| e.term)
             == Some(meta.last_included_term);
         if basis_matches {
             // Raft §7: "retain log entries following it".
-            self.log.compact_to(meta, &request.data)?;
+            self.log.compact_to(meta.clone(), &request.data)?;
         } else {
             // Raft §7: "discard the entire log".
             self.log
-                .install_snapshot_replacing_log(meta, &request.data)?;
+                .install_snapshot_replacing_log(meta.clone(), &request.data)?;
         }
-        self.snapshot = Some(meta);
+        // The snapshot replaces config entries too: adopt its configuration
+        // as the new base (I7b), keeping any retained tail's configs.
+        self.configs
+            .on_install_snapshot(request.config, meta.last_included_index, !basis_matches);
         // The guard above ensures this only ever moves the commit index forward.
         self.commit_index = meta.last_included_index;
+        self.snapshot = Some(meta);
         Ok(InstallSnapshotResponse { term })
     }
 
@@ -904,16 +1189,15 @@ impl RaftNode {
         if response.term != self.hard.current_term || !self.is_leader() {
             return Ok(Vec::new());
         }
-        let Some(meta) = self.snapshot else {
+        let Some(snapshot_index) = self.snapshot.as_ref().map(|m| m.last_included_index) else {
             return Ok(Vec::new());
         };
-        self.record_match(&from, meta.last_included_index);
-        self.advance_commit_index()?;
+        self.record_match(&from, snapshot_index);
+        let mut outs = self.advance_commit_index(now)?;
         if self.peer_is_behind(&from)? {
-            self.replicate_to(&from)
-        } else {
-            Ok(Vec::new())
+            outs.extend(self.replicate_to(&from)?);
         }
+        Ok(outs)
     }
 
     /// Whether the committed-but-uncompacted portion of the log has outgrown
@@ -947,9 +1231,13 @@ impl RaftNode {
         let meta = SnapshotMeta {
             last_included_index: index,
             last_included_term: term,
+            // The snapshot replaces config entries too: record the
+            // configuration in effect at the compaction point (I7b).
+            config: self.configs.config_at(index).clone(),
         };
-        self.log.compact_to(meta, &data)?;
-        self.snapshot = Some(meta);
+        self.log.compact_to(meta.clone(), &data)?;
+        self.snapshot = Some(meta.clone());
+        self.configs.on_compact(index);
         Ok(meta)
     }
 
@@ -959,7 +1247,7 @@ impl RaftNode {
     /// resulting `AppendEntries` to send. Errors with [`RaftError::NotLeader`] if
     /// this node is not the leader (the caller — the control plane in I8 —
     /// redirects the client to the current leader).
-    pub fn propose(&mut self, command: Bytes) -> Result<Vec<Outbound>, RaftError> {
+    pub fn propose(&mut self, command: Bytes, now: Instant) -> Result<Vec<Outbound>, RaftError> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader: self.leader_id.as_ref().map(|l| l.to_string()),
@@ -968,9 +1256,58 @@ impl RaftNode {
         let index = self.log.last_index()?.next();
         let entry = LogEntry::new(self.hard.current_term, index, command);
         self.log.append(&entry)?;
-        // A single-node cluster is its own majority and commits immediately.
-        self.advance_commit_index()?;
-        self.replicate_all()
+        // A cluster whose quorum this node satisfies alone commits immediately.
+        let mut outs = self.advance_commit_index(now)?;
+        outs.extend(self.replicate_all()?);
+        Ok(outs)
+    }
+
+    /// Begins a joint-consensus membership change to `new_voters` (I7b, Raft
+    /// §6): appends the joint configuration C_old,new — in force from this
+    /// very append — and replicates it. Once C_old,new commits (majorities in
+    /// **both** voter sets), the leader automatically appends C_new; once
+    /// C_new commits and excludes this leader, it steps down.
+    ///
+    /// Errors: [`RaftError::NotLeader`] on a non-leader;
+    /// [`RaftError::ConfChange`] if a change is already in flight (the latest
+    /// config in the log is uncommitted or joint) or `new_voters` is empty.
+    pub fn propose_conf_change(
+        &mut self,
+        new_voters: BTreeSet<NodeId>,
+        now: Instant,
+    ) -> Result<Vec<Outbound>, RaftError> {
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader: self.leader_id.as_ref().map(|l| l.to_string()),
+            });
+        }
+        if new_voters.is_empty() {
+            return Err(RaftError::ConfChange(
+                "the new configuration must have at least one voter".to_string(),
+            ));
+        }
+        let active = self.configs.active();
+        if active.is_joint() || self.configs.latest_index() > self.commit_index {
+            return Err(RaftError::ConfChange(
+                "a configuration change is already in flight (one at a time)".to_string(),
+            ));
+        }
+        if new_voters == active.voters {
+            return Err(RaftError::ConfChange(
+                "the new configuration is identical to the current one".to_string(),
+            ));
+        }
+        let joint = ClusterConfig {
+            old_voters: Some(active.voters.clone()),
+            learners: active
+                .learners
+                .iter()
+                .filter(|l| !new_voters.contains(*l))
+                .cloned()
+                .collect(),
+            voters: new_voters,
+        };
+        self.append_config_entry(joint, now)
     }
 }
 
@@ -1070,21 +1407,54 @@ mod tests {
         );
     }
 
+    /// Thesis §4.2.3 (leader stickiness, required by I7b): a current leader
+    /// disregards even a higher-term RequestVote — it stays leader and its
+    /// term does not move. (It still steps down to higher terms carried by
+    /// AppendEntries traffic, which is what preserves liveness.)
     #[test]
-    fn higher_term_request_vote_steps_a_leader_down() {
+    fn a_current_leader_ignores_higher_term_request_votes() {
         let t0 = Instant::now();
         let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
         c.tick_and_deliver(0, t0 + Duration::from_secs(1));
         assert!(c.nodes[0].is_leader());
         assert_eq!(c.nodes[0].current_term(), Term::new(1));
 
-        // A RequestVote from a higher term forces the leader back to follower.
         let resp = c.nodes[0]
             .handle_request_vote(request_vote("n1", 2), t0)
             .unwrap();
-        assert!(c.nodes[0].is_follower());
-        assert_eq!(c.nodes[0].current_term(), Term::new(2));
-        assert!(resp.vote_granted, "empty logs are equally up-to-date");
+        assert!(!resp.vote_granted, "a serving leader never grants");
+        assert!(c.nodes[0].is_leader(), "the leader is not disrupted");
+        assert_eq!(c.nodes[0].current_term(), Term::new(1), "term untouched");
+    }
+
+    /// The follower half of thesis §4.2.3: fresh leader contact suppresses
+    /// votes; once the contact goes stale a vote is granted normally.
+    #[test]
+    fn recent_leader_contact_suppresses_votes_until_it_goes_stale() {
+        let t0 = Instant::now();
+        let (_d, mut follower) = make("f", &["ldr", "c"], 1, t0);
+
+        // Hear from a valid leader at t0.
+        follower
+            .handle_append_entries(append_entries("ldr", 1, 0, 0, vec![], 0), t0)
+            .unwrap();
+
+        // 50 ms later (< min election timeout): the vote is disregarded and
+        // the term does not move.
+        let soon = t0 + Duration::from_millis(50);
+        let resp = follower
+            .handle_request_vote(request_vote("c", 5), soon)
+            .unwrap();
+        assert!(!resp.vote_granted);
+        assert_eq!(follower.current_term(), Term::new(1), "term not bumped");
+
+        // Well past the minimum election timeout: the candidate is heard out.
+        let later = t0 + Duration::from_secs(1);
+        let resp = follower
+            .handle_request_vote(request_vote("c", 5), later)
+            .unwrap();
+        assert!(resp.vote_granted);
+        assert_eq!(follower.current_term(), Term::new(5));
     }
 
     // --- election restriction (§6) ---------------------------------------
@@ -1169,10 +1539,6 @@ mod tests {
             Cluster { _dirs: dirs, nodes }
         }
 
-        fn idx(&self, id: &NodeId) -> usize {
-            self.nodes.iter().position(|n| n.id() == id).unwrap()
-        }
-
         fn leaders(&self) -> Vec<usize> {
             self.nodes
                 .iter()
@@ -1183,7 +1549,9 @@ mod tests {
         }
 
         /// Delivers a batch of `(sender_index, message)` to quiescence, routing
-        /// each reply back to its sender.
+        /// each reply back to its sender. Messages addressed to nodes the
+        /// cluster does not contain (e.g. unreachable members of a proposed
+        /// configuration) are silently dropped, like a dead host.
         fn deliver_all(&mut self, initial: Vec<(usize, Outbound)>, now: Instant) {
             let mut queue: VecDeque<(usize, Outbound)> = initial.into_iter().collect();
             let mut budget = 10_000;
@@ -1192,7 +1560,9 @@ mod tests {
                 assert!(budget > 0, "message storm — election is not converging");
                 match out {
                     Outbound::RequestVote { to, request } => {
-                        let ti = self.idx(&to);
+                        let Some(ti) = self.try_idx(&to) else {
+                            continue;
+                        };
                         let resp = self.nodes[ti].handle_request_vote(request, now).unwrap();
                         let more = self.nodes[from]
                             .handle_request_vote_response(to, resp, now)
@@ -1202,7 +1572,9 @@ mod tests {
                         }
                     }
                     Outbound::AppendEntries { to, request } => {
-                        let ti = self.idx(&to);
+                        let Some(ti) = self.try_idx(&to) else {
+                            continue;
+                        };
                         let resp = self.nodes[ti].handle_append_entries(request, now).unwrap();
                         let more = self.nodes[from]
                             .handle_append_entries_response(to, resp, now)
@@ -1212,7 +1584,9 @@ mod tests {
                         }
                     }
                     Outbound::InstallSnapshot { to, request } => {
-                        let ti = self.idx(&to);
+                        let Some(ti) = self.try_idx(&to) else {
+                            continue;
+                        };
                         let resp = self.nodes[ti]
                             .handle_install_snapshot(request, now)
                             .unwrap();
@@ -1225,6 +1599,10 @@ mod tests {
                     }
                 }
             }
+        }
+
+        fn try_idx(&self, id: &NodeId) -> Option<usize> {
+            self.nodes.iter().position(|n| n.id() == id)
         }
 
         fn tick_and_deliver(&mut self, i: usize, now: Instant) {
@@ -1418,7 +1796,7 @@ mod tests {
         c.tick_and_deliver(0, now);
         assert!(c.nodes[0].is_leader());
 
-        let out = c.nodes[0].propose(Bytes::from_static(b"x")).unwrap();
+        let out = c.nodes[0].propose(Bytes::from_static(b"x"), now).unwrap();
         c.deliver_all(batch(0, out), now);
 
         assert_eq!(c.nodes[0].commit_index(), LogIndex::new(1));
@@ -1440,9 +1818,10 @@ mod tests {
     fn single_node_leader_commits_proposal_immediately() {
         let t0 = Instant::now();
         let (_d, mut node) = make("solo", &[], 1, t0);
-        node.tick(t0 + Duration::from_secs(1)).unwrap();
+        let now = t0 + Duration::from_secs(1);
+        node.tick(now).unwrap();
         assert!(node.is_leader());
-        node.propose(Bytes::from_static(b"only")).unwrap();
+        node.propose(Bytes::from_static(b"only"), now).unwrap();
         assert_eq!(
             node.commit_index(),
             LogIndex::new(1),
@@ -1454,7 +1833,7 @@ mod tests {
     fn propose_on_a_follower_is_rejected() {
         let now = Instant::now();
         let (_d, mut node) = make("f", &["a", "b"], 1, now);
-        let err = node.propose(Bytes::from_static(b"x")).unwrap_err();
+        let err = node.propose(Bytes::from_static(b"x"), now).unwrap_err();
         assert!(matches!(err, RaftError::NotLeader { .. }));
     }
 
@@ -1614,7 +1993,7 @@ mod tests {
 
         // n0 proposes entry A (term 1) and we place it on the majority {n0, n1}
         // WITHOUT n0 learning n1 stored it — so A is on a majority but uncommitted.
-        let out = c.nodes[0].propose(Bytes::from_static(b"A")).unwrap();
+        let out = c.nodes[0].propose(Bytes::from_static(b"A"), now).unwrap();
         let ae_to_n1 = rv_or_ae_to(&out, "n1");
         if let Outbound::AppendEntries { request, .. } = ae_to_n1 {
             let _ = c.nodes[1].handle_append_entries(request, now).unwrap();
@@ -1644,7 +2023,7 @@ mod tests {
 
         // n1 proposes B (term 2). When B reaches a majority, commit jumps to 2 —
         // committing A indirectly via the Log Matching Property.
-        let out = c.nodes[1].propose(Bytes::from_static(b"B")).unwrap();
+        let out = c.nodes[1].propose(Bytes::from_static(b"B"), now2).unwrap();
         c.deliver_all(batch(1, out), now2);
         assert_eq!(
             c.nodes[1].commit_index(),
@@ -1684,10 +2063,11 @@ mod tests {
         };
 
         let mut node = mk(t0);
-        node.tick(t0 + Duration::from_secs(1)).unwrap();
+        let now = t0 + Duration::from_secs(1);
+        node.tick(now).unwrap();
         assert!(node.is_leader());
         for k in 0..5u32 {
-            node.propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+            node.propose(Bytes::copy_from_slice(&k.to_le_bytes()), now)
                 .unwrap();
         }
         assert_eq!(node.commit_index(), LogIndex::new(5));
@@ -1702,14 +2082,14 @@ mod tests {
         assert!(node.log_entry(LogIndex::new(3)).unwrap().is_none());
 
         // Appending continues seamlessly above the snapshot.
-        node.propose(Bytes::from_static(b"six")).unwrap();
+        node.propose(Bytes::from_static(b"six"), now).unwrap();
         assert_eq!(node.last_log_index().unwrap(), LogIndex::new(6));
         assert_eq!(node.first_log_index().unwrap(), LogIndex::new(6));
 
         // Restart: snapshot metadata recovers and floors the commit index (P9).
         drop(node);
         let node = mk(t0 + Duration::from_secs(2));
-        assert_eq!(node.snapshot_meta(), Some(meta));
+        assert_eq!(node.snapshot_meta(), Some(meta.clone()));
         assert!(node.commit_index() >= LogIndex::new(5));
         let (m, data) = node.snapshot().unwrap().unwrap();
         assert_eq!(m, meta);
@@ -1724,8 +2104,9 @@ mod tests {
         let err = node.compact(Bytes::new()).unwrap_err();
         assert!(matches!(err, RaftError::Snapshot(_)));
 
-        node.tick(t0 + Duration::from_secs(1)).unwrap();
-        node.propose(Bytes::from_static(b"a")).unwrap();
+        let now = t0 + Duration::from_secs(1);
+        node.tick(now).unwrap();
+        node.propose(Bytes::from_static(b"a"), now).unwrap();
         node.compact(Bytes::from_static(b"s1")).unwrap();
         // Compacting again with no new commits is refused.
         let err = node.compact(Bytes::from_static(b"s2")).unwrap_err();
@@ -1743,13 +2124,14 @@ mod tests {
         };
         let mut node =
             RaftNode::new(nid("solo"), vec![], log, Rng::seed_from_u64(1), cfg, t0).unwrap();
-        node.tick(t0 + Duration::from_secs(1)).unwrap();
+        let now = t0 + Duration::from_secs(1);
+        node.tick(now).unwrap();
         for k in 0..4u32 {
-            node.propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+            node.propose(Bytes::copy_from_slice(&k.to_le_bytes()), now)
                 .unwrap();
         }
         assert!(!node.needs_snapshot(), "exactly at the threshold is fine");
-        node.propose(Bytes::from_static(b"tip")).unwrap();
+        node.propose(Bytes::from_static(b"tip"), now).unwrap();
         assert!(node.needs_snapshot(), "one past the threshold triggers");
         node.compact(Bytes::from_static(b"s")).unwrap();
         assert!(!node.needs_snapshot(), "compaction resets the trigger");
@@ -1767,7 +2149,7 @@ mod tests {
         // propagates the leader's commit index to the followers.
         for k in 0..3u32 {
             let out = c.nodes[0]
-                .propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+                .propose(Bytes::copy_from_slice(&k.to_le_bytes()), now)
                 .unwrap();
             c.deliver_all(batch(0, out), now);
         }
@@ -1776,7 +2158,7 @@ mod tests {
 
         // Entry 4 reaches only n1 (a majority with the leader): committed on
         // n0 while n2 is left behind at index 3.
-        let out = c.nodes[0].propose(Bytes::from_static(b"e4")).unwrap();
+        let out = c.nodes[0].propose(Bytes::from_static(b"e4"), now).unwrap();
         let to_n1 = rv_or_ae_to(&out, "n1");
         if let Outbound::AppendEntries { request, .. } = to_n1 {
             let resp = c.nodes[1].handle_append_entries(request, now).unwrap();
@@ -1818,7 +2200,7 @@ mod tests {
 
         // Replication above the snapshot boundary resumes normally: the
         // prev term for entry 5 comes from the snapshot metadata on both ends.
-        let out = c.nodes[0].propose(Bytes::from_static(b"e5")).unwrap();
+        let out = c.nodes[0].propose(Bytes::from_static(b"e5"), now).unwrap();
         c.deliver_all(batch(0, out), now);
         assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(5));
         assert_eq!(c.nodes[0].commit_index(), LogIndex::new(5));
@@ -1849,6 +2231,7 @@ mod tests {
                     offset: 0,
                     data: Bytes::from_static(b"old"),
                     done: true,
+                    config: ClusterConfig::default(),
                 },
                 now,
             )
@@ -1873,6 +2256,7 @@ mod tests {
                     offset: 0,
                     data: Bytes::from_static(b"machine@2"),
                     done: true,
+                    config: ClusterConfig::default(),
                 },
                 now,
             )
@@ -1902,6 +2286,7 @@ mod tests {
             offset: 4096,
             data: Bytes::from_static(b"chunk"),
             done: true,
+            config: ClusterConfig::default(),
         };
         let err = follower
             .handle_install_snapshot(req.clone(), now)
@@ -1931,20 +2316,287 @@ mod tests {
         voter.compact(Bytes::from_static(b"machine@3")).unwrap();
         assert_eq!(voter.first_log_index().unwrap(), LogIndex::ZERO);
 
-        // The comparator still sees (term 2, index 3) via the snapshot.
+        // The comparator still sees (term 2, index 3) via the snapshot. The
+        // requests arrive after the leader-stickiness window (§4.2.3) so the
+        // election restriction alone decides.
+        let later = now + Duration::from_secs(1);
         assert!(
             !voter
-                .handle_request_vote(asks(2, 2), now)
+                .handle_request_vote(asks(2, 2), later)
                 .unwrap()
                 .vote_granted,
             "shorter log than the compacted (2,3) loses"
         );
         assert!(
             voter
-                .handle_request_vote(asks(2, 3), now)
+                .handle_request_vote(asks(2, 3), later)
                 .unwrap()
                 .vote_granted,
             "an equal log is still up-to-date after compaction"
         );
+    }
+
+    // --- membership changes (I7b, Raft §6) ---------------------------------
+
+    fn voter_set(names: &[&str]) -> BTreeSet<NodeId> {
+        names.iter().map(|n| nid(n)).collect()
+    }
+
+    fn config_entry(term: u64, index: u64, config: ClusterConfig) -> LogEntry {
+        LogEntry::with_payload(
+            Term::new(term),
+            LogIndex::new(index),
+            EntryPayload::Config(config),
+        )
+    }
+
+    #[test]
+    fn config_applies_on_append_and_rolls_back_on_truncation() {
+        // P10 — the plan calls this the nastiest edge, so it gets its own test.
+        let now = Instant::now();
+        let (_d, mut follower) = make("f", &["ldr"], 1, now);
+        let bootstrap = follower.active_config().clone();
+
+        // A leader replicates a joint config: it applies the moment it is
+        // appended, not committed.
+        let joint = ClusterConfig {
+            voters: voter_set(&["a", "b"]),
+            old_voters: Some(voter_set(&["f", "ldr"])),
+            learners: BTreeSet::new(),
+        };
+        let req = append_entries("ldr", 2, 0, 0, vec![config_entry(2, 1, joint.clone())], 0);
+        follower.handle_append_entries(req, now).unwrap();
+        assert_eq!(follower.active_config(), &joint);
+        assert!(follower.active_config().is_joint());
+
+        // A higher-term leader overwrites index 1 with a plain command: the
+        // truncation must roll the configuration back to the bootstrap one.
+        let overwrite = append_entries(
+            "ldr2",
+            3,
+            0,
+            0,
+            vec![LogEntry::new(
+                Term::new(3),
+                LogIndex::new(1),
+                Bytes::from_static(b"cmd"),
+            )],
+            0,
+        );
+        follower.handle_append_entries(overwrite, now).unwrap();
+        assert_eq!(
+            follower.active_config(),
+            &bootstrap,
+            "P10: the truncated joint config no longer governs this node"
+        );
+        assert!(!follower.active_config().is_joint());
+    }
+
+    #[test]
+    fn conf_change_adds_a_node_end_to_end() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        // Three founding members; n3 starts blank and out of the cluster.
+        let founders = ["n0", "n1", "n2"];
+        let mut dirs = Vec::new();
+        let mut nodes = Vec::new();
+        for (i, id) in founders.iter().enumerate() {
+            let peers: Vec<&str> = founders.iter().filter(|p| *p != id).copied().collect();
+            let (d, n) = make(id, &peers, 1 + i as u64, t0);
+            dirs.push(d);
+            nodes.push(n);
+        }
+        let (d3, n3) = make("n3", &["n0", "n1", "n2"], 7, t0);
+        dirs.push(d3);
+        nodes.push(n3);
+        let mut c = Cluster { _dirs: dirs, nodes };
+
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+        assert_eq!(c.nodes[0].active_config().voters.len(), 3);
+
+        // Add n3: the joint config goes in force immediately on the leader,
+        // and the whole two-phase change runs to completion in one cascade.
+        let outs = c.nodes[0]
+            .propose_conf_change(voter_set(&["n0", "n1", "n2", "n3"]), now)
+            .unwrap();
+        c.deliver_all(batch(0, outs), now);
+
+        for i in 0..4 {
+            let cfg = c.nodes[i].active_config();
+            assert!(!cfg.is_joint(), "n{i} settled on C_new");
+            assert_eq!(cfg.voters.len(), 4, "n{i} sees the four-voter config");
+        }
+        // Joint at index 1, C_new at index 2 — both committed.
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(2));
+
+        // The grown cluster keeps serving: a write commits with 3-of-4.
+        let outs = c.nodes[0].propose(Bytes::from_static(b"w"), now).unwrap();
+        c.deliver_all(batch(0, outs), now);
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(3));
+        assert_eq!(c.nodes[3].last_log_index().unwrap(), LogIndex::new(3));
+    }
+
+    #[test]
+    fn removed_leader_finishes_the_change_then_steps_down() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        // Remove the leader itself: joint commits (majorities of {n0,n1,n2}
+        // and {n1,n2}), C_new commits, and n0 steps down (paper §6).
+        let outs = c.nodes[0]
+            .propose_conf_change(voter_set(&["n1", "n2"]), now)
+            .unwrap();
+        c.deliver_all(batch(0, outs), now);
+
+        assert!(
+            !c.nodes[0].is_leader(),
+            "a committed C_new that excludes the leader forces a step-down"
+        );
+        assert_eq!(c.nodes[1].active_config().voters, voter_set(&["n1", "n2"]));
+
+        // The remaining pair elects among themselves and keeps serving.
+        let later = now + Duration::from_secs(1);
+        c.tick_and_deliver(1, later);
+        assert_eq!(c.leaders(), vec![1], "n1 wins with n2's vote alone");
+        let outs = c.nodes[1].propose(Bytes::from_static(b"w"), later).unwrap();
+        c.deliver_all(batch(1, outs), later);
+        assert!(c.nodes[1].commit_index() >= LogIndex::new(3));
+    }
+
+    #[test]
+    fn joint_config_cannot_commit_without_a_new_set_majority() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        // Move toward {n0, x, y} where x and y are unreachable: the joint
+        // config demands a majority of BOTH voter sets, and {n0} alone can
+        // never satisfy {n0, x, y}.
+        let outs = c.nodes[0]
+            .propose_conf_change(voter_set(&["n0", "x", "y"]), now)
+            .unwrap();
+        c.deliver_all(batch(0, outs), now);
+        let outs = c.nodes[0]
+            .propose(Bytes::from_static(b"stuck"), now)
+            .unwrap();
+        c.deliver_all(batch(0, outs), now);
+
+        assert_eq!(
+            c.nodes[0].commit_index(),
+            LogIndex::ZERO,
+            "no dual-majority window: nothing commits while C_new lacks a majority"
+        );
+        assert!(c.nodes[0].active_config().is_joint(), "stuck in joint");
+
+        // And only one change may be in flight.
+        let err = c.nodes[0]
+            .propose_conf_change(voter_set(&["n0", "n1"]), now)
+            .unwrap_err();
+        assert!(matches!(err, RaftError::ConfChange(_)));
+    }
+
+    #[test]
+    fn conf_change_input_validation() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let (_d, mut follower) = make("f", &["a", "b"], 1, t0);
+        let err = follower
+            .propose_conf_change(voter_set(&["a"]), now)
+            .unwrap_err();
+        assert!(matches!(err, RaftError::NotLeader { .. }));
+
+        let (_d2, mut solo) = make("solo", &[], 1, t0);
+        solo.tick(now).unwrap();
+        assert!(solo.is_leader());
+        let err = solo.propose_conf_change(BTreeSet::new(), now).unwrap_err();
+        assert!(matches!(err, RaftError::ConfChange(_)));
+        let err = solo
+            .propose_conf_change(voter_set(&["solo"]), now)
+            .unwrap_err();
+        assert!(
+            matches!(err, RaftError::ConfChange(_)),
+            "an unchanged voter set is rejected"
+        );
+    }
+
+    #[test]
+    fn snapshot_carries_config_across_restart() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            let mut node = RaftNode::new(
+                nid("f"),
+                vec![nid("ldr")],
+                log,
+                Rng::seed_from_u64(1),
+                Config::default(),
+                t0,
+            )
+            .unwrap();
+            // Learn a committed config {a, b, f} from a leader, then compact.
+            let cfg = ClusterConfig::single(voter_set(&["a", "b", "f"]));
+            let entries = vec![
+                LogEntry::new(Term::new(2), LogIndex::new(1), Bytes::from_static(b"c1")),
+                config_entry(2, 2, cfg.clone()),
+            ];
+            node.handle_append_entries(append_entries("ldr", 2, 0, 0, entries, 2), now)
+                .unwrap();
+            assert_eq!(node.active_config(), &cfg);
+            let meta = node.compact(Bytes::from_static(b"machine@2")).unwrap();
+            assert_eq!(
+                meta.config, cfg,
+                "the snapshot records the config at its point"
+            );
+        }
+        // Restart with a DIFFERENT bootstrap: the snapshot's config wins.
+        let log = RaftLog::open(&path).unwrap();
+        let node = RaftNode::new(
+            nid("f"),
+            vec![nid("zzz")],
+            log,
+            Rng::seed_from_u64(1),
+            Config::default(),
+            t0 + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            node.active_config().voters,
+            voter_set(&["a", "b", "f"]),
+            "membership recovered from the snapshot, not the bootstrap list"
+        );
+    }
+
+    #[test]
+    fn install_snapshot_adopts_the_carried_config() {
+        let now = Instant::now();
+        let (_d, mut fresh) = make("g", &["ldr"], 1, now);
+        let carried = ClusterConfig::single(voter_set(&["a", "b", "g"]));
+        fresh
+            .handle_install_snapshot(
+                InstallSnapshot {
+                    term: Term::new(3),
+                    leader_id: nid("ldr"),
+                    last_included_index: LogIndex::new(9),
+                    last_included_term: Term::new(3),
+                    offset: 0,
+                    data: Bytes::from_static(b"machine@9"),
+                    done: true,
+                    config: carried.clone(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(fresh.active_config(), &carried);
+        assert_eq!(fresh.snapshot_meta().unwrap().config, carried);
+        assert_eq!(fresh.commit_index(), LogIndex::new(9));
     }
 }

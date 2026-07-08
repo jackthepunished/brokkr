@@ -1064,6 +1064,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ids are rejected instead of silently mangled. No behavioral change to
   consensus yet — the dual-majority election/commit machinery,
   config-on-append semantics, and learner catch-up land as I7b/I7c.
+- `brokkr-raft` joint-consensus membership changes (milestone I7b,
+  `docs/plan.md` §17 task 5, Raft §6 / thesis ch. 4): the node now derives
+  its membership from the log. A `ConfigTracker` holds the base config
+  (snapshot/bootstrap) plus every config entry still in the log; the active
+  config **applies on append** and **rolls back on truncation** (P10, tested
+  head-on). The fixed `peers` list is gone: replication targets, vote
+  targets, election tallies, and the commit rule all derive from the active
+  config via `ClusterConfig::has_quorum` — majorities in *both* voter sets
+  while C_old,new is in flight, learners never counted.
+  `RaftNode::propose_conf_change(new_voters)` appends C_old,new (one change
+  in flight, validated); when it commits the leader automatically appends
+  C_new; when a committed C_new excludes the leader it steps down — and the
+  remaining members elect among themselves. `SnapshotMeta` and
+  `InstallSnapshot` now carry the configuration in effect at the snapshot
+  point (proto field 8 + persisted `snapshot_config`), so a node restoring
+  from snapshot learns its membership from it, overriding the bootstrap
+  list. **Leader stickiness (thesis §4.2.3)** ships with this: a server
+  that heard from a current leader within the minimum election timeout
+  disregards RequestVote (no term bump, no grant). The driver-level removal
+  test caught the omission — without it, the *removed* server's endless
+  campaigns deposed the leader of the cluster it had left; a stale minority
+  leader still steps down via AppendEntries terms, so liveness holds.
+  Driver: `RaftHandle::propose_conf_change` + `DriverStatus.config`.
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
   hard state (`currentTerm` + `votedFor`) is now modelled by `HardState` and
   written **atomically as a unit** via `RaftLog::save_hard_state` in a single
