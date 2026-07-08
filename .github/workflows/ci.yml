@@ -15,6 +15,8 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
+  # Full backtraces on a test panic make CI failures diagnosable from the log.
+  RUST_BACKTRACE: "1"
 
 jobs:
   fmt:
@@ -37,7 +39,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-key: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   doc:
     name: cargo doc
@@ -48,7 +50,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-key: doc
-      - run: cargo doc --workspace --no-deps --all-features
+      - run: cargo doc --workspace --no-deps --all-features --locked
 
   deny:
     name: cargo deny
@@ -79,5 +81,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
           cache-key: ${{ matrix.target }}
-      - run: cargo test --workspace --all-targets
-      - run: cargo build --workspace --release
+      # `--all-targets` runs lib/bin/integration/example tests but NOT
+      # doctests — they need a separate `--doc` invocation. brokkr-proto is
+      # excluded: it is generated code whose protobuf doc comments are not
+      # valid Rust, and an explicit `--doc` run ignores its `doctest = false`.
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo test --workspace --doc --exclude brokkr-proto --locked
+      - run: cargo build --workspace --release --locked
