@@ -231,23 +231,12 @@ impl RaftLog {
             meta_table.insert(META_SNAP_DATA, data).map_err(stor)?;
 
             let mut log_table = write.open_table(LOG_TABLE).map_err(stor)?;
-            let mut to_remove = Vec::new();
             if wipe_entire_log {
-                for item in log_table.range::<u64>(..).map_err(stor)? {
-                    let (key, _value) = item.map_err(stor)?;
-                    to_remove.push(key.value());
-                }
+                log_table.retain(|_, _| false).map_err(stor)?;
             } else {
-                for item in log_table
-                    .range(..=meta.last_included_index.get())
-                    .map_err(stor)?
-                {
-                    let (key, _value) = item.map_err(stor)?;
-                    to_remove.push(key.value());
-                }
-            }
-            for key in to_remove {
-                log_table.remove(key).map_err(stor)?;
+                log_table
+                    .retain_in(..=meta.last_included_index.get(), |_, _| false)
+                    .map_err(stor)?;
             }
         }
         write.commit().map_err(stor)?;
