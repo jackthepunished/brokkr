@@ -54,6 +54,12 @@ pub struct Config {
     /// the shell should supply a state-machine snapshot via
     /// [`RaftNode::compact`].
     pub snapshot_threshold: u64,
+    /// Promotion catch-up gate (I7c, thesis ch. 4): a configuration change may
+    /// add a voter only if the leader has replicated to it to within this many
+    /// entries of its own last log index. Without the gate, promoting a fresh
+    /// node adds a voter that cannot ack anything for a long time and can
+    /// stall commitment.
+    pub catch_up_margin: u64,
 }
 
 impl Default for Config {
@@ -63,6 +69,7 @@ impl Default for Config {
             max_election_timeout: Duration::from_millis(300),
             heartbeat_interval: Duration::from_millis(50),
             snapshot_threshold: 8192,
+            catch_up_margin: 256,
         }
     }
 }
@@ -254,6 +261,43 @@ impl RaftNode {
         config: Config,
         now: Instant,
     ) -> Result<Self, RaftError> {
+        let bootstrap = {
+            let mut voters: BTreeSet<NodeId> = peers.into_iter().collect();
+            voters.insert(id.clone());
+            ClusterConfig::single(voters)
+        };
+        Self::with_bootstrap(id, bootstrap, log, rng, config, now)
+    }
+
+    /// Creates a node that joins as a **learner** (I7c, thesis ch. 4): its
+    /// bootstrap configuration lists `voters` as the cluster and itself only
+    /// as a non-voting learner, so it never campaigns or counts toward quorum
+    /// until a replicated configuration promotes it. This is how a fresh node
+    /// enters an existing cluster without stalling it.
+    pub fn new_learner(
+        id: NodeId,
+        voters: Vec<NodeId>,
+        log: RaftLog,
+        rng: Rng,
+        config: Config,
+        now: Instant,
+    ) -> Result<Self, RaftError> {
+        let bootstrap = ClusterConfig {
+            voters: voters.into_iter().collect(),
+            old_voters: None,
+            learners: [id.clone()].into_iter().collect(),
+        };
+        Self::with_bootstrap(id, bootstrap, log, rng, config, now)
+    }
+
+    fn with_bootstrap(
+        id: NodeId,
+        bootstrap: ClusterConfig,
+        log: RaftLog,
+        rng: Rng,
+        config: Config,
+        now: Instant,
+    ) -> Result<Self, RaftError> {
         let hard = log.load_hard_state()?;
         let snapshot = log.snapshot_meta()?;
         // P9: everything a snapshot covers is committed and applied; the commit
@@ -263,11 +307,6 @@ impl RaftNode {
             .map(|m| m.last_included_index)
             .unwrap_or(LogIndex::ZERO);
 
-        let bootstrap = {
-            let mut voters: BTreeSet<NodeId> = peers.into_iter().collect();
-            voters.insert(id.clone());
-            ClusterConfig::single(voters)
-        };
         let (base, base_index) = match &snapshot {
             // A pre-I7b snapshot has an empty ("unknown") config: fall back
             // to the bootstrap membership.
@@ -449,10 +488,29 @@ impl RaftNode {
             Ok(Vec::new())
         } else {
             if now >= self.election_deadline {
+                // Only voters campaign (I7c). A learner — or a node whose
+                // active configuration no longer names it at all — re-arms
+                // its timer and stays quiet instead of bumping terms it can
+                // never win with.
+                if !self.is_voter() {
+                    self.arm_election_timer(now);
+                    return Ok(Vec::new());
+                }
                 return self.start_election(now);
             }
             Ok(Vec::new())
         }
+    }
+
+    /// Whether this node may vote and campaign under the active configuration:
+    /// it is in `voters`, or in `old_voters` while a joint change is in flight.
+    fn is_voter(&self) -> bool {
+        let active = self.configs.active();
+        active.voters.contains(&self.id)
+            || active
+                .old_voters
+                .as_ref()
+                .is_some_and(|old| old.contains(&self.id))
     }
 
     fn arm_election_timer(&mut self, now: Instant) {
@@ -1297,6 +1355,30 @@ impl RaftNode {
                 "the new configuration is identical to the current one".to_string(),
             ));
         }
+
+        // Catch-up gate (I7c, thesis ch. 4): every *added* voter must already
+        // be replicated to within `catch_up_margin` entries of the leader's
+        // log. Otherwise the new configuration immediately depends on a
+        // member that cannot ack anything for a long time — the stall the
+        // learner phase exists to prevent.
+        let last = self.log.last_index()?;
+        let floor = LogIndex::new(last.get().saturating_sub(self.config.catch_up_margin));
+        if let Role::Leader(state) = &self.role {
+            for added in new_voters.difference(&active.voters) {
+                let matched = state
+                    .match_index
+                    .get(added)
+                    .copied()
+                    .unwrap_or(LogIndex::ZERO);
+                if matched < floor {
+                    return Err(RaftError::ConfChange(format!(
+                        "voter {added} is not caught up (replicated to {matched}, \
+                         leader log at {last}); add it as a learner first"
+                    )));
+                }
+            }
+        }
+
         let joint = ClusterConfig {
             old_voters: Some(active.voters.clone()),
             learners: active
@@ -1308,6 +1390,41 @@ impl RaftNode {
             voters: new_voters,
         };
         self.append_config_entry(joint, now)
+    }
+
+    /// Adds `id` as a non-voting **learner** (I7c, thesis ch. 4): it is
+    /// replicated to — and so catches up — but never votes or counts toward
+    /// quorum. Once [`RaftNode::propose_conf_change`] sees it caught up, it
+    /// may be promoted into the voter set.
+    ///
+    /// A learner addition is a single (non-joint) configuration entry: it
+    /// changes no quorum, so joint consensus is unnecessary — but it still
+    /// respects the one-change-in-flight rule.
+    pub fn propose_add_learner(
+        &mut self,
+        id: NodeId,
+        now: Instant,
+    ) -> Result<Vec<Outbound>, RaftError> {
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader: self.leader_id.as_ref().map(|l| l.to_string()),
+            });
+        }
+        let active = self.configs.active();
+        if active.is_joint() || self.configs.latest_index() > self.commit_index {
+            return Err(RaftError::ConfChange(
+                "a configuration change is already in flight (one at a time)".to_string(),
+            ));
+        }
+        if active.voters.contains(&id) {
+            return Err(RaftError::ConfChange(format!("{id} is already a voter")));
+        }
+        if active.learners.contains(&id) {
+            return Err(RaftError::ConfChange(format!("{id} is already a learner")));
+        }
+        let mut with_learner = active.clone();
+        with_learner.learners.insert(id);
+        self.append_config_entry(with_learner, now)
     }
 }
 
@@ -2598,5 +2715,208 @@ mod tests {
         assert_eq!(fresh.active_config(), &carried);
         assert_eq!(fresh.snapshot_meta().unwrap().config, carried);
         assert_eq!(fresh.commit_index(), LogIndex::new(9));
+    }
+
+    // --- learners & the catch-up gate (I7c, thesis ch. 4) -------------------
+
+    /// Builds a learner node `id` whose bootstrap cluster is `voters`.
+    fn make_learner(
+        id: &str,
+        voters: &[&str],
+        seed: u64,
+        now: Instant,
+    ) -> (tempfile::TempDir, RaftNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RaftLog::open(dir.path().join("raft.redb")).unwrap();
+        let node = RaftNode::new_learner(
+            nid(id),
+            voters.iter().map(|p| nid(p)).collect(),
+            log,
+            Rng::seed_from_u64(seed),
+            Config::default(),
+            now,
+        )
+        .unwrap();
+        (dir, node)
+    }
+
+    #[test]
+    fn a_learner_never_campaigns() {
+        let t0 = Instant::now();
+        let (_d, mut learner) = make_learner("l", &["n0", "n1"], 1, t0);
+        // Long past any election timeout, repeatedly: a learner re-arms and
+        // stays a quiet follower instead of bumping terms.
+        let mut now = t0;
+        for _ in 0..10 {
+            now += Duration::from_secs(1);
+            let outs = learner.tick(now).unwrap();
+            assert!(outs.is_empty(), "a learner sends no RequestVote");
+        }
+        assert!(learner.is_follower());
+        assert_eq!(learner.current_term(), Term::ZERO, "term never moved");
+    }
+
+    #[test]
+    fn add_learner_replicates_without_joint_consensus() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        // Two founding voters + a blank learner.
+        let (d0, n0) = make("n0", &["n1"], 1, t0);
+        let (d1, n1) = make("n1", &["n0"], 2, t0);
+        let (dl, l) = make_learner("l", &["n0", "n1"], 3, t0);
+        let mut c = Cluster {
+            _dirs: vec![d0, d1, dl],
+            nodes: vec![n0, n1, l],
+        };
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        let outs = c.nodes[0].propose_add_learner(nid("l"), now).unwrap();
+        c.deliver_all(batch(0, outs), now);
+
+        // A learner addition is a plain config entry, never a joint one.
+        assert!(!c.nodes[0].active_config().is_joint());
+        assert!(c.nodes[0].active_config().learners.contains(&nid("l")));
+        assert_eq!(c.nodes[0].active_config().voters.len(), 2);
+
+        // The learner receives entries like any member…
+        let outs = c.nodes[0].propose(Bytes::from_static(b"w"), now).unwrap();
+        c.deliver_all(batch(0, outs), now);
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(2));
+        assert!(c.nodes[2].active_config().learners.contains(&nid("l")));
+
+        // …but still never campaigns.
+        let outs = c.nodes[2].tick(now + Duration::from_secs(5)).unwrap();
+        assert!(outs.is_empty());
+        assert!(c.nodes[2].is_follower());
+    }
+
+    #[test]
+    fn promotion_is_gated_until_the_learner_catches_up() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        // A tight margin so a small log already trips the gate.
+        let cfg = Config {
+            catch_up_margin: 2,
+            ..Config::default()
+        };
+        let mk = |id: &str, peers: &[&str], seed: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            let log = RaftLog::open(dir.path().join("raft.redb")).unwrap();
+            let node = RaftNode::new(
+                nid(id),
+                peers.iter().map(|p| nid(p)).collect(),
+                log,
+                Rng::seed_from_u64(seed),
+                cfg.clone(),
+                t0,
+            )
+            .unwrap();
+            (dir, node)
+        };
+        let (d0, n0) = mk("n0", &["n1"], 1);
+        let (d1, n1) = mk("n1", &["n0"], 2);
+        let dirl = tempfile::tempdir().unwrap();
+        let logl = RaftLog::open(dirl.path().join("raft.redb")).unwrap();
+        let l = RaftNode::new_learner(
+            nid("l"),
+            vec![nid("n0"), nid("n1")],
+            logl,
+            Rng::seed_from_u64(3),
+            cfg.clone(),
+            t0,
+        )
+        .unwrap();
+        let mut c = Cluster {
+            _dirs: vec![d0, d1, dirl],
+            nodes: vec![n0, n1, l],
+        };
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        // Six committed entries; the would-be voter has none of them.
+        for k in 0..6u32 {
+            let outs = c.nodes[0]
+                .propose(Bytes::copy_from_slice(&k.to_le_bytes()), now)
+                .unwrap();
+            // Deliver only to n1 — the learner is not yet a member at all.
+            let to_n1 = rv_or_ae_to(&outs, "n1");
+            if let Outbound::AppendEntries { request, .. } = to_n1 {
+                let resp = c.nodes[1].handle_append_entries(request, now).unwrap();
+                c.nodes[0]
+                    .handle_append_entries_response(nid("n1"), resp, now)
+                    .unwrap();
+            }
+        }
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(6));
+
+        // Promoting an uncaught-up node is refused with a pointer to the
+        // learner flow.
+        let err = c.nodes[0]
+            .propose_conf_change(voter_set(&["n0", "n1", "l"]), now)
+            .unwrap_err();
+        assert!(matches!(err, RaftError::ConfChange(_)));
+        assert!(
+            err.to_string().contains("learner"),
+            "error suggests the fix"
+        );
+
+        // The learner path: add, let it catch up, then promotion passes.
+        let outs = c.nodes[0].propose_add_learner(nid("l"), now).unwrap();
+        c.deliver_all(batch(0, outs), now);
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(7));
+
+        let outs = c.nodes[0]
+            .propose_conf_change(voter_set(&["n0", "n1", "l"]), now)
+            .unwrap();
+        c.deliver_all(batch(0, outs), now);
+        let cfg_now = c.nodes[0].active_config();
+        assert!(!cfg_now.is_joint(), "joint phase completed");
+        assert_eq!(cfg_now.voters, voter_set(&["n0", "n1", "l"]));
+        assert!(
+            cfg_now.learners.is_empty(),
+            "promotion removes the learner role"
+        );
+        // The promoted node now counts toward quorum: with n1 silenced, a
+        // write still commits via {n0, l} — 2 of 3.
+        let outs = c.nodes[0].propose(Bytes::from_static(b"z"), now).unwrap();
+        for out in outs {
+            if let Outbound::AppendEntries { to, request } = out {
+                if to.as_str() == "l" {
+                    let resp = c.nodes[2].handle_append_entries(request, now).unwrap();
+                    c.nodes[0]
+                        .handle_append_entries_response(nid("l"), resp, now)
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            c.nodes[0].commit_index().get(),
+            c.nodes[0].last_log_index().unwrap().get(),
+            "the promoted voter's ack completes the majority"
+        );
+    }
+
+    #[test]
+    fn add_learner_input_validation() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        // An existing voter cannot become a learner.
+        let err = c.nodes[0].propose_add_learner(nid("n1"), now).unwrap_err();
+        assert!(matches!(err, RaftError::ConfChange(_)));
+
+        // A follower rejects the proposal outright.
+        let err = c.nodes[1].propose_add_learner(nid("x"), now).unwrap_err();
+        assert!(matches!(err, RaftError::NotLeader { .. }));
+
+        // Adding twice is refused once the first addition is in force.
+        let outs = c.nodes[0].propose_add_learner(nid("x"), now).unwrap();
+        c.deliver_all(batch(0, outs), now);
+        let err = c.nodes[0].propose_add_learner(nid("x"), now).unwrap_err();
+        assert!(matches!(err, RaftError::ConfChange(_)));
     }
 }
