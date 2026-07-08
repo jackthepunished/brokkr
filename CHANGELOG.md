@@ -1009,6 +1009,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **tonic-over-turmoil** transport + `turmoil` cluster test is a follow-up; it
   needs new dev-dependencies — `hyper-util` etc. — which are pending owner
   approval.)
+- `brokkr-raft` tonic-over-turmoil cluster tests (milestone I5c, `docs/plan.md`
+  §17 task 3): `tests/turmoil_cluster.rs` runs a real 3-node cluster —
+  `RaftDriver`s over the production `TonicTransport` — with every Raft RPC
+  crossing `turmoil`'s deterministic simulated network as genuine gRPC/HTTP2.
+  Each host serves `brokkr.v1.RaftService` (its `RaftHandle` wrapped in
+  `RaftServiceAdapter`, fed to tonic's `serve_with_incoming` from a
+  `turmoil::net::TcpListener`); peer channels dial through a
+  `tower::service_fn` connector opening `turmoil::net::TcpStream`s wrapped in
+  `hyper_util::rt::TokioIo`. Two scenarios: election + replicated commit, and
+  a partitioned leader that cannot commit while the majority elects a
+  higher-term leader, then steps down and converges on heal. Peer channels
+  enable **HTTP/2 keepalive** — turmoil partitions drop packets silently, so
+  without it a dead h2 connection never errors and tonic would pin it forever,
+  preventing re-integration after a heal (exactly the failure the first run
+  caught). `RaftServiceAdapter` is now re-exported from the crate root. New
+  dev-dependencies (owner-approved): `hyper-util`, `tower`, `tokio-stream` for
+  `brokkr-raft`; `hyper-util` + `tower` added to the workspace manifest.
 
 ### Changed
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
