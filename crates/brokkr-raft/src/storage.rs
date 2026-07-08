@@ -437,9 +437,36 @@ mod tests {
         assert_eq!(log.last_index().unwrap(), LogIndex::new(3));
         assert_eq!(log.last_term().unwrap(), Term::new(2));
         assert_eq!(
-            log.get(LogIndex::new(2)).unwrap().unwrap().command,
-            Bytes::from_static(b"b")
+            log.get(LogIndex::new(2))
+                .unwrap()
+                .unwrap()
+                .command()
+                .cloned(),
+            Some(Bytes::from_static(b"b"))
         );
+    }
+
+    #[test]
+    fn config_entry_survives_disk_round_trip() {
+        use crate::types::{ClusterConfig, EntryPayload};
+        let (_dir, log) = temp_log();
+        let config = ClusterConfig {
+            voters: ["a", "b", "c"]
+                .iter()
+                .map(|n| NodeId::new(*n).unwrap())
+                .collect(),
+            old_voters: Some(
+                ["a", "b"]
+                    .iter()
+                    .map(|n| NodeId::new(*n).unwrap())
+                    .collect(),
+            ),
+            learners: ["l"].iter().map(|n| NodeId::new(*n).unwrap()).collect(),
+        };
+        let entry =
+            LogEntry::with_payload(Term::new(2), LogIndex::new(1), EntryPayload::Config(config));
+        log.append(&entry).unwrap();
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), Some(entry));
     }
 
     #[test]
@@ -476,7 +503,7 @@ mod tests {
         log.append(&entry(2, 1, b"new")).unwrap();
         let got = log.get(LogIndex::new(1)).unwrap().unwrap();
         assert_eq!(got.term, Term::new(2));
-        assert_eq!(got.command, Bytes::from_static(b"new"));
+        assert_eq!(got.command().cloned(), Some(Bytes::from_static(b"new")));
     }
 
     #[test]

@@ -1049,6 +1049,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   InstallSnapshot** after the cluster compacted past its log, and
   restart-from-snapshot history equality via the linearizability oracle
   (snapshot blob + log tail).
+- `brokkr-raft` entry payloads + cluster configurations (milestone I7a,
+  `docs/plan.md` §17 task 5 groundwork): `LogEntry` now carries an
+  `EntryPayload` — `Command(Bytes)` (the default), `Noop` (reserved for the
+  linearizable-read path), or `Config(ClusterConfig)`. `ClusterConfig` models
+  joint consensus per Raft §6 / thesis ch. 4: `voters`, optional `old_voters`
+  (present ⇔ the joint C_old,new is in flight), and non-voting `learners`;
+  `has_quorum` demands a strict majority of *both* voter sets when joint and
+  never counts learners. The wire/disk protobuf grows an `EntryKind`
+  discriminator and a `ClusterConfig` message with COMMAND as the proto3
+  default, so **entries written before I7 keep decoding unchanged** (proven
+  by a test against the exact pre-I7 encoding). Decoding is now fallible
+  (`TryFrom`): unknown kinds, config-less CONFIG entries, and invalid node
+  ids are rejected instead of silently mangled. No behavioral change to
+  consensus yet — the dual-majority election/commit machinery,
+  config-on-append semantics, and learner catch-up land as I7b/I7c.
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
   hard state (`currentTerm` + `votedFor`) is now modelled by `HardState` and
   written **atomically as a unit** via `RaftLog::save_hard_state` in a single

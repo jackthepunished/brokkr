@@ -6,6 +6,7 @@
 //! (`brokkr.v1.LogEntry`) and is stored on disk in that same encoding
 //! (ADR 0013 D1).
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use bytes::Bytes;
@@ -157,25 +158,135 @@ pub struct SnapshotMeta {
     pub last_included_term: Term,
 }
 
-/// One entry in the replicated log: a state-machine `command` tagged with the
-/// `term` in which the leader created it and its 1-based `index`.
+/// A cluster membership configuration (I7, Raft §6 / thesis ch. 4).
+///
+/// Configurations travel *in the log*: appending a [`EntryPayload::Config`]
+/// entry is what changes the membership a node uses (applied on append, not
+/// commit — the paper's rule). `old_voters: Some(..)` marks the joint
+/// configuration C_old,new, where agreement — elections and commits alike —
+/// requires a strict majority in **both** voter sets. Learners are replicated
+/// to but never count toward quorum.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClusterConfig {
+    /// Voting members (during a joint change, C_new's voters).
+    pub voters: BTreeSet<NodeId>,
+    /// C_old's voters while the joint C_old,new is in flight; `None` otherwise.
+    pub old_voters: Option<BTreeSet<NodeId>>,
+    /// Non-voting members being caught up before promotion (thesis ch. 4).
+    pub learners: BTreeSet<NodeId>,
+}
+
+impl ClusterConfig {
+    /// A non-joint configuration with the given voters and no learners.
+    pub fn single(voters: impl IntoIterator<Item = NodeId>) -> Self {
+        ClusterConfig {
+            voters: voters.into_iter().collect(),
+            old_voters: None,
+            learners: BTreeSet::new(),
+        }
+    }
+
+    /// Whether this is the joint configuration C_old,new.
+    pub fn is_joint(&self) -> bool {
+        self.old_voters.is_some()
+    }
+
+    /// Whether `acks` satisfies quorum: a strict majority of `voters`, **and**
+    /// of `old_voters` when joint (Raft §6 — no decision without agreement in
+    /// both configurations). Learners never count; an empty voter set can
+    /// never reach quorum.
+    pub fn has_quorum(&self, acks: &BTreeSet<NodeId>) -> bool {
+        fn majority(voters: &BTreeSet<NodeId>, acks: &BTreeSet<NodeId>) -> bool {
+            !voters.is_empty()
+                && voters.iter().filter(|v| acks.contains(*v)).count() * 2 > voters.len()
+        }
+        majority(&self.voters, acks)
+            && self
+                .old_voters
+                .as_ref()
+                .is_none_or(|old| majority(old, acks))
+    }
+}
+
+impl From<&ClusterConfig> for pb::ClusterConfig {
+    fn from(c: &ClusterConfig) -> Self {
+        pb::ClusterConfig {
+            voters: c.voters.iter().map(|n| n.as_str().to_string()).collect(),
+            old_voters: c
+                .old_voters
+                .iter()
+                .flatten()
+                .map(|n| n.as_str().to_string())
+                .collect(),
+            learners: c.learners.iter().map(|n| n.as_str().to_string()).collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::ClusterConfig> for ClusterConfig {
+    type Error = RaftError;
+    fn try_from(p: pb::ClusterConfig) -> Result<Self, Self::Error> {
+        let parse = |ids: Vec<String>| -> Result<BTreeSet<NodeId>, RaftError> {
+            ids.into_iter().map(NodeId::new).collect()
+        };
+        let old = parse(p.old_voters)?;
+        Ok(ClusterConfig {
+            voters: parse(p.voters)?,
+            old_voters: if old.is_empty() { None } else { Some(old) },
+            learners: parse(p.learners)?,
+        })
+    }
+}
+
+/// The payload of a log entry (I7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryPayload {
+    /// An opaque state-machine command.
+    Command(Bytes),
+    /// A leader's start-of-term no-op (reserved for the linearizable-read
+    /// path; never produced yet).
+    Noop,
+    /// A cluster membership configuration (joint consensus, I7).
+    Config(ClusterConfig),
+}
+
+/// One entry in the replicated log: a payload tagged with the `term` in which
+/// the leader created it and its 1-based `index`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     /// The leader's term when this entry was created.
     pub term: Term,
     /// The entry's 1-based position in the log.
     pub index: LogIndex,
-    /// The opaque state-machine command.
-    pub command: Bytes,
+    /// What the entry carries (I7): a command, a no-op, or a configuration.
+    pub payload: EntryPayload,
 }
 
 impl LogEntry {
-    /// Constructs a log entry.
+    /// Constructs a command entry (the common case).
     pub fn new(term: Term, index: LogIndex, command: impl Into<Bytes>) -> Self {
         LogEntry {
             term,
             index,
-            command: command.into(),
+            payload: EntryPayload::Command(command.into()),
+        }
+    }
+
+    /// Constructs an entry with an explicit payload.
+    pub fn with_payload(term: Term, index: LogIndex, payload: EntryPayload) -> Self {
+        LogEntry {
+            term,
+            index,
+            payload,
+        }
+    }
+
+    /// The state-machine command, or `None` for no-op / configuration entries
+    /// (which produce no state-machine output).
+    pub fn command(&self) -> Option<&Bytes> {
+        match &self.payload {
+            EntryPayload::Command(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -184,18 +295,30 @@ impl LogEntry {
         Bytes::from(pb::LogEntry::from(self).encode_to_vec())
     }
 
-    /// Decodes an entry from its protobuf wire/disk form.
+    /// Decodes an entry from its protobuf wire/disk form. Entries written
+    /// before I7 carry no `kind` field and decode as commands.
     pub fn decode(bytes: &[u8]) -> Result<Self, RaftError> {
-        Ok(pb::LogEntry::decode(bytes)?.into())
+        pb::LogEntry::decode(bytes)?.try_into()
     }
 }
 
 impl From<&LogEntry> for pb::LogEntry {
     fn from(e: &LogEntry) -> Self {
+        let (kind, command, config) = match &e.payload {
+            EntryPayload::Command(c) => (pb::EntryKind::Command, c.to_vec(), None),
+            EntryPayload::Noop => (pb::EntryKind::Noop, Vec::new(), None),
+            EntryPayload::Config(c) => (
+                pb::EntryKind::Config,
+                Vec::new(),
+                Some(pb::ClusterConfig::from(c)),
+            ),
+        };
         pb::LogEntry {
             term: e.term.get(),
             index: e.index.get(),
-            command: e.command.to_vec(),
+            command,
+            kind: kind as i32,
+            config,
         }
     }
 }
@@ -206,13 +329,26 @@ impl From<LogEntry> for pb::LogEntry {
     }
 }
 
-impl From<pb::LogEntry> for LogEntry {
-    fn from(p: pb::LogEntry) -> Self {
-        LogEntry {
+impl TryFrom<pb::LogEntry> for LogEntry {
+    type Error = RaftError;
+    fn try_from(p: pb::LogEntry) -> Result<Self, Self::Error> {
+        let kind = pb::EntryKind::try_from(p.kind)
+            .map_err(|_| RaftError::Codec(format!("unknown log entry kind {}", p.kind)))?;
+        let payload = match kind {
+            pb::EntryKind::Command => EntryPayload::Command(Bytes::from(p.command)),
+            pb::EntryKind::Noop => EntryPayload::Noop,
+            pb::EntryKind::Config => {
+                let config = p.config.ok_or_else(|| {
+                    RaftError::Codec("CONFIG log entry without a config".to_string())
+                })?;
+                EntryPayload::Config(ClusterConfig::try_from(config)?)
+            }
+        };
+        Ok(LogEntry {
             term: Term::new(p.term),
             index: LogIndex::new(p.index),
-            command: Bytes::from(p.command),
-        }
+            payload,
+        })
     }
 }
 
@@ -276,7 +412,7 @@ mod tests {
         let proto: pb::LogEntry = (&entry).into();
         assert_eq!(proto.term, 3);
         assert_eq!(proto.index, 9);
-        let back: LogEntry = proto.into();
+        let back: LogEntry = proto.try_into().unwrap();
         assert_eq!(entry, back);
     }
 
@@ -285,6 +421,146 @@ mod tests {
         let entry = LogEntry::new(Term::ZERO, LogIndex::ZERO, Bytes::new());
         let decoded = LogEntry::decode(&entry.encode()).unwrap();
         assert_eq!(entry, decoded);
-        assert!(decoded.command.is_empty());
+        assert_eq!(decoded.command(), Some(&Bytes::new()));
+    }
+
+    // --- entry payloads & cluster configs (I7a) ----------------------------
+
+    fn ids(names: &[&str]) -> BTreeSet<NodeId> {
+        names.iter().map(|n| NodeId::new(*n).unwrap()).collect()
+    }
+
+    #[test]
+    fn noop_and_config_payloads_round_trip() {
+        let noop = LogEntry::with_payload(Term::new(2), LogIndex::new(5), EntryPayload::Noop);
+        assert_eq!(LogEntry::decode(&noop.encode()).unwrap(), noop);
+        assert_eq!(noop.command(), None);
+
+        let config = ClusterConfig {
+            voters: ids(&["a", "b", "c"]),
+            old_voters: Some(ids(&["a", "b", "d"])),
+            learners: ids(&["e"]),
+        };
+        let entry = LogEntry::with_payload(
+            Term::new(3),
+            LogIndex::new(6),
+            EntryPayload::Config(config.clone()),
+        );
+        let decoded = LogEntry::decode(&entry.encode()).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.command(), None);
+        let EntryPayload::Config(back) = decoded.payload else {
+            panic!("expected a config payload");
+        };
+        assert!(back.is_joint());
+        assert_eq!(back, config);
+    }
+
+    #[test]
+    fn pre_i7_encoding_decodes_as_command() {
+        // Exactly the bytes an I6-era node wrote to disk: fields 1–3 only.
+        let legacy = pb::LogEntry {
+            term: 4,
+            index: 11,
+            command: b"set x=1".to_vec(),
+            kind: 0,
+            config: None,
+        };
+        let decoded = LogEntry::decode(&legacy.encode_to_vec()).unwrap();
+        assert_eq!(
+            decoded.payload,
+            EntryPayload::Command(Bytes::from_static(b"set x=1"))
+        );
+    }
+
+    #[test]
+    fn config_entry_with_invalid_node_id_fails_decode() {
+        let proto = pb::LogEntry {
+            term: 1,
+            index: 1,
+            command: Vec::new(),
+            kind: pb::EntryKind::Config as i32,
+            config: Some(pb::ClusterConfig {
+                voters: vec![String::new()], // empty node id
+                old_voters: vec![],
+                learners: vec![],
+            }),
+        };
+        assert!(LogEntry::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn config_entry_without_config_fails_decode() {
+        let proto = pb::LogEntry {
+            term: 1,
+            index: 1,
+            command: Vec::new(),
+            kind: pb::EntryKind::Config as i32,
+            config: None,
+        };
+        assert!(matches!(
+            LogEntry::try_from(proto).unwrap_err(),
+            RaftError::Codec(_)
+        ));
+    }
+
+    #[test]
+    fn single_config_quorum_is_a_strict_majority() {
+        let c = ClusterConfig::single(ids(&["a", "b", "c"]));
+        assert!(!c.is_joint());
+        assert!(c.has_quorum(&ids(&["a", "b"])));
+        assert!(!c.has_quorum(&ids(&["a"])));
+        // Non-voters in the ack set contribute nothing.
+        assert!(!c.has_quorum(&ids(&["a", "x", "y", "z"])));
+    }
+
+    #[test]
+    fn joint_config_requires_majorities_in_both_sets() {
+        let joint = ClusterConfig {
+            voters: ids(&["d", "e", "f"]),           // C_new
+            old_voters: Some(ids(&["a", "b", "c"])), // C_old
+            learners: BTreeSet::new(),
+        };
+        // Majority of C_new only: not enough.
+        assert!(!joint.has_quorum(&ids(&["d", "e"])));
+        // Majority of C_old only: not enough.
+        assert!(!joint.has_quorum(&ids(&["a", "b"])));
+        // Majorities in both: quorum.
+        assert!(joint.has_quorum(&ids(&["a", "b", "d", "e"])));
+    }
+
+    #[test]
+    fn learners_never_count_toward_quorum() {
+        let c = ClusterConfig {
+            voters: ids(&["a", "b", "c"]),
+            old_voters: None,
+            learners: ids(&["l1", "l2"]),
+        };
+        assert!(!c.has_quorum(&ids(&["a", "l1", "l2"])));
+        assert!(c.has_quorum(&ids(&["a", "b", "l1"])));
+    }
+
+    #[test]
+    fn empty_voter_set_never_has_quorum() {
+        let c = ClusterConfig::default();
+        assert!(!c.has_quorum(&ids(&["a", "b"])));
+        assert!(!c.has_quorum(&BTreeSet::new()));
+    }
+
+    #[test]
+    fn cluster_config_proto_round_trips_and_empty_old_means_single() {
+        let joint = ClusterConfig {
+            voters: ids(&["a", "b"]),
+            old_voters: Some(ids(&["c"])),
+            learners: ids(&["l"]),
+        };
+        let back = ClusterConfig::try_from(pb::ClusterConfig::from(&joint)).unwrap();
+        assert_eq!(back, joint);
+
+        let single = ClusterConfig::single(ids(&["a", "b"]));
+        let proto = pb::ClusterConfig::from(&single);
+        assert!(proto.old_voters.is_empty());
+        let back = ClusterConfig::try_from(proto).unwrap();
+        assert_eq!(back.old_voters, None);
     }
 }
