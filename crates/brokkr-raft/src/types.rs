@@ -229,11 +229,28 @@ impl TryFrom<pb::ClusterConfig> for ClusterConfig {
         let parse = |ids: Vec<String>| -> Result<BTreeSet<NodeId>, RaftError> {
             ids.into_iter().map(NodeId::new).collect()
         };
+        let voters = parse(p.voters)?;
         let old = parse(p.old_voters)?;
+        let learners = parse(p.learners)?;
+        // A node cannot both vote and be a non-voting learner. Voters and
+        // `old_voters` *do* overlap during a joint change (that is the point),
+        // so only learner disjointness is an invariant. This holds for every
+        // config, including the empty "unknown membership" sentinel a
+        // snapshot may carry (which trivially has no overlap).
+        if let Some(id) = voters.intersection(&learners).next() {
+            return Err(RaftError::Codec(format!(
+                "node {id} is both a voter and a learner"
+            )));
+        }
+        if let Some(id) = old.intersection(&learners).next() {
+            return Err(RaftError::Codec(format!(
+                "node {id} is both an old voter and a learner"
+            )));
+        }
         Ok(ClusterConfig {
-            voters: parse(p.voters)?,
+            voters,
             old_voters: if old.is_empty() { None } else { Some(old) },
-            learners: parse(p.learners)?,
+            learners,
         })
     }
 }
@@ -334,14 +351,46 @@ impl TryFrom<pb::LogEntry> for LogEntry {
     fn try_from(p: pb::LogEntry) -> Result<Self, Self::Error> {
         let kind = pb::EntryKind::try_from(p.kind)
             .map_err(|_| RaftError::Codec(format!("unknown log entry kind {}", p.kind)))?;
+        // `kind` is the discriminator: reject entries whose other fields do not
+        // match it instead of silently normalizing them into a different
+        // meaning. Our encoder only ever emits canonical combinations, so this
+        // only ever fires on corrupt or forged wire/disk data.
         let payload = match kind {
-            pb::EntryKind::Command => EntryPayload::Command(Bytes::from(p.command)),
-            pb::EntryKind::Noop => EntryPayload::Noop,
+            pb::EntryKind::Command => {
+                if p.config.is_some() {
+                    return Err(RaftError::Codec(
+                        "COMMAND log entry must not carry a config".to_string(),
+                    ));
+                }
+                EntryPayload::Command(Bytes::from(p.command))
+            }
+            pb::EntryKind::Noop => {
+                if !p.command.is_empty() || p.config.is_some() {
+                    return Err(RaftError::Codec(
+                        "NOOP log entry must not carry command or config data".to_string(),
+                    ));
+                }
+                EntryPayload::Noop
+            }
             pb::EntryKind::Config => {
-                let config = p.config.ok_or_else(|| {
+                if !p.command.is_empty() {
+                    return Err(RaftError::Codec(
+                        "CONFIG log entry must not carry command data".to_string(),
+                    ));
+                }
+                let config = ClusterConfig::try_from(p.config.ok_or_else(|| {
                     RaftError::Codec("CONFIG log entry without a config".to_string())
-                })?;
-                EntryPayload::Config(ClusterConfig::try_from(config)?)
+                })?)?;
+                // A configuration that governs the cluster must name at least
+                // one voter; an empty set could never reach quorum. (The empty
+                // `ClusterConfig` sentinel is only meaningful for a snapshot's
+                // "unknown membership", never for a log entry.)
+                if config.voters.is_empty() {
+                    return Err(RaftError::Codec(
+                        "CONFIG log entry must name at least one voter".to_string(),
+                    ));
+                }
+                EntryPayload::Config(config)
             }
         };
         Ok(LogEntry {
@@ -502,6 +551,92 @@ mod tests {
             LogEntry::try_from(proto).unwrap_err(),
             RaftError::Codec(_)
         ));
+    }
+
+    #[test]
+    fn config_entry_without_voters_fails_decode() {
+        // A governing config from the log must name a voter; an empty voter
+        // set could never reach quorum.
+        let proto = pb::LogEntry {
+            term: 1,
+            index: 1,
+            command: Vec::new(),
+            kind: pb::EntryKind::Config as i32,
+            config: Some(pb::ClusterConfig {
+                voters: vec![],
+                old_voters: vec![],
+                learners: vec!["l".to_string()],
+            }),
+        };
+        assert!(matches!(
+            LogEntry::try_from(proto).unwrap_err(),
+            RaftError::Codec(_)
+        ));
+    }
+
+    #[test]
+    fn cluster_config_rejects_learner_voter_overlap() {
+        // A node cannot be both a voter and a learner...
+        let overlap = pb::ClusterConfig {
+            voters: vec!["a".to_string(), "b".to_string()],
+            old_voters: vec![],
+            learners: vec!["b".to_string()],
+        };
+        assert!(ClusterConfig::try_from(overlap).is_err());
+
+        // ...nor both an old voter and a learner.
+        let old_overlap = pb::ClusterConfig {
+            voters: vec!["a".to_string()],
+            old_voters: vec!["c".to_string()],
+            learners: vec!["c".to_string()],
+        };
+        assert!(ClusterConfig::try_from(old_overlap).is_err());
+
+        // But voters and old_voters overlapping is normal during a joint change.
+        let joint = pb::ClusterConfig {
+            voters: vec!["a".to_string(), "b".to_string(), "d".to_string()],
+            old_voters: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            learners: vec![],
+        };
+        assert!(ClusterConfig::try_from(joint).is_ok());
+    }
+
+    #[test]
+    fn non_canonical_log_entry_payloads_are_rejected() {
+        let base = |kind: pb::EntryKind| pb::LogEntry {
+            term: 1,
+            index: 1,
+            command: Vec::new(),
+            kind: kind as i32,
+            config: None,
+        };
+        let config = || {
+            Some(pb::ClusterConfig {
+                voters: vec!["a".to_string()],
+                old_voters: vec![],
+                learners: vec![],
+            })
+        };
+
+        // COMMAND must not carry a config.
+        let mut cmd = base(pb::EntryKind::Command);
+        cmd.command = b"x".to_vec();
+        cmd.config = config();
+        assert!(LogEntry::try_from(cmd).is_err());
+
+        // NOOP must carry neither command nor config.
+        let mut noop_cmd = base(pb::EntryKind::Noop);
+        noop_cmd.command = b"x".to_vec();
+        assert!(LogEntry::try_from(noop_cmd).is_err());
+        let mut noop_cfg = base(pb::EntryKind::Noop);
+        noop_cfg.config = config();
+        assert!(LogEntry::try_from(noop_cfg).is_err());
+
+        // CONFIG must not carry command data.
+        let mut cfg_cmd = base(pb::EntryKind::Config);
+        cfg_cmd.command = b"x".to_vec();
+        cfg_cmd.config = config();
+        assert!(LogEntry::try_from(cfg_cmd).is_err());
     }
 
     #[test]
