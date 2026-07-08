@@ -62,4 +62,4 @@ pub use transport::{
     InstallSnapshotResponse, RaftRpc, RaftServiceAdapter, RequestVote, RequestVoteResponse,
     TonicTransport, Transport,
 };
-pub use types::{LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+pub use types::{ClusterConfig, EntryPayload, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};

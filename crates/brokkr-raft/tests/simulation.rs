@@ -395,7 +395,11 @@ impl Sim {
         let ci = node.commit_index().get();
         for idx in start..=ci {
             if let Some(e) = node.log_entry(LogIndex::new(idx)).unwrap() {
-                cmds.push(e.command);
+                // Only commands produce state-machine output; no-op and
+                // config entries (I7) contribute nothing to applied history.
+                if let Some(c) = e.command() {
+                    cmds.push(c.clone());
+                }
             }
         }
         cmds

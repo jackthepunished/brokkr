@@ -188,7 +188,11 @@ impl TryFrom<pb::AppendEntriesRequest> for AppendEntries {
             leader_id: NodeId::new(p.leader_id)?,
             prev_log_index: LogIndex::new(p.prev_log_index),
             prev_log_term: Term::new(p.prev_log_term),
-            entries: p.entries.into_iter().map(LogEntry::from).collect(),
+            entries: p
+                .entries
+                .into_iter()
+                .map(LogEntry::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
             leader_commit: LogIndex::new(p.leader_commit),
         })
     }

@@ -1429,8 +1429,9 @@ mod tests {
                     .log_entry(LogIndex::new(1))
                     .unwrap()
                     .unwrap()
-                    .command,
-                Bytes::from_static(b"x")
+                    .command()
+                    .cloned(),
+                Some(Bytes::from_static(b"x"))
             );
         }
     }
