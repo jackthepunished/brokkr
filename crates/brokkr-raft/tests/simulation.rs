@@ -35,8 +35,33 @@ use brokkr_raft::{
 enum Msg {
     RequestVote(RequestVote),
     AppendEntries(brokkr_raft::AppendEntries),
+    InstallSnapshot(brokkr_raft::InstallSnapshot),
     VoteResp(RequestVoteResponse),
     AppendResp(AppendEntriesResponse),
+    SnapResp(brokkr_raft::InstallSnapshotResponse),
+}
+
+/// The sim's stand-in for a state-machine snapshot blob (I6): the committed
+/// command history, length-prefixed. Self-describing so a node that receives
+/// it over `InstallSnapshot` contributes the right prefix to the oracle.
+fn encode_history(cmds: &[Bytes]) -> Bytes {
+    let mut out = Vec::new();
+    for c in cmds {
+        out.extend_from_slice(&u32::try_from(c.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(c);
+    }
+    Bytes::from(out)
+}
+
+fn decode_history(mut blob: &[u8]) -> Vec<Bytes> {
+    let mut cmds = Vec::new();
+    while blob.len() >= 4 {
+        let len = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
+        blob = &blob[4..];
+        cmds.push(Bytes::copy_from_slice(&blob[..len]));
+        blob = &blob[len..];
+    }
+    cmds
 }
 
 struct Packet {
@@ -65,11 +90,20 @@ struct Sim {
 
 impl Sim {
     fn new(n: usize, base_seed: u64) -> Self {
+        Self::new_with_threshold(n, base_seed, Config::default().snapshot_threshold)
+    }
+
+    /// A sim whose nodes compact automatically once the committed log outgrows
+    /// `snapshot_threshold` (I6 exit criteria run the whole campaign at 16).
+    fn new_with_threshold(n: usize, base_seed: u64, snapshot_threshold: u64) -> Self {
         let t0 = Instant::now();
         let ids: Vec<NodeId> = (0..n)
             .map(|i| NodeId::new(format!("n{i}")).unwrap())
             .collect();
-        let cfg = Config::default();
+        let cfg = Config {
+            snapshot_threshold,
+            ..Config::default()
+        };
         let mut dirs = Vec::new();
         let mut paths = Vec::new();
         let mut nodes = Vec::new();
@@ -156,6 +190,7 @@ impl Sim {
             let (to_id, msg) = match o {
                 Outbound::RequestVote { to, request } => (to, Msg::RequestVote(request)),
                 Outbound::AppendEntries { to, request } => (to, Msg::AppendEntries(request)),
+                Outbound::InstallSnapshot { to, request } => (to, Msg::InstallSnapshot(request)),
             };
             let to = self.idx(&to_id);
             self.push(from, to, msg);
@@ -202,6 +237,13 @@ impl Sim {
                 };
                 self.push(p.to, p.from, Msg::AppendResp(resp));
             }
+            Msg::InstallSnapshot(req) => {
+                let resp = match &mut self.nodes[p.to] {
+                    Some(n) => n.handle_install_snapshot(req, now).unwrap(),
+                    None => return,
+                };
+                self.push(p.to, p.from, Msg::SnapResp(resp));
+            }
             Msg::VoteResp(resp) => {
                 let outs = match &mut self.nodes[p.to] {
                     Some(n) => n.handle_request_vote_response(from_id, resp, now).unwrap(),
@@ -213,6 +255,15 @@ impl Sim {
                 let outs = match &mut self.nodes[p.to] {
                     Some(n) => n
                         .handle_append_entries_response(from_id, resp, now)
+                        .unwrap(),
+                    None => return,
+                };
+                self.enqueue_outbound(p.to, outs);
+            }
+            Msg::SnapResp(resp) => {
+                let outs = match &mut self.nodes[p.to] {
+                    Some(n) => n
+                        .handle_install_snapshot_response(from_id, resp, now)
                         .unwrap(),
                     None => return,
                 };
@@ -233,13 +284,32 @@ impl Sim {
     }
 
     /// Advances simulated time by `dur`, ticking every live node and delivering
-    /// due packets in small fixed steps.
+    /// due packets in small fixed steps. Every step also runs the compaction
+    /// trigger, exactly as a shell would (I6): any node whose committed log
+    /// outgrew the threshold snapshots its state machine — here, its committed
+    /// command history — and compacts.
     fn advance(&mut self, dur: Duration) {
         let target = self.clock + dur;
         while self.clock < target {
             self.clock += self.step;
             self.deliver_due();
             self.tick_all();
+            self.maybe_compact();
+        }
+    }
+
+    /// The shell-side snapshot trigger: compact every live node that reports
+    /// [`RaftNode::needs_snapshot`], using its committed history as the blob.
+    fn maybe_compact(&mut self) {
+        for i in 0..self.nodes.len() {
+            let needs = self.nodes[i].as_ref().is_some_and(|n| n.needs_snapshot());
+            if !needs {
+                continue;
+            }
+            let blob = encode_history(&self.committed(i));
+            if let Some(n) = self.nodes[i].as_mut() {
+                n.compact(blob).unwrap();
+            }
         }
     }
 
@@ -309,14 +379,26 @@ impl Sim {
         self.nodes[i] = Some(node);
     }
 
-    /// The committed command sequence a live node has applied.
+    /// The committed command sequence a live node has applied: the history
+    /// encoded in its snapshot blob (if any), then the committed log tail.
     fn committed(&self, i: usize) -> Vec<Bytes> {
         let node = self.nodes[i].as_ref().expect("node is live");
+        let mut cmds = match node.snapshot().unwrap() {
+            Some((_, blob)) => decode_history(&blob),
+            None => Vec::new(),
+        };
+        let start = node
+            .snapshot_meta()
+            .map(|m| m.last_included_index.get())
+            .unwrap_or(0)
+            + 1;
         let ci = node.commit_index().get();
-        (1..=ci)
-            .filter_map(|idx| node.log_entry(LogIndex::new(idx)).unwrap())
-            .map(|e| e.command)
-            .collect()
+        for idx in start..=ci {
+            if let Some(e) = node.log_entry(LogIndex::new(idx)).unwrap() {
+                cmds.push(e.command);
+            }
+        }
+        cmds
     }
 
     fn max_commit(&self) -> u64 {
@@ -459,10 +541,94 @@ fn crashed_follower_restarts_and_catches_up() {
 }
 
 #[test]
+fn constant_compaction_preserves_history() {
+    // threshold 16 with dozens of writes: every node snapshots repeatedly,
+    // and the committed history (snapshot blob + log tail) never diverges.
+    let mut sim = Sim::new_with_threshold(3, 42, 16);
+    let leader = sim.advance_until_stable_leader(40);
+    for k in 0..48u32 {
+        assert!(sim.propose(leader, format!("w{k}").as_bytes()));
+        sim.advance(Duration::from_millis(60));
+        if k % 8 == 7 {
+            sim.assert_no_divergence();
+        }
+    }
+    sim.advance(Duration::from_secs(1));
+    sim.assert_no_divergence();
+    assert!(sim.max_commit() >= 48);
+    for i in 0..3 {
+        let node = sim.nodes[i].as_ref().unwrap();
+        assert!(
+            node.snapshot_meta().is_some(),
+            "n{i} compacted at least once under threshold 16"
+        );
+        assert_eq!(sim.committed(i).len() as u64, node.commit_index().get());
+    }
+}
+
+#[test]
+fn crashed_follower_catches_up_via_install_snapshot() {
+    // A follower misses enough writes that the leader compacts past its log:
+    // catch-up can only happen through InstallSnapshot, and the restarted
+    // node's history must match (restore-from-snapshot + tail replay, P9).
+    let mut sim = Sim::new_with_threshold(3, 77, 16);
+    let leader = sim.advance_until_stable_leader(40);
+    let follower = (0..3).find(|&i| i != leader).unwrap();
+
+    for k in 0..6u32 {
+        assert!(sim.propose(leader, format!("a{k}").as_bytes()));
+        sim.advance(Duration::from_millis(60));
+    }
+    sim.crash(follower);
+    // 30 more writes: the survivors commit and compact (threshold 16), so the
+    // crashed node's next entries no longer exist in anyone's log.
+    for k in 0..30u32 {
+        assert!(sim.propose(leader, format!("b{k}").as_bytes()));
+        sim.advance(Duration::from_millis(60));
+    }
+    let leader_snap = sim.nodes[leader]
+        .as_ref()
+        .unwrap()
+        .snapshot_meta()
+        .expect("leader compacted during the follower's outage");
+    assert!(
+        leader_snap.last_included_index.get() > 6,
+        "compaction moved past the crashed follower's log"
+    );
+
+    sim.restart(follower);
+    sim.advance(Duration::from_secs(3));
+    sim.assert_no_divergence();
+
+    let f = sim.nodes[follower].as_ref().unwrap();
+    assert!(
+        f.snapshot_meta()
+            .is_some_and(|m| m.last_included_index.get() > 6),
+        "the follower received a snapshot, not just log entries"
+    );
+    assert_eq!(
+        sim.committed(follower),
+        sim.committed(leader),
+        "restored-from-snapshot history matches the leader's"
+    );
+}
+
+#[test]
 fn soak_random_faults_never_diverge() {
+    soak_random_faults(Config::default().snapshot_threshold);
+}
+
+/// I6 exit criteria: the full I5 fault campaign stays green while snapshots
+/// are exercised constantly (`snapshot_threshold = 16`).
+#[test]
+fn soak_random_faults_with_constant_compaction_never_diverge() {
+    soak_random_faults(16);
+}
+
+fn soak_random_faults(snapshot_threshold: u64) {
     // Many client writes interleaved with random partitions, heals, crashes and
     // restarts — the committed history must stay linearizable throughout.
-    let mut sim = Sim::new(5, 2024);
+    let mut sim = Sim::new_with_threshold(5, 2024, snapshot_threshold);
     let mut writes = 0u32;
     let mut fault_rng = Rng::seed_from_u64(999);
 

@@ -453,3 +453,64 @@ proto field.
   is already stubbed in the wire types and `RaftRpc`; the driver's
   `install_snapshot` handler currently rejects with "not implemented until
   I6".
+
+## I6 — snapshots & log compaction (§17 task 4)
+
+- **Date:** 2026-07-08
+- **Affected:** `crates/brokkr-raft` (`types.rs` `SnapshotMeta`, `storage.rs`
+  snapshot persistence, `node.rs` compaction + `InstallSnapshot` both sides,
+  `driver.rs` routing + `RaftHandle::compact`, `error.rs` `Snapshot` variant,
+  `lib.rs`; tests in `storage.rs`, `node.rs`, `tests/driver.rs`,
+  `tests/simulation.rs`).
+- **Outcome:** the log no longer grows without bound. The committed prefix
+  compacts into a snapshot, a leader catches compacted-away followers up via
+  single-shot `InstallSnapshot`, and the whole I5 fault campaign is green
+  with `snapshot_threshold = 16` (the plan's exit criterion).
+
+### Decisions / notes
+
+- **Atomicity is the whole game (§III.4):** snapshot metadata + blob + the
+  covered prefix's removal commit in **one** redb transaction
+  (`RaftLog::compact_to`), so no crash point exists where the prefix is gone
+  but the snapshot is not. The receiver's "discard the entire log" path
+  (`install_snapshot_replacing_log`) is likewise a single transaction.
+- **The node stays sans-IO; the blob comes from the caller.**
+  `RaftNode::compact(data)` takes the serialized state machine at exactly
+  `commit_index`; `needs_snapshot()` is the trigger the shell polls. The plan
+  sketched `Effect::SnapshotRequest`, but the implemented architecture returns
+  `Outbound`s rather than effects — a poll + explicit `compact` keeps the
+  one-writer discipline without inventing a callback plumbed through the
+  event loop. I8's KV wires `snapshot()`/`restore()` to it.
+- **Last-`(index, term)` must survive full compaction.** After the whole log
+  compacts, `RaftLog::last_index_and_term` falls back to the snapshot
+  metadata (one read txn), keeping the election restriction and
+  `prev_log_term` at the snapshot boundary correct — proven by a vote test
+  on a fully compacted voter.
+- **Stale-snapshot guard doubles as the P9 floor.** An inbound snapshot at or
+  below `commit_index` (or our own snapshot) is ignored, so applied state
+  never regresses; on restart `commit_index` starts at the snapshot index.
+- **Single-shot only.** `offset != 0 || !done` → `RaftError::Snapshot`;
+  chunking is future work (entries are small KV commands). The driver treats
+  that as a peer-protocol error — reply dropped, loop keeps running — while
+  local storage errors stay fatal.
+- **Oracle under compaction:** the sim's snapshot blob is the committed
+  command history (length-prefixed), so `committed(i)` = decoded blob + log
+  tail. The linearizability oracle is unchanged in spirit but now spans the
+  compacted region; a receiver of `InstallSnapshot` contributes the leader's
+  blob as its prefix, which is exactly the restore-then-replay restart path.
+
+### Verified per-crate in WSL2
+
+`brokkr-raft` green on `fmt --check`, `clippy --all-targets -- -D warnings`,
+**69 unit + 17 integration** tests (13 new unit; new integration: driver
+snapshot catch-up over the switchboard, constant-compaction history
+preservation, crashed-follower catch-up via `InstallSnapshot`, and the fault
+soak re-run at `snapshot_threshold = 16`), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I7:** membership changes via joint consensus (plan §17 task 5) —
+  `EntryPayload::ConfChange`, config applied on append (rolled back on
+  truncation, P10), learner catch-up gate, one in-flight change at a time.
+  `SnapshotMeta` gains the cluster configuration then.

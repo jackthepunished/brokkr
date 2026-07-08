@@ -5,6 +5,7 @@
 //! ```text
 //! ├─ "log":  u64  → &[u8]   // protobuf-encoded LogEntry, keyed by 1-based index
 //! └─ "meta": &str → &[u8]   // hard state: current_term, voted_for
+//!                           // snapshot: last index/term + opaque blob (I6)
 //! ```
 //!
 //! Log entries are stored in the same protobuf encoding they take on the wire,
@@ -20,11 +21,12 @@
 
 use std::path::Path;
 
+use bytes::Bytes;
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::error::RaftError;
 use crate::state::HardState;
-use crate::types::{LogEntry, LogIndex, NodeId, Term};
+use crate::types::{LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 /// Log table: 1-based index → protobuf-encoded [`LogEntry`].
 const LOG_TABLE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("log");
@@ -35,6 +37,12 @@ const META_TABLE: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("
 const META_CURRENT_TERM: &str = "current_term";
 /// `meta` key for the persisted `votedFor` (UTF-8 node id; absent = none).
 const META_VOTED_FOR: &str = "voted_for";
+/// `meta` key for the snapshot's `last_included_index` (little-endian `u64`).
+const META_SNAP_INDEX: &str = "snapshot_last_index";
+/// `meta` key for the snapshot's `last_included_term` (little-endian `u64`).
+const META_SNAP_TERM: &str = "snapshot_last_term";
+/// `meta` key for the opaque snapshot blob.
+const META_SNAP_DATA: &str = "snapshot_data";
 
 /// Maps any `Display` storage error into [`RaftError::Storage`].
 fn stor<E: std::fmt::Display>(e: E) -> RaftError {
@@ -110,34 +118,24 @@ impl RaftLog {
         Ok(entries)
     }
 
-    /// The highest index present, or [`LogIndex::ZERO`] for an empty log.
+    /// The highest index present — the last log entry's, or, when the log is
+    /// empty (fresh store, or fully compacted into a snapshot), the snapshot's
+    /// `last_included_index` ([`LogIndex::ZERO`] if neither exists).
     pub fn last_index(&self) -> Result<LogIndex, RaftError> {
-        let read = self.db.begin_read().map_err(stor)?;
-        let table = read.open_table(LOG_TABLE).map_err(stor)?;
-        // Bind into a local so the borrowing `AccessGuard` is dropped before the
-        // function returns (it must not outlive `table`).
-        let last = table.last().map_err(stor)?;
-        let index = match last {
-            Some((key, _)) => LogIndex::new(key.value()),
-            None => LogIndex::ZERO,
-        };
-        Ok(index)
+        Ok(self.last_index_and_term()?.0)
     }
 
-    /// The term of the last entry, or [`Term::ZERO`] for an empty log. Used by
-    /// the election restriction (`docs/raft-notes.md` §6).
+    /// The term at [`RaftLog::last_index`], or [`Term::ZERO`] for an empty
+    /// store. Used by the election restriction (`docs/raft-notes.md` §6).
     pub fn last_term(&self) -> Result<Term, RaftError> {
-        let last = self.last_index()?;
-        if last == LogIndex::ZERO {
-            return Ok(Term::ZERO);
-        }
-        Ok(self.get(last)?.map(|e| e.term).unwrap_or(Term::ZERO))
+        Ok(self.last_index_and_term()?.1)
     }
 
-    /// The last entry's `(index, term)`, or `(ZERO, ZERO)` for an empty log, in a
-    /// **single** read transaction. Hot paths (heartbeats, `RequestVote`,
-    /// replication) need both together; calling `last_index()` then `last_term()`
-    /// would re-read the log two or three times.
+    /// The last `(index, term)` — from the log's last entry, falling back to
+    /// the snapshot metadata when the log is empty — in a **single** read
+    /// transaction. Hot paths (heartbeats, `RequestVote`, replication) need
+    /// both together, and the fallback keeps elections correct after the whole
+    /// log has been compacted into a snapshot.
     pub fn last_index_and_term(&self) -> Result<(LogIndex, Term), RaftError> {
         let read = self.db.begin_read().map_err(stor)?;
         let table = read.open_table(LOG_TABLE).map_err(stor)?;
@@ -147,9 +145,28 @@ impl RaftLog {
                 LogIndex::new(key.value()),
                 LogEntry::decode(value.value())?.term,
             ),
-            None => (LogIndex::ZERO, Term::ZERO),
+            None => {
+                let meta = read.open_table(META_TABLE).map_err(stor)?;
+                match Self::read_snapshot_meta(&meta)? {
+                    Some(snap) => (snap.last_included_index, snap.last_included_term),
+                    None => (LogIndex::ZERO, Term::ZERO),
+                }
+            }
         };
         Ok(result)
+    }
+
+    /// The lowest index the log still holds, or [`LogIndex::ZERO`] for an empty
+    /// log. After compaction this is `snapshot.last_included_index + 1`.
+    pub fn first_index(&self) -> Result<LogIndex, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(LOG_TABLE).map_err(stor)?;
+        let first = table.first().map_err(stor)?;
+        let index = match first {
+            Some((key, _)) => LogIndex::new(key.value()),
+            None => LogIndex::ZERO,
+        };
+        Ok(index)
     }
 
     /// Removes every entry with index `>= from` (conflict truncation,
@@ -170,6 +187,106 @@ impl RaftLog {
         }
         write.commit().map_err(stor)?;
         Ok(())
+    }
+
+    /// Atomically installs a snapshot (metadata + opaque blob) and drops every
+    /// log entry it covers (`index <= meta.last_included_index`), retaining any
+    /// tail beyond it — all in **one** durable transaction, so a crash can
+    /// never leave the prefix dropped without the snapshot or vice versa
+    /// (`docs/plan.md` §17 task 4). Used both for self-compaction and for an
+    /// inbound `InstallSnapshot` whose last-included entry matches our log
+    /// (Raft §7: "retain log entries following it").
+    pub fn compact_to(&self, meta: SnapshotMeta, data: &[u8]) -> Result<(), RaftError> {
+        self.write_snapshot(meta, data, false)
+    }
+
+    /// Atomically installs a snapshot and discards the **entire** log — the
+    /// receiver path when our log conflicts with (or predates) the snapshot's
+    /// last-included entry (Raft §7: "discard the entire log").
+    pub fn install_snapshot_replacing_log(
+        &self,
+        meta: SnapshotMeta,
+        data: &[u8],
+    ) -> Result<(), RaftError> {
+        self.write_snapshot(meta, data, true)
+    }
+
+    fn write_snapshot(
+        &self,
+        meta: SnapshotMeta,
+        data: &[u8],
+        wipe_entire_log: bool,
+    ) -> Result<(), RaftError> {
+        let index_bytes = meta.last_included_index.get().to_le_bytes();
+        let term_bytes = meta.last_included_term.get().to_le_bytes();
+        let write = self.db.begin_write().map_err(stor)?;
+        {
+            let mut meta_table = write.open_table(META_TABLE).map_err(stor)?;
+            meta_table
+                .insert(META_SNAP_INDEX, &index_bytes[..])
+                .map_err(stor)?;
+            meta_table
+                .insert(META_SNAP_TERM, &term_bytes[..])
+                .map_err(stor)?;
+            meta_table.insert(META_SNAP_DATA, data).map_err(stor)?;
+
+            let mut log_table = write.open_table(LOG_TABLE).map_err(stor)?;
+            if wipe_entire_log {
+                log_table.retain(|_, _| false).map_err(stor)?;
+            } else {
+                log_table
+                    .retain_in(..=meta.last_included_index.get(), |_, _| false)
+                    .map_err(stor)?;
+            }
+        }
+        write.commit().map_err(stor)?;
+        Ok(())
+    }
+
+    /// The installed snapshot's metadata, or `None` if no snapshot exists.
+    pub fn snapshot_meta(&self) -> Result<Option<SnapshotMeta>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        Self::read_snapshot_meta(&table)
+    }
+
+    /// The installed snapshot (metadata + opaque blob), or `None`.
+    pub fn snapshot(&self) -> Result<Option<(SnapshotMeta, Bytes)>, RaftError> {
+        let read = self.db.begin_read().map_err(stor)?;
+        let table = read.open_table(META_TABLE).map_err(stor)?;
+        let Some(meta) = Self::read_snapshot_meta(&table)? else {
+            return Ok(None);
+        };
+        let data = match table.get(META_SNAP_DATA).map_err(stor)? {
+            Some(guard) => Bytes::copy_from_slice(guard.value()),
+            None => Bytes::new(),
+        };
+        Ok(Some((meta, data)))
+    }
+
+    /// Reads the snapshot metadata within an already-open `meta` table, so
+    /// callers can pair it with other reads in one consistent transaction.
+    fn read_snapshot_meta(
+        table: &impl ReadableTable<&'static str, &'static [u8]>,
+    ) -> Result<Option<SnapshotMeta>, RaftError> {
+        let index = match table.get(META_SNAP_INDEX).map_err(stor)? {
+            Some(guard) => u64_from_le(guard.value())?,
+            None => return Ok(None),
+        };
+        let term = match table.get(META_SNAP_TERM).map_err(stor)? {
+            // Index and term are only ever written together in one
+            // transaction; a lone index would be a corrupted store.
+            Some(guard) => u64_from_le(guard.value())?,
+            None => {
+                return Err(RaftError::Storage(
+                    "snapshot index present without snapshot term".to_string(),
+                ));
+            }
+        };
+        Ok(Some(SnapshotMeta {
+            last_included_index: LogIndex::new(index),
+            last_included_term: Term::new(term),
+        }))
     }
 
     /// Atomically persists the hard state (`currentTerm` **and** `votedFor`) in
@@ -464,6 +581,95 @@ mod tests {
             reads += 1;
         }
         writer.join().unwrap();
+    }
+
+    // --- snapshots (I6) ----------------------------------------------------
+
+    fn meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: LogIndex::new(index),
+            last_included_term: Term::new(term),
+        }
+    }
+
+    #[test]
+    fn fresh_store_has_no_snapshot() {
+        let (_dir, log) = temp_log();
+        assert_eq!(log.snapshot_meta().unwrap(), None);
+        assert!(log.snapshot().unwrap().is_none());
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO);
+    }
+
+    #[test]
+    fn compact_to_drops_covered_prefix_and_keeps_tail() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[
+            entry(1, 1, b"a"),
+            entry(1, 2, b"b"),
+            entry(2, 3, b"c"),
+            entry(2, 4, b"d"),
+            entry(2, 5, b"e"),
+        ])
+        .unwrap();
+        log.compact_to(meta(3, 2), b"blob@3").unwrap();
+
+        assert_eq!(log.get(LogIndex::new(1)).unwrap(), None);
+        assert_eq!(log.get(LogIndex::new(3)).unwrap(), None);
+        assert_eq!(log.get(LogIndex::new(4)).unwrap(), Some(entry(2, 4, b"d")));
+        assert_eq!(log.first_index().unwrap(), LogIndex::new(4));
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(5));
+        let (m, data) = log.snapshot().unwrap().unwrap();
+        assert_eq!(m, meta(3, 2));
+        assert_eq!(data, Bytes::from_static(b"blob@3"));
+    }
+
+    #[test]
+    fn install_snapshot_replacing_log_discards_everything() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(1, 3, b"c")])
+            .unwrap();
+        // The incoming snapshot is beyond (and inconsistent with) our log.
+        log.install_snapshot_replacing_log(meta(10, 4), b"blob@10")
+            .unwrap();
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO, "log is empty");
+        // last (index, term) falls back to the snapshot metadata.
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(10));
+        assert_eq!(log.last_term().unwrap(), Term::new(4));
+        assert_eq!(
+            log.last_index_and_term().unwrap(),
+            (LogIndex::new(10), Term::new(4))
+        );
+    }
+
+    #[test]
+    fn snapshot_and_dropped_prefix_survive_reopen_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        {
+            let log = RaftLog::open(&path).unwrap();
+            log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b")])
+                .unwrap();
+            log.compact_to(meta(2, 1), b"snap").unwrap();
+        }
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.snapshot_meta().unwrap(), Some(meta(2, 1)));
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO);
+        assert_eq!(log.last_index().unwrap(), LogIndex::new(2));
+        let (_, data) = log.snapshot().unwrap().unwrap();
+        assert_eq!(data, Bytes::from_static(b"snap"));
+    }
+
+    #[test]
+    fn a_newer_snapshot_overwrites_an_older_one() {
+        let (_dir, log) = temp_log();
+        log.append_all(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(1, 3, b"c")])
+            .unwrap();
+        log.compact_to(meta(1, 1), b"v1").unwrap();
+        log.compact_to(meta(3, 1), b"v2").unwrap();
+        let (m, data) = log.snapshot().unwrap().unwrap();
+        assert_eq!(m, meta(3, 1));
+        assert_eq!(data, Bytes::from_static(b"v2"));
+        assert_eq!(log.first_index().unwrap(), LogIndex::ZERO);
     }
 
     #[test]

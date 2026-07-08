@@ -36,7 +36,7 @@ use crate::transport::{
     AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, RaftRpc,
     RequestVote, RequestVoteResponse, Transport,
 };
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{LogIndex, NodeId, SnapshotMeta, Term};
 
 /// A point-in-time snapshot of a driver's node state, for observability/tests.
 #[derive(Debug, Clone)]
@@ -51,12 +51,16 @@ pub struct DriverStatus {
     pub last_log_index: LogIndex,
     /// The leader the node currently recognizes, if any.
     pub leader: Option<NodeId>,
+    /// The node's installed snapshot metadata, if any (I6).
+    pub snapshot: Option<SnapshotMeta>,
 }
 
 /// Work delivered into the driver's event loop.
 enum Inbound {
     RequestVote(RequestVote, oneshot::Sender<RequestVoteResponse>),
     AppendEntries(AppendEntries, oneshot::Sender<AppendEntriesResponse>),
+    InstallSnapshot(InstallSnapshot, oneshot::Sender<InstallSnapshotResponse>),
+    Compact(Bytes, oneshot::Sender<Result<SnapshotMeta, RaftError>>),
     Status(oneshot::Sender<DriverStatus>),
 }
 
@@ -70,6 +74,7 @@ struct Proposal {
 enum PeerReply {
     Vote(NodeId, RequestVoteResponse),
     Append(NodeId, AppendEntriesResponse),
+    Snapshot(NodeId, InstallSnapshotResponse),
 }
 
 /// A cloneable handle to a running [`RaftDriver`]. It is both the inbound-RPC
@@ -99,6 +104,15 @@ impl RaftHandle {
         self.query(Inbound::Status).await
     }
 
+    /// Compacts the node's committed log prefix into a snapshot whose opaque
+    /// blob is `data` — the state machine's serialized state at the node's
+    /// current commit index (I6). The shell calls this when the committed log
+    /// outgrows the snapshot threshold; for I8's KV it is wired to the state
+    /// machine's `snapshot()` callback.
+    pub async fn compact(&self, data: Bytes) -> Result<SnapshotMeta, RaftError> {
+        self.query(|tx| Inbound::Compact(data, tx)).await?
+    }
+
     async fn query<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Inbound,
@@ -125,12 +139,9 @@ impl RaftRpc for RaftHandle {
 
     async fn install_snapshot(
         &self,
-        _req: InstallSnapshot,
+        req: InstallSnapshot,
     ) -> Result<InstallSnapshotResponse, RaftError> {
-        // Snapshots (and thus InstallSnapshot) arrive in milestone I6.
-        Err(RaftError::Transport(
-            "install_snapshot is not implemented until I6".to_string(),
-        ))
+        self.query(|tx| Inbound::InstallSnapshot(req, tx)).await
     }
 }
 
@@ -214,6 +225,9 @@ impl<T: Transport + 'static> RaftDriver<T> {
                             PeerReply::Append(from, r) => {
                                 self.node.handle_append_entries_response(from, r, now)?
                             }
+                            PeerReply::Snapshot(from, r) => {
+                                self.node.handle_install_snapshot_response(from, r, now)?
+                            }
                         };
                         self.dispatch(outs);
                     }
@@ -236,6 +250,24 @@ impl<T: Transport + 'static> RaftDriver<T> {
                 let resp = self.node.handle_append_entries(req, now)?;
                 let _ = reply.send(resp);
             }
+            Inbound::InstallSnapshot(req, reply) => {
+                match self.node.handle_install_snapshot(req, now) {
+                    Ok(resp) => {
+                        let _ = reply.send(resp);
+                    }
+                    // A malformed request from a peer (e.g. chunked) must not
+                    // kill this node's event loop: drop the reply — the sender
+                    // observes an error — and keep running. Local faults
+                    // (storage) stay fatal below.
+                    Err(RaftError::Snapshot(reason)) => {
+                        tracing::warn!(reason, "rejected inbound InstallSnapshot");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Inbound::Compact(data, reply) => {
+                let _ = reply.send(self.node.compact(data));
+            }
             Inbound::Status(reply) => {
                 let status = DriverStatus {
                     is_leader: self.node.is_leader(),
@@ -243,6 +275,7 @@ impl<T: Transport + 'static> RaftDriver<T> {
                     commit_index: self.node.commit_index(),
                     last_log_index: self.node.last_log_index()?,
                     leader: self.node.leader_id().cloned(),
+                    snapshot: self.node.snapshot_meta(),
                 };
                 let _ = reply.send(status);
             }
@@ -273,6 +306,16 @@ impl<T: Transport + 'static> RaftDriver<T> {
                         async move {
                             if let Ok(resp) = transport.append_entries(&to, request).await {
                                 let _ = replies.send(PeerReply::Append(to, resp));
+                            }
+                        }
+                        .in_current_span(),
+                    );
+                }
+                Outbound::InstallSnapshot { to, request } => {
+                    tokio::spawn(
+                        async move {
+                            if let Ok(resp) = transport.install_snapshot(&to, request).await {
+                                let _ = replies.send(PeerReply::Snapshot(to, resp));
                             }
                         }
                         .in_current_span(),

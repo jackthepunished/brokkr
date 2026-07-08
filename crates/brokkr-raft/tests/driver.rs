@@ -235,3 +235,62 @@ async fn driver_minority_partition_cannot_commit_then_heals() {
     settle(Duration::from_secs(3)).await;
     assert_eq!(leaders(&handles).await.len(), 1, "one leader after healing");
 }
+
+#[tokio::test(start_paused = true)]
+async fn driver_compacts_and_ships_snapshot_to_partitioned_member() {
+    let (fabric, handles, _dirs) = cluster(3);
+    settle(Duration::from_secs(2)).await;
+    let leader = leaders(&handles).await[0];
+    let lagging = (0..3).find(|&i| i != leader).unwrap();
+    let third = (0..3).find(|&i| i != leader && i != lagging).unwrap();
+
+    // Cut one member off, then commit five writes on the majority.
+    fabric.partition(&[&[leader, third], &[lagging]]);
+    for k in 0..5u32 {
+        handles[leader]
+            .propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+            .await
+            .unwrap();
+        settle(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        handles[leader].status().await.unwrap().commit_index.get(),
+        5
+    );
+
+    // Compact the leader (I6): the shell supplies the machine blob.
+    let meta = handles[leader]
+        .compact(Bytes::from_static(b"machine@5"))
+        .await
+        .unwrap();
+    assert_eq!(meta.last_included_index.get(), 5);
+    assert_eq!(
+        handles[leader]
+            .status()
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .last_included_index
+            .get(),
+        5
+    );
+    // Compacting again with nothing new is refused.
+    assert!(handles[leader].compact(Bytes::new()).await.is_err());
+
+    // Heal: the lagging member's entries were compacted away, so it can only
+    // catch up via InstallSnapshot through the driver + transport.
+    fabric.heal();
+    settle(Duration::from_secs(2)).await;
+    let status = handles[lagging].status().await.unwrap();
+    assert_eq!(
+        status.commit_index.get(),
+        5,
+        "caught up to the commit index"
+    );
+    assert_eq!(
+        status.snapshot.unwrap().last_included_index.get(),
+        5,
+        "caught up via snapshot, not log replay"
+    );
+}

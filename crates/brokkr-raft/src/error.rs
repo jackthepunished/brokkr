@@ -36,6 +36,11 @@ pub enum RaftError {
         /// The leader this node currently recognizes, if any.
         leader: Option<String>,
     },
+
+    /// A snapshot operation failed or was invalid (nothing to compact, a
+    /// missing snapshot, or an unsupported chunked `InstallSnapshot`).
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
 }
 
 impl From<prost::DecodeError> for RaftError {
