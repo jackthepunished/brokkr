@@ -637,3 +637,62 @@ leader stickiness ×2, driver conf-change shrink), and
   thesis ch. 4 catch-up gate (a learner joins the voter set only once its
   match index is near the leader's), plus membership churn added to the I5
   fault campaign (the plan's I7 exit criterion).
+
+## I7c — learners & the catch-up gate (§17 task 5, completes I7)
+
+- **Date:** 2026-07-08
+- **Affected:** `crates/brokkr-raft` (`node.rs` `new_learner` +
+  voters-only-campaign + `propose_add_learner` + the promotion gate,
+  `driver.rs` `propose_add_learner`, `Config::catch_up_margin`;
+  `tests/simulation.rs` spare slots + churn campaign).
+- **Outcome:** the full thesis ch. 4 join flow works — a fresh node enters
+  as a non-voting learner, catches up via normal replication (or
+  `InstallSnapshot`), and is promoted through joint consensus only once the
+  catch-up gate passes. **I7's exit criterion is met**: the fault campaign
+  is green with membership churn added to the mix.
+
+### Decisions / notes
+
+- **Only voters campaign.** A node whose active configuration does not name
+  it a voter (a learner, or a fully removed server that learned its removal)
+  re-arms its election timer and stays quiet. Complements I7b's leader
+  stickiness: stickiness protects the cluster from disruptors; this stops
+  well-behaved non-voters from becoming disruptors at all.
+- **`new_learner` is how nodes join.** Its bootstrap config lists the
+  founding voters and itself only as a learner, so a joining node can never
+  self-elect off its bootstrap before learning the real membership. The sim
+  spawns spares this way; I9's real join flow should too.
+- **The gate measures replication distance, not learner status.** A
+  promotion is refused iff an added voter's `matchIndex` lags the leader's
+  last index by more than `catch_up_margin` (default 256). Adding a voter
+  directly to a small/fresh cluster still works (I7b's add-node test is
+  unchanged); adding a cold node to a long log is refused with an error
+  pointing at the learner flow.
+- **Learner additions are single-config entries.** They change no quorum,
+  so joint consensus would be ceremony; the one-in-flight rule still
+  applies. Promotion (a quorum change) goes through the full
+  C_old,new → C_new machinery from I7b, which drops the promoted node from
+  `learners` as it enters `voters`.
+- **Churn campaign** (`soak_random_faults_with_membership_churn`): 5
+  founders + 2 spare slots, threshold 16, 120 rounds of random
+  partitions/crashes/restarts interleaved with a retried churn plan
+  (add n5 → promote n5 → retire a founder → add n6 → promote n6 → retire
+  another). Proposals bounced by the gate/one-in-flight rule are retried
+  next round; the linearizability oracle runs after every round. The run
+  completes the plan through at least the second add, keeps committing
+  writes, and compacts throughout.
+
+### Verified per-crate in WSL2
+
+`brokkr-proto` and `brokkr-raft` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, tests (**91 unit + 19 integration**;
+new: learner-never-campaigns, add-learner-without-joint, gated promotion
+end-to-end with the promoted voter completing a majority, add-learner
+validation, and the churn soak), and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I7 is complete.** Next is **I8 — Raft-backed KV in the control plane**
+  (§17 task 6), which begins with the plan's **MANDATORY stop-and-ask**:
+  propose to the owner exactly what replicates through Raft before writing
+  any code.

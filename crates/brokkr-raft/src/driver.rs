@@ -65,6 +65,7 @@ enum Inbound {
     InstallSnapshot(InstallSnapshot, oneshot::Sender<InstallSnapshotResponse>),
     Compact(Bytes, oneshot::Sender<Result<SnapshotMeta, RaftError>>),
     ConfChange(BTreeSet<NodeId>, oneshot::Sender<Result<(), RaftError>>),
+    AddLearner(NodeId, oneshot::Sender<Result<(), RaftError>>),
     Status(oneshot::Sender<DriverStatus>),
 }
 
@@ -122,6 +123,13 @@ impl RaftHandle {
     /// any step-down happen automatically as commits advance.
     pub async fn propose_conf_change(&self, new_voters: BTreeSet<NodeId>) -> Result<(), RaftError> {
         self.query(|tx| Inbound::ConfChange(new_voters, tx)).await?
+    }
+
+    /// Adds `id` as a non-voting learner (I7c): replicated to, never counted.
+    /// Promote it later with [`RaftHandle::propose_conf_change`] once the
+    /// catch-up gate is satisfied.
+    pub async fn propose_add_learner(&self, id: NodeId) -> Result<(), RaftError> {
+        self.query(|tx| Inbound::AddLearner(id, tx)).await?
     }
 
     async fn query<R>(
@@ -290,6 +298,15 @@ impl<T: Transport + 'static> RaftDriver<T> {
                     }
                 }
             }
+            Inbound::AddLearner(id, reply) => match self.node.propose_add_learner(id, now) {
+                Ok(outs) => {
+                    self.dispatch(outs);
+                    let _ = reply.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
             Inbound::Status(reply) => {
                 let status = DriverStatus {
                     is_leader: self.node.is_leader(),

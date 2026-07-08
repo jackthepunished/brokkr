@@ -1087,6 +1087,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   campaigns deposed the leader of the cluster it had left; a stale minority
   leader still steps down via AppendEntries terms, so liveness holds.
   Driver: `RaftHandle::propose_conf_change` + `DriverStatus.config`.
+- `brokkr-raft` learners + catch-up gate (milestone I7c, `docs/plan.md` §17
+  task 5, thesis ch. 4 — completes I7): fresh nodes join as **non-voting
+  learners** and are promoted only once caught up. `RaftNode::new_learner`
+  bootstraps a joining node whose config lists itself only as a learner;
+  **only voters campaign** — a learner (or a node its active config no
+  longer names) re-arms its election timer instead of bumping terms it can
+  never win with. `propose_add_learner` appends a single non-joint config
+  entry (a learner changes no quorum), still under the one-in-flight rule.
+  `propose_conf_change` now enforces the **catch-up gate**: every *added*
+  voter must be replicated to within `Config::catch_up_margin` (default 256)
+  entries of the leader's log, else the change is refused with a pointer to
+  the learner flow — without the gate, promoting a fresh node adds a voter
+  that cannot ack anything and can stall commitment. Driver:
+  `RaftHandle::propose_add_learner`. **The I7 exit criterion is met**: the
+  fault campaign runs green with membership churn in the mix
+  (`soak_random_faults_with_membership_churn` — spares join as learners,
+  promote through joint consensus, founders retire, all under random
+  partitions/crashes/restarts with compaction at threshold 16, the
+  linearizability oracle checked every round).
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
   hard state (`currentTerm` + `votedFor`) is now modelled by `HardState` and
   written **atomically as a unit** via `RaftLog::save_hard_state` in a single
