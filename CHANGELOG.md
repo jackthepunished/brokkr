@@ -1026,8 +1026,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caught). `RaftServiceAdapter` is now re-exported from the crate root. New
   dev-dependencies (owner-approved): `hyper-util`, `tower`, `tokio-stream` for
   `brokkr-raft`; `hyper-util` + `tower` added to the workspace manifest.
-
-### Changed
+- `brokkr-raft` snapshots & log compaction (milestone I6, `docs/plan.md` §17
+  task 4, Raft §7): a `SnapshotMeta { last_included_index, last_included_term }`
+  plus an opaque state-machine blob persist **atomically with the covered log
+  prefix's removal** in one redb transaction (`RaftLog::compact_to` /
+  `install_snapshot_replacing_log`); last-`(index, term)` lookups fall back to
+  the snapshot metadata so elections stay correct after the whole log
+  compacts. `RaftNode::compact(data)` snapshots the committed prefix (blob
+  supplied by the shell — I8's KV wires it to the state machine),
+  `needs_snapshot()` reports growth past `Config::snapshot_threshold`
+  (default 8192), and recovery floors the commit index at the snapshot (P9).
+  A leader whose follower's `nextIndex` was compacted away ships the blob via
+  a single-shot `InstallSnapshot` (chunking noted as future work); the
+  receiver retains its log tail when the snapshot's last-included entry
+  matches, discards the whole log otherwise, and ignores stale snapshots.
+  The driver routes `InstallSnapshot` both ways, exposes
+  `RaftHandle::compact`, and reports the snapshot in `DriverStatus`; a
+  protocol-invalid inbound snapshot (chunked) is rejected without killing the
+  event loop. The I5a simulation campaign runs green with
+  `snapshot_threshold = 16` — snapshots exercised constantly under the fault
+  soak — plus new scenarios: a crashed follower catching up **via
+  InstallSnapshot** after the cluster compacted past its log, and
+  restart-from-snapshot history equality via the linearizability oracle
+  (snapshot blob + log tail).
 - `brokkr-raft` persistent state (milestone I2, `docs/plan.md` §17): the Raft
   hard state (`currentTerm` + `votedFor`) is now modelled by `HardState` and
   written **atomically as a unit** via `RaftLog::save_hard_state` in a single

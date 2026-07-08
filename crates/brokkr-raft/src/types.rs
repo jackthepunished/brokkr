@@ -142,6 +142,21 @@ impl AsRef<str> for NodeId {
     }
 }
 
+/// Metadata describing a snapshot: the log prefix it replaces (Raft §7).
+///
+/// The snapshot blob itself is opaque `Bytes` produced by the state machine
+/// (for I8's KV, a serialized map); this metadata is what consensus needs —
+/// the last log entry the snapshot covers, so replication and elections can
+/// reason about a log whose prefix has been compacted away. The cluster
+/// configuration joins this struct with membership changes (I7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotMeta {
+    /// The snapshot replaces all log entries up to and including this index.
+    pub last_included_index: LogIndex,
+    /// The term of the entry at `last_included_index`.
+    pub last_included_term: Term,
+}
+
 /// One entry in the replicated log: a state-machine `command` tagged with the
 /// `term` in which the leader created it and its 1-based `index`.
 #[derive(Debug, Clone, PartialEq, Eq)]

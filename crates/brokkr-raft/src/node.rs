@@ -33,8 +33,11 @@ use crate::error::RaftError;
 use crate::rng::Rng;
 use crate::state::HardState;
 use crate::storage::RaftLog;
-use crate::transport::{AppendEntries, AppendEntriesResponse, RequestVote, RequestVoteResponse};
-use crate::types::{LogEntry, LogIndex, NodeId, Term};
+use crate::transport::{
+    AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, RequestVote,
+    RequestVoteResponse,
+};
+use crate::types::{LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 /// Timing parameters for a node. Defaults match the paper's 150–300 ms election
 /// window (`docs/raft-notes.md` §4.1).
@@ -46,6 +49,11 @@ pub struct Config {
     pub max_election_timeout: Duration,
     /// How often a leader emits heartbeats. Must be `≪ min_election_timeout`.
     pub heartbeat_interval: Duration,
+    /// Compaction trigger (I6): once more than this many committed entries sit
+    /// above the last snapshot, [`RaftNode::needs_snapshot`] reports `true` and
+    /// the shell should supply a state-machine snapshot via
+    /// [`RaftNode::compact`].
+    pub snapshot_threshold: u64,
 }
 
 impl Default for Config {
@@ -54,6 +62,7 @@ impl Default for Config {
             min_election_timeout: Duration::from_millis(150),
             max_election_timeout: Duration::from_millis(300),
             heartbeat_interval: Duration::from_millis(50),
+            snapshot_threshold: 8192,
         }
     }
 }
@@ -98,6 +107,15 @@ pub enum Outbound {
         /// The request.
         request: AppendEntries,
     },
+    /// Send an `InstallSnapshot` to `to` — its `nextIndex` was compacted away
+    /// (I6). Single-shot: the whole blob in one request (chunking is noted as
+    /// future work; entries are small KV commands).
+    InstallSnapshot {
+        /// Recipient.
+        to: NodeId,
+        /// The request.
+        request: InstallSnapshot,
+    },
 }
 
 /// A Raft node: the consensus state machine for one server.
@@ -112,8 +130,14 @@ pub struct RaftNode {
     /// In-memory copy of the persisted hard state; every mutation is written
     /// through to `log` before the corresponding reply (persist-before-respond).
     hard: HardState,
-    /// Highest index known committed (volatile).
+    /// Highest index known committed (volatile, but floored at the snapshot's
+    /// `last_included_index` on recovery — snapshotted entries are
+    /// definitionally committed and applied; P9).
     commit_index: LogIndex,
+    /// In-memory copy of the persisted snapshot metadata (the blob stays on
+    /// disk); kept in sync by `compact` and `handle_install_snapshot`. Cached
+    /// because replication consults it on every heartbeat.
+    snapshot: Option<SnapshotMeta>,
     /// The leader this node currently recognizes, if any.
     leader_id: Option<NodeId>,
     rng: Rng,
@@ -136,13 +160,20 @@ impl RaftNode {
         now: Instant,
     ) -> Result<Self, RaftError> {
         let hard = log.load_hard_state()?;
+        let snapshot = log.snapshot_meta()?;
+        // P9: everything a snapshot covers is committed and applied; the commit
+        // index must never regress below it across a restart.
+        let commit_floor = snapshot
+            .map(|m| m.last_included_index)
+            .unwrap_or(LogIndex::ZERO);
         let mut node = RaftNode {
             id,
             peers,
             role: Role::Follower,
             log,
             hard,
-            commit_index: LogIndex::ZERO,
+            commit_index: commit_floor,
+            snapshot,
             leader_id: None,
             rng,
             config,
@@ -209,6 +240,44 @@ impl RaftNode {
     /// leader (a driver uses this to schedule the next `tick`).
     pub fn election_deadline(&self) -> Instant {
         self.election_deadline
+    }
+
+    /// The installed snapshot's metadata, if any (I6).
+    pub fn snapshot_meta(&self) -> Option<SnapshotMeta> {
+        self.snapshot
+    }
+
+    /// The installed snapshot (metadata + opaque blob), if any. The blob is
+    /// read from storage; the shell uses it to restore a state machine.
+    pub fn snapshot(&self) -> Result<Option<(SnapshotMeta, Bytes)>, RaftError> {
+        self.log.snapshot()
+    }
+
+    /// The lowest index still present in the log ([`LogIndex::ZERO`] when
+    /// empty). After compaction this is `snapshot.last_included_index + 1`.
+    pub fn first_log_index(&self) -> Result<LogIndex, RaftError> {
+        self.log.first_index()
+    }
+
+    /// The index of the last entry the current snapshot covers (ZERO if none).
+    fn snapshot_index(&self) -> LogIndex {
+        self.snapshot
+            .map(|m| m.last_included_index)
+            .unwrap_or(LogIndex::ZERO)
+    }
+
+    /// The term at `index`: from the log entry if present, or from the
+    /// snapshot metadata when `index` is exactly the snapshot's last included
+    /// entry. `None` for indices compacted away below the snapshot (their
+    /// terms are gone by design) or beyond the end of the log.
+    fn term_at(&self, index: LogIndex) -> Result<Option<Term>, RaftError> {
+        if let Some(entry) = self.log.get(index)? {
+            return Ok(Some(entry.term));
+        }
+        match self.snapshot {
+            Some(meta) if meta.last_included_index == index => Ok(Some(meta.last_included_term)),
+            _ => Ok(None),
+        }
     }
 
     // --- time -------------------------------------------------------------
@@ -345,7 +414,9 @@ impl RaftNode {
         Ok(out)
     }
 
-    /// Builds the `AppendEntries` to send `peer` given the leader `state`.
+    /// Builds the `AppendEntries` to send `peer` given the leader `state` — or
+    /// an `InstallSnapshot` (I6, Raft §7) when the entries the peer needs were
+    /// compacted away (`nextIndex <= snapshot.last_included_index`).
     fn append_entries_for(
         &self,
         peer: &NodeId,
@@ -356,14 +427,31 @@ impl RaftNode {
             .get(peer)
             .copied()
             .unwrap_or_else(|| LogIndex::new(1));
+        if next <= self.snapshot_index() {
+            let (meta, data) = self.log.snapshot()?.ok_or_else(|| {
+                RaftError::Snapshot("snapshot metadata cached but blob missing".to_string())
+            })?;
+            return Ok(Outbound::InstallSnapshot {
+                to: peer.clone(),
+                request: InstallSnapshot {
+                    term: self.hard.current_term,
+                    leader_id: self.id.clone(),
+                    last_included_index: meta.last_included_index,
+                    last_included_term: meta.last_included_term,
+                    offset: 0,
+                    data,
+                    done: true,
+                },
+            });
+        }
         let prev_log_index = next.prev();
         let prev_log_term = if prev_log_index == LogIndex::ZERO {
             Term::ZERO
         } else {
-            self.log
-                .get(prev_log_index)?
-                .map(|e| e.term)
-                .unwrap_or(Term::ZERO)
+            // `term_at` also resolves the snapshot boundary: for the first
+            // entry after compaction, `prev` is the snapshot's last included
+            // index, whose term lives in the snapshot metadata.
+            self.term_at(prev_log_index)?.unwrap_or(Term::ZERO)
         };
         let entries = self.log.entries_from(next)?;
         Ok(Outbound::AppendEntries {
@@ -563,11 +651,19 @@ impl RaftNode {
 
     /// Whether our log holds an entry at `prev_index` with term `prev_term`
     /// (trivially true for the empty prefix, `prev_index == 0`).
+    ///
+    /// Indices at or below our snapshot match by construction: everything a
+    /// snapshot covers is committed, and committed entries agree on every log
+    /// (Leader Completeness) — the boundary index itself is still checked
+    /// against the snapshot's recorded term via `term_at`.
     fn log_matches(&self, prev_index: LogIndex, prev_term: Term) -> Result<bool, RaftError> {
         if prev_index == LogIndex::ZERO {
             return Ok(true);
         }
-        Ok(self.log.get(prev_index)?.map(|e| e.term) == Some(prev_term))
+        if prev_index < self.snapshot_index() {
+            return Ok(true);
+        }
+        Ok(self.term_at(prev_index)? == Some(prev_term))
     }
 
     /// The fast-backtrack hint (`docs/raft-notes.md` §5.3) for a failed check at
@@ -601,7 +697,13 @@ impl RaftNode {
     /// delayed or duplicated request must not erase a committed suffix
     /// (`docs/raft-notes.md` §5.1).
     fn append_new_entries(&mut self, entries: &[LogEntry]) -> Result<(), RaftError> {
+        let snapshot_index = self.snapshot_index();
         for (i, entry) in entries.iter().enumerate() {
+            // Entries the snapshot already covers are committed and applied;
+            // never re-append them into the compacted region (I6).
+            if entry.index <= snapshot_index {
+                continue;
+            }
             match self.log.get(entry.index)? {
                 Some(existing) if existing.term == entry.term => continue,
                 Some(_) => {
@@ -721,6 +823,134 @@ impl RaftNode {
         };
         self.commit_index = new_commit;
         Ok(())
+    }
+
+    // --- snapshots (I6, Raft §7) -------------------------------------------
+
+    /// Handles an inbound `InstallSnapshot` from a leader whose log no longer
+    /// holds the entries we need (Raft §7).
+    ///
+    /// Single-shot only: `offset != 0` or `done == false` is rejected with
+    /// [`RaftError::Snapshot`] (chunking is future work — entries are small KV
+    /// commands, so blobs stay modest). A snapshot that is older than our own
+    /// snapshot or our commit index is stale and ignored: installing it would
+    /// regress applied state (P9). Otherwise: if our log holds the snapshot's
+    /// last-included entry with a matching term, the tail beyond it is
+    /// retained; on any conflict (or a too-short log) the entire log is
+    /// discarded — both installs are atomic with the prefix drop.
+    pub fn handle_install_snapshot(
+        &mut self,
+        request: InstallSnapshot,
+        now: Instant,
+    ) -> Result<InstallSnapshotResponse, RaftError> {
+        self.observe_term(request.term, now)?;
+        let term = self.hard.current_term;
+
+        // Stale leader: reply with our term, take no action.
+        if request.term < term {
+            return Ok(InstallSnapshotResponse { term });
+        }
+        if request.offset != 0 || !request.done {
+            return Err(RaftError::Snapshot(
+                "chunked InstallSnapshot is not supported (single-shot only)".to_string(),
+            ));
+        }
+
+        // A valid leader for this term, exactly as in `handle_append_entries`.
+        self.role = Role::Follower;
+        self.leader_id = Some(request.leader_id.clone());
+        self.arm_election_timer(now);
+
+        // Stale snapshot: nothing it covers is news to us.
+        if request.last_included_index <= self.snapshot_index()
+            || request.last_included_index <= self.commit_index
+        {
+            return Ok(InstallSnapshotResponse { term });
+        }
+
+        let meta = SnapshotMeta {
+            last_included_index: request.last_included_index,
+            last_included_term: request.last_included_term,
+        };
+        let basis_matches = self.log.get(meta.last_included_index)?.map(|e| e.term)
+            == Some(meta.last_included_term);
+        if basis_matches {
+            // Raft §7: "retain log entries following it".
+            self.log.compact_to(meta, &request.data)?;
+        } else {
+            // Raft §7: "discard the entire log".
+            self.log
+                .install_snapshot_replacing_log(meta, &request.data)?;
+        }
+        self.snapshot = Some(meta);
+        // The guard above ensures this only ever moves the commit index forward.
+        self.commit_index = meta.last_included_index;
+        Ok(InstallSnapshotResponse { term })
+    }
+
+    /// Handles a peer's reply to our `InstallSnapshot`. A higher term steps us
+    /// down; otherwise the peer now holds everything up to our snapshot's last
+    /// included index, so its `matchIndex`/`nextIndex` jump there and normal
+    /// log replication resumes.
+    pub fn handle_install_snapshot_response(
+        &mut self,
+        from: NodeId,
+        response: InstallSnapshotResponse,
+        now: Instant,
+    ) -> Result<Vec<Outbound>, RaftError> {
+        if self.observe_term(response.term, now)? {
+            return Ok(Vec::new());
+        }
+        if response.term != self.hard.current_term || !self.is_leader() {
+            return Ok(Vec::new());
+        }
+        let Some(meta) = self.snapshot else {
+            return Ok(Vec::new());
+        };
+        self.record_match(&from, meta.last_included_index);
+        self.advance_commit_index()?;
+        if self.peer_is_behind(&from)? {
+            self.replicate_to(&from)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Whether the committed-but-uncompacted portion of the log has outgrown
+    /// [`Config::snapshot_threshold`]. The shell polls this and, when `true`,
+    /// obtains a state-machine snapshot and calls [`RaftNode::compact`].
+    pub fn needs_snapshot(&self) -> bool {
+        let uncompacted = self
+            .commit_index
+            .get()
+            .saturating_sub(self.snapshot_index().get());
+        uncompacted > self.config.snapshot_threshold
+    }
+
+    /// Compacts the committed prefix of the log into a snapshot whose opaque
+    /// blob is `data` — the state machine's serialized state at exactly the
+    /// current commit index (the caller guarantees this correspondence; for
+    /// I8's KV, a serialized map). Persisted atomically with the prefix drop.
+    ///
+    /// Errors with [`RaftError::Snapshot`] if there is nothing new to compact.
+    pub fn compact(&mut self, data: Bytes) -> Result<SnapshotMeta, RaftError> {
+        let index = self.commit_index;
+        if index == LogIndex::ZERO || index <= self.snapshot_index() {
+            return Err(RaftError::Snapshot(format!(
+                "nothing to compact: commit index {index}, snapshot already at {}",
+                self.snapshot_index()
+            )));
+        }
+        let term = self.term_at(index)?.ok_or_else(|| {
+            RaftError::Snapshot(format!("no term known for committed index {index}"))
+        })?;
+        let meta = SnapshotMeta {
+            last_included_index: index,
+            last_included_term: term,
+        };
+        self.log.compact_to(meta, &data)?;
+        self.snapshot = Some(meta);
+        Ok(meta)
     }
 
     // --- client interface -------------------------------------------------
@@ -976,6 +1206,18 @@ mod tests {
                         let resp = self.nodes[ti].handle_append_entries(request, now).unwrap();
                         let more = self.nodes[from]
                             .handle_append_entries_response(to, resp, now)
+                            .unwrap();
+                        for o in more {
+                            queue.push_back((from, o));
+                        }
+                    }
+                    Outbound::InstallSnapshot { to, request } => {
+                        let ti = self.idx(&to);
+                        let resp = self.nodes[ti]
+                            .handle_install_snapshot(request, now)
+                            .unwrap();
+                        let more = self.nodes[from]
+                            .handle_install_snapshot_response(to, resp, now)
                             .unwrap();
                         for o in more {
                             queue.push_back((from, o));
@@ -1315,6 +1557,9 @@ mod tests {
                         queue.push_back((0, o));
                     }
                 }
+                Outbound::InstallSnapshot { .. } => {
+                    unreachable!("no compaction happens in this test")
+                }
             }
         }
         assert!(n0.is_leader());
@@ -1412,8 +1657,293 @@ mod tests {
             .find(|o| match o {
                 Outbound::AppendEntries { to, .. } => to.as_str() == target,
                 Outbound::RequestVote { to, .. } => to.as_str() == target,
+                Outbound::InstallSnapshot { to, .. } => to.as_str() == target,
             })
             .unwrap()
             .clone()
+    }
+
+    // --- snapshots & compaction (I6) ---------------------------------------
+
+    #[test]
+    fn compact_drops_prefix_and_survives_restart() {
+        let t0 = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.redb");
+        let mk = |now: Instant| {
+            RaftNode::new(
+                nid("solo"),
+                vec![],
+                RaftLog::open(&path).unwrap(),
+                Rng::seed_from_u64(1),
+                Config::default(),
+                now,
+            )
+            .unwrap()
+        };
+
+        let mut node = mk(t0);
+        node.tick(t0 + Duration::from_secs(1)).unwrap();
+        assert!(node.is_leader());
+        for k in 0..5u32 {
+            node.propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+                .unwrap();
+        }
+        assert_eq!(node.commit_index(), LogIndex::new(5));
+
+        let meta = node.compact(Bytes::from_static(b"machine@5")).unwrap();
+        assert_eq!(meta.last_included_index, LogIndex::new(5));
+        assert_eq!(meta.last_included_term, Term::new(1));
+        // The whole log was committed, so compaction empties it — but the
+        // last (index, term) must survive via the snapshot fallback.
+        assert_eq!(node.first_log_index().unwrap(), LogIndex::ZERO);
+        assert_eq!(node.last_log_index().unwrap(), LogIndex::new(5));
+        assert!(node.log_entry(LogIndex::new(3)).unwrap().is_none());
+
+        // Appending continues seamlessly above the snapshot.
+        node.propose(Bytes::from_static(b"six")).unwrap();
+        assert_eq!(node.last_log_index().unwrap(), LogIndex::new(6));
+        assert_eq!(node.first_log_index().unwrap(), LogIndex::new(6));
+
+        // Restart: snapshot metadata recovers and floors the commit index (P9).
+        drop(node);
+        let node = mk(t0 + Duration::from_secs(2));
+        assert_eq!(node.snapshot_meta(), Some(meta));
+        assert!(node.commit_index() >= LogIndex::new(5));
+        let (m, data) = node.snapshot().unwrap().unwrap();
+        assert_eq!(m, meta);
+        assert_eq!(data, Bytes::from_static(b"machine@5"));
+    }
+
+    #[test]
+    fn compact_with_nothing_new_errors() {
+        let t0 = Instant::now();
+        let (_d, mut node) = make("solo", &[], 1, t0);
+        // Nothing committed at all.
+        let err = node.compact(Bytes::new()).unwrap_err();
+        assert!(matches!(err, RaftError::Snapshot(_)));
+
+        node.tick(t0 + Duration::from_secs(1)).unwrap();
+        node.propose(Bytes::from_static(b"a")).unwrap();
+        node.compact(Bytes::from_static(b"s1")).unwrap();
+        // Compacting again with no new commits is refused.
+        let err = node.compact(Bytes::from_static(b"s2")).unwrap_err();
+        assert!(matches!(err, RaftError::Snapshot(_)));
+    }
+
+    #[test]
+    fn needs_snapshot_tracks_committed_growth_past_threshold() {
+        let t0 = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let log = RaftLog::open(dir.path().join("raft.redb")).unwrap();
+        let cfg = Config {
+            snapshot_threshold: 4,
+            ..Config::default()
+        };
+        let mut node =
+            RaftNode::new(nid("solo"), vec![], log, Rng::seed_from_u64(1), cfg, t0).unwrap();
+        node.tick(t0 + Duration::from_secs(1)).unwrap();
+        for k in 0..4u32 {
+            node.propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+                .unwrap();
+        }
+        assert!(!node.needs_snapshot(), "exactly at the threshold is fine");
+        node.propose(Bytes::from_static(b"tip")).unwrap();
+        assert!(node.needs_snapshot(), "one past the threshold triggers");
+        node.compact(Bytes::from_static(b"s")).unwrap();
+        assert!(!node.needs_snapshot(), "compaction resets the trigger");
+    }
+
+    #[test]
+    fn leader_ships_snapshot_to_a_follower_whose_entries_were_compacted() {
+        let t0 = Instant::now();
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        let now = t0 + Duration::from_secs(1);
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        // Three fully replicated, committed entries; one heartbeat round then
+        // propagates the leader's commit index to the followers.
+        for k in 0..3u32 {
+            let out = c.nodes[0]
+                .propose(Bytes::copy_from_slice(&k.to_le_bytes()))
+                .unwrap();
+            c.deliver_all(batch(0, out), now);
+        }
+        c.tick_and_deliver(0, now + Duration::from_millis(60));
+        assert_eq!(c.nodes[2].commit_index(), LogIndex::new(3));
+
+        // Entry 4 reaches only n1 (a majority with the leader): committed on
+        // n0 while n2 is left behind at index 3.
+        let out = c.nodes[0].propose(Bytes::from_static(b"e4")).unwrap();
+        let to_n1 = rv_or_ae_to(&out, "n1");
+        if let Outbound::AppendEntries { request, .. } = to_n1 {
+            let resp = c.nodes[1].handle_append_entries(request, now).unwrap();
+            c.nodes[0]
+                .handle_append_entries_response(nid("n1"), resp, now)
+                .unwrap();
+        }
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(4));
+
+        // The leader compacts everything it committed; index 4 is now gone
+        // from its log, so n2 can only be caught up by snapshot.
+        c.nodes[0]
+            .compact(Bytes::from_static(b"machine@4"))
+            .unwrap();
+        let outs = c.nodes[0].tick(now + Duration::from_millis(120)).unwrap();
+        let to_n2 = rv_or_ae_to(&outs, "n2");
+        let Outbound::InstallSnapshot { request, .. } = to_n2 else {
+            panic!("expected InstallSnapshot for the lagging follower, got {to_n2:?}");
+        };
+        assert_eq!(request.last_included_index, LogIndex::new(4));
+        assert!(request.done && request.offset == 0, "single-shot");
+
+        // n2 installs it: conflicting basis (it never saw entry 4) discards
+        // the log; state jumps to the snapshot.
+        let resp = c.nodes[2].handle_install_snapshot(request, now).unwrap();
+        assert_eq!(c.nodes[2].commit_index(), LogIndex::new(4));
+        assert_eq!(
+            c.nodes[2].snapshot_meta().unwrap().last_included_index,
+            LogIndex::new(4)
+        );
+        assert_eq!(c.nodes[2].first_log_index().unwrap(), LogIndex::ZERO);
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(4));
+
+        // The leader records the catch-up; n2 is no longer behind.
+        let more = c.nodes[0]
+            .handle_install_snapshot_response(nid("n2"), resp, now)
+            .unwrap();
+        assert!(more.is_empty(), "peer is fully caught up");
+
+        // Replication above the snapshot boundary resumes normally: the
+        // prev term for entry 5 comes from the snapshot metadata on both ends.
+        let out = c.nodes[0].propose(Bytes::from_static(b"e5")).unwrap();
+        c.deliver_all(batch(0, out), now);
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(5));
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(5));
+    }
+
+    #[test]
+    fn stale_install_snapshot_is_ignored() {
+        let now = Instant::now();
+        let (_d, mut follower) = make_with_log(
+            "f",
+            &["ldr"],
+            &[(1, 1), (1, 2), (1, 3), (1, 4), (1, 5)],
+            now,
+        );
+        // A heartbeat commits everything the follower holds.
+        let req = append_entries("ldr", 1, 5, 1, vec![], 5);
+        follower.handle_append_entries(req, now).unwrap();
+        assert_eq!(follower.commit_index(), LogIndex::new(5));
+
+        // A snapshot older than the commit index must be a no-op.
+        let resp = follower
+            .handle_install_snapshot(
+                InstallSnapshot {
+                    term: Term::new(1),
+                    leader_id: nid("ldr"),
+                    last_included_index: LogIndex::new(3),
+                    last_included_term: Term::new(1),
+                    offset: 0,
+                    data: Bytes::from_static(b"old"),
+                    done: true,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(resp.term, Term::new(1));
+        assert!(follower.snapshot_meta().is_none(), "stale snapshot ignored");
+        assert!(follower.log_entry(LogIndex::new(2)).unwrap().is_some());
+        assert_eq!(follower.commit_index(), LogIndex::new(5));
+    }
+
+    #[test]
+    fn install_snapshot_with_matching_basis_retains_the_tail() {
+        let now = Instant::now();
+        let (_d, mut follower) = make_with_log("f", &["ldr"], &[(1, 1), (1, 2), (2, 3)], now);
+        let resp = follower
+            .handle_install_snapshot(
+                InstallSnapshot {
+                    term: Term::new(2),
+                    leader_id: nid("ldr"),
+                    last_included_index: LogIndex::new(2),
+                    last_included_term: Term::new(1), // matches our entry 2
+                    offset: 0,
+                    data: Bytes::from_static(b"machine@2"),
+                    done: true,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(resp.term, Term::new(2));
+        assert_eq!(
+            follower.first_log_index().unwrap(),
+            LogIndex::new(3),
+            "the tail beyond the snapshot survives"
+        );
+        assert_eq!(follower.commit_index(), LogIndex::new(2));
+        assert_eq!(
+            follower.snapshot_meta().unwrap().last_included_index,
+            LogIndex::new(2)
+        );
+    }
+
+    #[test]
+    fn chunked_install_snapshot_is_rejected() {
+        let now = Instant::now();
+        let (_d, mut follower) = make("f", &["ldr"], 1, now);
+        let mut req = InstallSnapshot {
+            term: Term::new(1),
+            leader_id: nid("ldr"),
+            last_included_index: LogIndex::new(1),
+            last_included_term: Term::new(1),
+            offset: 4096,
+            data: Bytes::from_static(b"chunk"),
+            done: true,
+        };
+        let err = follower
+            .handle_install_snapshot(req.clone(), now)
+            .unwrap_err();
+        assert!(matches!(err, RaftError::Snapshot(_)));
+        req.offset = 0;
+        req.done = false;
+        let err = follower.handle_install_snapshot(req, now).unwrap_err();
+        assert!(matches!(err, RaftError::Snapshot(_)));
+    }
+
+    #[test]
+    fn election_restriction_uses_snapshot_term_after_full_compaction() {
+        let now = Instant::now();
+        let (_d, mut voter) = make("v", &["c"], 1, now);
+        // A leader replicates three entries (last: term 2, index 3) and
+        // commits them; the voter then compacts its entire log away.
+        let entries = vec![
+            LogEntry::new(Term::new(1), LogIndex::new(1), Bytes::from_static(b"a")),
+            LogEntry::new(Term::new(2), LogIndex::new(2), Bytes::from_static(b"b")),
+            LogEntry::new(Term::new(2), LogIndex::new(3), Bytes::from_static(b"c")),
+        ];
+        voter
+            .handle_append_entries(append_entries("ldr", 2, 0, 0, entries, 3), now)
+            .unwrap();
+        assert_eq!(voter.commit_index(), LogIndex::new(3));
+        voter.compact(Bytes::from_static(b"machine@3")).unwrap();
+        assert_eq!(voter.first_log_index().unwrap(), LogIndex::ZERO);
+
+        // The comparator still sees (term 2, index 3) via the snapshot.
+        assert!(
+            !voter
+                .handle_request_vote(asks(2, 2), now)
+                .unwrap()
+                .vote_granted,
+            "shorter log than the compacted (2,3) loses"
+        );
+        assert!(
+            voter
+                .handle_request_vote(asks(2, 3), now)
+                .unwrap()
+                .vote_granted,
+            "an equal log is still up-to-date after compaction"
+        );
     }
 }

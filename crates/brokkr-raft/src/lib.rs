@@ -32,8 +32,13 @@
 //! [`RaftNode`] is a synchronous, single-owner state machine (no locks, ADR 0013
 //! D4): callers drive it with `tick` (time), `handle_*` (RPCs), and `propose`
 //! (client writes), and it returns the messages to send. The async event-loop
-//! shell that wires it to a [`Transport`] and a real clock arrives with the
-//! simulation suite (I5).
+//! shell that wires it to a [`Transport`] and a real clock is [`RaftDriver`]
+//! (I5).
+//!
+//! Milestone I6 adds **snapshots and log compaction** (Raft §7): the committed
+//! prefix compacts into a [`SnapshotMeta`] + opaque blob (atomically with the
+//! prefix drop), a leader ships `InstallSnapshot` to followers whose entries
+//! were compacted away, and recovery floors the commit index at the snapshot.
 
 #![deny(missing_docs)]
 
@@ -57,4 +62,4 @@ pub use transport::{
     InstallSnapshotResponse, RaftRpc, RaftServiceAdapter, RequestVote, RequestVoteResponse,
     TonicTransport, Transport,
 };
-pub use types::{LogEntry, LogIndex, NodeId, Term};
+pub use types::{LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
