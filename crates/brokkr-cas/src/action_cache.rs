@@ -16,7 +16,8 @@ use tokio::sync::Semaphore;
 
 use crate::error::CasError;
 
-const ACTION_RESULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("action_results");
+const ACTION_RESULTS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("action_results");
 
 /// Default max concurrent `spawn_blocking` tasks for [`RedbActionCache`].
 const DEFAULT_ACTION_CACHE_CONCURRENCY: usize = 16;

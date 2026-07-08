@@ -15,22 +15,25 @@ fmt-check:
 
 # Lint with clippy. Warnings are errors.
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 
-# Run the full test suite.
+# Run the full test suite (integration/unit + doctests).
+# brokkr-proto is excluded from doctests: generated protobuf comments are not
+# valid Rust, and `--doc` ignores its `doctest = false`.
 test:
-    cargo test --workspace --all-targets
+    cargo test --workspace --all-targets --locked
+    cargo test --workspace --doc --exclude brokkr-proto --locked
 
 # Build everything in release mode.
 build:
-    cargo build --workspace --release
+    cargo build --workspace --release --locked
 
 # Audit dependencies (advisories, licenses, bans).
 deny:
     cargo deny check
 
 # What CI runs locally. Run before pushing.
-ci: fmt-check lint test
+ci: fmt-check lint test deny
 
 # Run the brokk CLI.
 brokk *ARGS:

@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Rust dependencies. Lockfile bumps land as their own PRs (CLAUDE.md rule 7).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Keep the churn low: batch routine patch/minor bumps into one PR,
+      # leaving majors as individual PRs that get real review.
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the workflows above.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"
