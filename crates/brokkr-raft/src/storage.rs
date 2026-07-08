@@ -22,11 +22,14 @@
 use std::path::Path;
 
 use bytes::Bytes;
+use prost::Message;
 use redb::{Database, ReadableTable, TableDefinition};
+
+use brokkr_proto::brokkr::v1 as pb;
 
 use crate::error::RaftError;
 use crate::state::HardState;
-use crate::types::{LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+use crate::types::{ClusterConfig, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 /// Log table: 1-based index → protobuf-encoded [`LogEntry`].
 const LOG_TABLE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("log");
@@ -43,6 +46,9 @@ const META_SNAP_INDEX: &str = "snapshot_last_index";
 const META_SNAP_TERM: &str = "snapshot_last_term";
 /// `meta` key for the opaque snapshot blob.
 const META_SNAP_DATA: &str = "snapshot_data";
+/// `meta` key for the snapshot's cluster configuration (protobuf-encoded
+/// `brokkr.v1.ClusterConfig`; absent on pre-I7b stores).
+const META_SNAP_CONFIG: &str = "snapshot_config";
 
 /// Maps any `Display` storage error into [`RaftError::Storage`].
 fn stor<E: std::fmt::Display>(e: E) -> RaftError {
@@ -219,6 +225,7 @@ impl RaftLog {
     ) -> Result<(), RaftError> {
         let index_bytes = meta.last_included_index.get().to_le_bytes();
         let term_bytes = meta.last_included_term.get().to_le_bytes();
+        let config_bytes = pb::ClusterConfig::from(&meta.config).encode_to_vec();
         let write = self.db.begin_write().map_err(stor)?;
         {
             let mut meta_table = write.open_table(META_TABLE).map_err(stor)?;
@@ -229,6 +236,9 @@ impl RaftLog {
                 .insert(META_SNAP_TERM, &term_bytes[..])
                 .map_err(stor)?;
             meta_table.insert(META_SNAP_DATA, data).map_err(stor)?;
+            meta_table
+                .insert(META_SNAP_CONFIG, &config_bytes[..])
+                .map_err(stor)?;
 
             let mut log_table = write.open_table(LOG_TABLE).map_err(stor)?;
             if wipe_entire_log {
@@ -283,9 +293,15 @@ impl RaftLog {
                 ));
             }
         };
+        // Absent on pre-I7b stores: decodes to the empty ("unknown") config.
+        let config = match table.get(META_SNAP_CONFIG).map_err(stor)? {
+            Some(guard) => ClusterConfig::try_from(pb::ClusterConfig::decode(guard.value())?)?,
+            None => ClusterConfig::default(),
+        };
         Ok(Some(SnapshotMeta {
             last_included_index: LogIndex::new(index),
             last_included_term: Term::new(term),
+            config,
         }))
     }
 
@@ -616,6 +632,7 @@ mod tests {
         SnapshotMeta {
             last_included_index: LogIndex::new(index),
             last_included_term: Term::new(term),
+            config: ClusterConfig::default(),
         }
     }
 

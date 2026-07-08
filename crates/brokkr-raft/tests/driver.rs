@@ -294,3 +294,39 @@ async fn driver_compacts_and_ships_snapshot_to_partitioned_member() {
         "caught up via snapshot, not log replay"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn driver_conf_change_shrinks_the_cluster() {
+    let (_fabric, handles, _dirs) = cluster(3);
+    settle(Duration::from_secs(2)).await;
+    let leader = leaders(&handles).await[0];
+    let keeper = (0..3).find(|&i| i != leader).unwrap();
+    let keep: BTreeSet<NodeId> = [node_id(leader), node_id(keeper)].into_iter().collect();
+
+    // A follower rejects the proposal.
+    let removed = (0..3).find(|&i| i != leader && i != keeper).unwrap();
+    assert!(handles[removed]
+        .propose_conf_change(keep.clone())
+        .await
+        .is_err());
+
+    // The leader runs the two-phase change; both config entries commit.
+    handles[leader]
+        .propose_conf_change(keep.clone())
+        .await
+        .unwrap();
+    settle(Duration::from_secs(2)).await;
+    let status = handles[leader].status().await.unwrap();
+    assert!(status.is_leader, "the surviving leader keeps leading");
+    assert_eq!(status.config.voters, keep, "settled on C_new");
+    assert!(status.config.old_voters.is_none(), "joint phase is over");
+    assert!(status.commit_index.get() >= 2, "joint + C_new committed");
+
+    // Writes keep committing with the two-member quorum.
+    handles[leader]
+        .propose(Bytes::from_static(b"after-shrink"))
+        .await
+        .unwrap();
+    settle(Duration::from_secs(1)).await;
+    assert!(handles[leader].status().await.unwrap().commit_index.get() >= 3);
+}

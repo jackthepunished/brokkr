@@ -570,3 +570,70 @@ and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
   commits through `has_quorum`, `propose_conf_change` (one in flight;
   C_old,new commits → append C_new; a leader excluded by a committed C_new
   steps down), and `SnapshotMeta` gains the config.
+
+## I7b — joint-consensus membership changes (§17 task 5)
+
+- **Date:** 2026-07-08
+- **Affected:** `crates/brokkr-proto` (`InstallSnapshotRequest.config`),
+  `crates/brokkr-raft` (`node.rs` `ConfigTracker` + full quorum rewiring +
+  `propose_conf_change` + leader stickiness, `types.rs`
+  `SnapshotMeta.config` (no longer `Copy`), `storage.rs` snapshot-config
+  persistence, `transport.rs` `InstallSnapshot.config`, `driver.rs`
+  `propose_conf_change`/`DriverStatus.config`, `error.rs` `ConfChange`).
+- **Outcome:** membership is now a property of the log, changed by joint
+  consensus exactly per the paper: propose → C_old,new (applied on append,
+  dual-majority agreement) → committed → C_new → committed → an excluded
+  leader steps down and the remainder carries on.
+
+### Decisions / notes
+
+- **`ConfigTracker` is the P10 mechanism.** Base config (snapshot or
+  bootstrap) + every config entry still in the log, ascending. Append pushes,
+  truncation drops entries at/after the cut (the rollback), compaction folds
+  into the base, and `InstallSnapshot` adopts the carried config. Rebuilt on
+  startup by a full log scan (fine at current scale; an index would be an
+  optimization, noted for later).
+- **The `peers` field is gone.** Replication targets (voters ∪ old voters ∪
+  learners − self), vote targets (voters only — learners are never asked),
+  election tallies, and `advance_commit_index` all read the active config;
+  `has_quorum` filters non-voters, so stray grants can never elect anyone.
+- **`advance_commit_index` returns messages now.** A moved commit index can
+  demand follow-ups: appending C_new after the joint config commits, or
+  stepping down after a committed C_new excludes the leader. `propose` and
+  `propose_conf_change` take `now: Instant` because step-down re-arms the
+  election timer (same discipline as every other transition).
+- **Leader stickiness (thesis §4.2.3) turned out to be REQUIRED, not
+  optional.** The driver-level shrink test failed on the first run: after
+  C_new committed, the removed server stopped receiving heartbeats, timed
+  out repeatedly, and its ever-higher-term `RequestVote`s deposed the
+  legitimate leader — the exact disruption §4.2.3 describes. The fix: a
+  server that is a leader, or heard from one within `min_election_timeout`,
+  disregards `RequestVote` entirely (no term bump, no grant). Liveness is
+  preserved because stale leaders still step down via AppendEntries-carried
+  terms — pinned by `a_current_leader_ignores_higher_term_request_votes` and
+  the contact-goes-stale test. One I3-era test changed expectation
+  accordingly.
+- **Snapshots carry the config** (plan's `SnapshotMeta.conf`): persisted
+  under `snapshot_config`, sent in `InstallSnapshotRequest.config` (field 8),
+  adopted by the receiver; restart prefers the snapshot's config over the
+  bootstrap peer list. `SnapshotMeta` lost `Copy` — the config is owned.
+- **One change in flight.** `propose_conf_change` rejects while the latest
+  config is joint or uncommitted, rejects empty/unchanged voter sets, and
+  runs entirely leader-side; followers only ever see config *entries*.
+
+### Verified per-crate in WSL2
+
+`brokkr-proto` and `brokkr-raft` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, tests (**87 unit + 18 integration**;
+new: P10 append/rollback, add-a-node end-to-end, removed-leader step-down +
+re-election, joint-stall without a new-set majority, one-in-flight and input
+validation, snapshot-carries-config across restart and `InstallSnapshot`,
+leader stickiness ×2, driver conf-change shrink), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I7c:** learners end-to-end — `add_learner`/promotion flow with the
+  thesis ch. 4 catch-up gate (a learner joins the voter set only once its
+  match index is near the leader's), plus membership churn added to the I5
+  fault campaign (the plan's I7 exit criterion).

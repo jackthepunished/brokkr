@@ -148,14 +148,20 @@ impl AsRef<str> for NodeId {
 /// The snapshot blob itself is opaque `Bytes` produced by the state machine
 /// (for I8's KV, a serialized map); this metadata is what consensus needs —
 /// the last log entry the snapshot covers, so replication and elections can
-/// reason about a log whose prefix has been compacted away. The cluster
-/// configuration joins this struct with membership changes (I7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// reason about a log whose prefix has been compacted away. Because config
+/// entries live in the log and the snapshot replaces the prefix, the
+/// configuration in effect at `last_included_index` rides along (I7b) —
+/// a node restoring from snapshot must learn its membership from here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SnapshotMeta {
     /// The snapshot replaces all log entries up to and including this index.
     pub last_included_index: LogIndex,
     /// The term of the entry at `last_included_index`.
     pub last_included_term: Term,
+    /// The cluster configuration as of `last_included_index`. Empty voters
+    /// mean "unknown" (a pre-I7b snapshot): the node falls back to its
+    /// bootstrap configuration.
+    pub config: ClusterConfig,
 }
 
 /// A cluster membership configuration (I7, Raft §6 / thesis ch. 4).

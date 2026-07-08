@@ -338,8 +338,9 @@ impl Sim {
     /// Attempts a client write on node `i`; returns whether it was accepted
     /// (i.e. `i` was the leader).
     fn propose(&mut self, i: usize, cmd: &[u8]) -> bool {
+        let now = self.clock;
         let result = match &mut self.nodes[i] {
-            Some(n) => n.propose(Bytes::copy_from_slice(cmd)),
+            Some(n) => n.propose(Bytes::copy_from_slice(cmd), now),
             None => return false,
         };
         match result {
