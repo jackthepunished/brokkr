@@ -20,7 +20,7 @@ use crate::traits::{Cas, UpdateResult};
 const DEFAULT_REDB_CAS_CONCURRENCY: usize = 64;
 
 /// Table mapping `digest_hash_hex` → blob bytes.
-const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("blobs");
+const BLOBS: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("blobs");
 
 /// On-disk CAS backed by a `redb` database.
 #[derive(Clone)]

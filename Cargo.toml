@@ -97,11 +97,23 @@ brokkr-test-utils = { path = "crates/brokkr-test-utils", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+# Idiomatic-Rust and hygiene gates. CI runs with `-D warnings`, so each of
+# these is effectively an error there; they are `warn` so a plain local
+# `cargo build` still succeeds while surfacing them. `rust_2018_idioms` is a
+# lint *group*, so it takes a lower priority than the individual lints (Cargo
+# requires this so a group can be overridden per-lint).
+# TODO(brokkr): also enable `unused_qualifications` and `unreachable_pub` once
+# the ~44 pre-existing violations they surface (mostly in brokkr-sandbox and
+# brokkr-control) are cleaned up in a dedicated follow-up.
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_lifetimes = "warn"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+# A stray `dbg!` must never reach a commit.
+dbg_macro = "deny"
 
 [profile.release]
 lto = "thin"
