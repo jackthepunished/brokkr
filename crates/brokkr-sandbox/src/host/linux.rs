@@ -74,8 +74,19 @@ pub(super) async fn run_action(
 
     // SAFETY: pre_exec runs in the freshly-forked child between fork and
     // exec. We perform only async-signal-safe operations: dup2(2),
-    // close(2), and fcntl(2) on file descriptors we own. We do not
-    // allocate, touch globals, or call non-reentrant libc routines.
+    // close(2), fcntl(2), and setsid(2) (all listed in the POSIX
+    // signal-safety(7) table). We do not allocate, touch globals, or
+    // call non-reentrant libc routines.
+    //
+    // setsid makes the runner a new session leader and the leader of
+    // a single-member process group. On the namespace path,
+    // init (forked inside the new pidns) inherits the runner's pgid;
+    // init then forks the action, which also inherits it. On timeout
+    // or on host-side error, the host sends `killpg(-runner_pid,
+    // SIGKILL)` — which reaches init, SIGKILLing it and triggering
+    // kernel pidns teardown. On the M2 no-isolation path the runner
+    // is the action, so killpg just kills the runner (same effect as
+    // today). See issue #142.
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
@@ -91,14 +102,35 @@ pub(super) async fn run_action(
                 )
                 .map_err(io::Error::from)?;
             }
+            // New session / process-group leader. Async-signal-safe
+            // per POSIX signal-safety(7); only depends on the calling
+            // process (returns EPERM if already a session leader, but
+            // tokio's Command::spawn does not set that up, so we never
+            // hit it in practice).
+            nix::unistd::setsid().map_err(io::Error::from)?;
             Ok(())
         });
     }
 
-    let mut child = cmd.spawn().map_err(|e| SandboxError::Setup {
+    let child = cmd.spawn().map_err(|e| SandboxError::Setup {
         step: "spawn runner",
         source: e,
     })?;
+
+    // M6 + #142: take the runner's pid *now* so we can hand it to
+    // the KillpgOnDrop wrapper below. We then move `child` into the
+    // wrapper, which fires killpg on any host-side early return.
+    // `Command::kill_on_drop(true)` stays on the inner Command as a
+    // belt-and-suspenders for paths that bypass the wrapper, but it
+    // only kills the runner — not the namespace pidns init + action
+    // — so the wrapper's killpg is what actually closes the leak.
+    let mut child = {
+        let runner_pid_raw = child.id().ok_or_else(|| SandboxError::Setup {
+            step: "read runner pid",
+            source: io::Error::other("tokio child has no pid"),
+        })?;
+        KillpgOnDrop::new(child, runner_pid_raw as i32)
+    };
 
     // Decompose the pipe so the host's copy of the read end closes
     // immediately (the child has its own copy at fd 3) and `writer` is
@@ -109,6 +141,8 @@ pub(super) async fn run_action(
     // M6: create a per-action cgroup and attach the runner pid before
     // we let the runner make progress. The runner is currently parked
     // on `read_to_end(fd 3)`; it can't fork until we close the writer.
+    // We pass through KillpgOnDrop::id() here — the pid was captured
+    // once at spawn time (above) and never changes.
     let runner_pid = child.id().ok_or_else(|| SandboxError::Setup {
         step: "read runner pid",
         source: io::Error::other("tokio child has no pid"),
@@ -125,11 +159,11 @@ pub(super) async fn run_action(
     // Take stdout / stderr off the child so we can drive `wait` and
     // pipe-draining concurrently — wait_with_output wouldn't let us
     // SIGKILL on timeout because it consumes the Child.
-    let stdout = child.stdout.take().ok_or_else(|| SandboxError::Setup {
+    let stdout = child.stdout().ok_or_else(|| SandboxError::Setup {
         step: "take stdout",
         source: io::Error::other("child stdout already taken"),
     })?;
-    let stderr = child.stderr.take().ok_or_else(|| SandboxError::Setup {
+    let stderr = child.stderr().ok_or_else(|| SandboxError::Setup {
         step: "take stderr",
         source: io::Error::other("child stderr already taken"),
     })?;
@@ -178,15 +212,39 @@ pub(super) async fn run_action(
             }
             Err(_elapsed) => {
                 // SIGKILL the whole cgroup if we have one (catches
-                // grandchildren); otherwise just kill the runner. If
-                // the cgroup kill fails (delegation hiccup, cgroup
-                // already gone), fall back to killing just the runner
-                // so we still have a chance of reaping.
+                // grandchildren); otherwise killpg the runner's
+                // process group. killpg reaches the runner + the
+                // namespace pidns init (which inherited the runner's
+                // pgid via fork) + the action (which inherited via
+                // init). SIGKILLing init triggers kernel pidns
+                // teardown — the kernel sweeps every remaining
+                // process in the namespace. ESRCH is success: the
+                // M2 path where the runner IS the action self-exits,
+                // and the group is already empty.
+                //
+                // If killpg fails for any other reason (EPERM, etc.)
+                // we fall back to child.kill() so we still have a
+                // chance of reaping. Issue #142.
                 let cgroup_killed = match &cgroup {
                     Some(cg) => cg.kill_all().is_ok(),
                     None => false,
                 };
-                if !cgroup_killed {
+                let pid_group_killed = match nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(runner_pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                ) {
+                    Ok(()) => true,
+                    Err(nix::errno::Errno::ESRCH) => true, // already gone
+                    Err(e) => {
+                        tracing::warn!(
+                            runner_pid,
+                            error = %e,
+                            "killpg on runner process group failed; falling back to child.kill()"
+                        );
+                        false
+                    }
+                };
+                if !cgroup_killed && !pid_group_killed {
                     let _ = child.kill().await;
                 }
                 // Bound the post-kill wait. If the kernel won't reap
@@ -319,6 +377,122 @@ fn join_capture(joined: Result<Vec<u8>, tokio::task::JoinError>, stream: &str) -
                 "output capture task failed to join; {stream} will be reported as empty"
             );
             Vec::new()
+        }
+    }
+}
+
+/// Wrapper around `tokio::process::Child` that SIGKILLs the runner's
+/// whole process group on drop, unless `wait` has already consumed
+/// the child (i.e. the runner exited normally). This closes the
+/// error-path leak called out in issue #142: the host's early
+/// returns between `spawn` and `wait` (cgroup setup failure,
+/// config-pipe write error, stdout/stderr take failures) would
+/// otherwise drop the Child and leave the namespace PID 1 + the
+/// action alive on the host. `Command::kill_on_drop(true)` only
+/// reaches the immediate child, which is not enough on the
+/// namespace path.
+///
+/// The wrapper exposes a deliberately narrow surface — only the
+/// methods the host actually uses (`id`, `stdout`, `stderr`, `kill`,
+/// `wait`). It deliberately does not `Deref` to `tokio::process::Child`,
+/// because methods like `start_kill` would let a caller bypass the
+/// killpg-on-drop contract (sending SIGKILL to the immediate child
+/// only, leaving the namespace init + action alive). Adding new
+/// methods here requires also adding a comment justifying why the
+/// bypass-safe contract still holds.
+struct KillpgOnDrop {
+    child: Option<tokio::process::Child>,
+    runner_pid: i32,
+}
+
+impl KillpgOnDrop {
+    fn new(child: tokio::process::Child, runner_pid: i32) -> Self {
+        Self {
+            child: Some(child),
+            runner_pid,
+        }
+    }
+
+    /// Take the child out of the wrapper so Drop becomes a no-op.
+    /// Only `Drop` calls this; the wrapper's other methods pass
+    /// through to the inner child via `&mut`. The invariant is
+    /// "Drop is the only consumer of `take`" — easy to audit.
+    fn take(&mut self) -> Option<tokio::process::Child> {
+        self.child.take()
+    }
+
+    /// `tokio::process::Child::id` — pid, captured once at spawn
+    /// time, never changes.
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// `tokio::process::Child::stdout` — borrowed so the host can
+    /// `.take()` it once. Safe to call any number of times; the
+    /// inner `Option<ChildStdout>` is `None` after the first take.
+    fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.as_mut().and_then(|c| c.stdout.take())
+    }
+
+    /// `tokio::process::Child::stderr` — see `stdout`.
+    fn stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.as_mut().and_then(|c| c.stderr.take())
+    }
+
+    /// `tokio::process::Child::kill` — SIGKILL the immediate child
+    /// only. The host uses this as a last-ditch fallback when
+    /// `killpg` itself failed for a reason other than `ESRCH`. The
+    /// wrapper's Drop guard remains the primary cleanup path.
+    async fn kill(&mut self) -> std::io::Result<()> {
+        // Use the inner `Option<Child>` directly so we don't
+        // accidentally consume the child here — Drop should still
+        // fire killpg if kill() returned an error and the host
+        // bails out before `wait()`.
+        match self.child.as_mut() {
+            Some(c) => c.kill().await,
+            None => Ok(()), // already taken via Drop or wait(); nothing to do
+        }
+    }
+
+    /// `tokio::process::Child::wait` — does NOT take the child; the
+    /// child stays in the wrapper and Drop still fires killpg if
+    /// `wait` returns an error and the host bails out before
+    /// consuming the child. On the happy path, the caller drops
+    /// the wrapper after this returns; Drop sees `Some(child)` and
+    /// calls killpg, which is a no-op (ESRCH) because the runner
+    /// already exited. So `killpg on drop` doesn't cost an extra
+    /// syscall on the happy path, only on error paths.
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.child.as_mut() {
+            Some(c) => c.wait().await,
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "KillpgOnDrop::wait called after child was taken",
+            )),
+        }
+    }
+}
+
+impl Drop for KillpgOnDrop {
+    fn drop(&mut self) {
+        if self.take().is_some() {
+            // Best-effort killpg. ESRCH means the runner already
+            // exited (e.g. M2 path where the runner IS the action
+            // and self-exited before the host could wait); treat
+            // that as success. EPERM / EACCES shouldn't happen
+            // because we own the runner's session, but log them
+            // so a future regression is visible.
+            match nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.runner_pid),
+                nix::sys::signal::Signal::SIGKILL,
+            ) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(e) => tracing::warn!(
+                    runner_pid = self.runner_pid,
+                    error = %e,
+                    "killpg on runner process group failed during drop"
+                ),
+            }
         }
     }
 }
