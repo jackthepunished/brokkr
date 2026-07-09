@@ -65,6 +65,20 @@ impl<A: ActionCache> AcSvc for ActionCacheService<A> {
             .action_result
             .ok_or_else(|| Status::invalid_argument("missing action_result"))?;
         let _enter = span.enter();
+        // Hold the GC coordination barrier (issue #144) across the
+        // AC write so that an in-process `gc::sweep` cannot delete
+        // the blobs referenced by this `ActionResult` after this
+        // handler commits. The guard is dropped when this handler
+        // returns; coverage is sufficient because workers upload
+        // CAS blobs over a *separate* gRPC stream before invoking
+        // this RPC, and the barrier closes the in-process window
+        // that previously raced between `cas.list_digests()` and
+        // `cas.delete_blob(d)`.
+        let _gc_guard = self
+            .backend
+            .gc_window()
+            .await
+            .map_err(|e| Status::internal(format!("gc_window: {e}")))?;
         self.backend
             .update_action_result(&digest, result.clone())
             .await
