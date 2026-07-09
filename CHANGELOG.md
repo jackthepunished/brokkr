@@ -1138,7 +1138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ActionCache` trait under namespaced `ac/<digest-hash>` keys. `main` wires
   the scheduler and `ActionCacheService` through it — zero behavior change;
   swapping in `RaftKv` (I8c) is a one-line change at the same spot.
-  `MetaKvError::NotLeader` is declared ahead of the I8c follower redirect.
+  The `MetaKvError`→`CasError` conversion is an exhaustive match on
+  purpose: adding I8c's `NotLeader` variant fails to compile until the
+  follower redirect gets a real propagation path.
   Note: the action cache moves from `action_cache.redb` to `meta.redb`;
   existing cached results are not migrated (it is a cache; it refills).
 - `brokkr-raft` learners + catch-up gate (milestone I7c, `docs/plan.md` §17

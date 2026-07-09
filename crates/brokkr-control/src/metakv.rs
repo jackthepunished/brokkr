@@ -60,21 +60,17 @@ pub enum MetaKvError {
         /// The configured concurrency limit.
         limit: usize,
     },
-
-    /// The write was routed to a node that is not the Raft leader (I8c).
-    /// Carries the leader's address when known, so the caller can redirect.
-    #[error("not the metadata leader (leader hint: {leader:?})")]
-    NotLeader {
-        /// Address of the current leader, if known.
-        leader: Option<String>,
-    },
 }
 
 impl From<MetaKvError> for CasError {
     fn from(e: MetaKvError) -> Self {
+        // Exhaustive on purpose: when I8c adds the `NotLeader` redirect
+        // variant for `RaftKv`, this conversion must fail to compile so the
+        // leader hint gets a real propagation path (FAILED_PRECONDITION +
+        // leader metadata) instead of being flattened into a storage string.
         match e {
+            MetaKvError::Storage(msg) => CasError::Redb(msg),
             MetaKvError::ThroughputLimit { limit } => CasError::ThroughputLimit { limit },
-            other => CasError::Redb(other.to_string()),
         }
     }
 }
@@ -135,12 +131,28 @@ impl RedbMetaKv {
         })
     }
 
-    fn permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, MetaKvError> {
-        self.semaphore
-            .try_acquire()
-            .map_err(|_| MetaKvError::ThroughputLimit {
+    /// Runs `f` against the database on the blocking pool, bounded by the
+    /// semaphore. The permit **moves into the blocking task**, so the
+    /// concurrency bound holds even when the calling future is cancelled
+    /// mid-operation (a dropped RPC must not leak an unbounded blocking task
+    /// past the limit).
+    async fn run_blocking<T, F>(&self, f: F) -> Result<T, MetaKvError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Database) -> Result<T, MetaKvError> + Send + 'static,
+    {
+        let permit = self.semaphore.clone().try_acquire_owned().map_err(|_| {
+            MetaKvError::ThroughputLimit {
                 limit: self.max_concurrent,
-            })
+            }
+        })?;
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&db)
+        })
+        .await
+        .map_err(stor)?
     }
 }
 
@@ -153,63 +165,50 @@ fn stor<E: std::fmt::Display>(e: E) -> MetaKvError {
 impl MetaKv for RedbMetaKv {
     #[tracing::instrument(level = "debug", skip_all)]
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, MetaKvError> {
-        let _permit = self.permit()?;
-        let db = self.db.clone();
         let key = key.to_vec();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |db| {
             let txn = db.begin_read().map_err(stor)?;
             let table = txn.open_table(META_KV).map_err(stor)?;
-            match table.get(key.as_slice()).map_err(stor)? {
-                Some(guard) => Ok(Some(Bytes::copy_from_slice(guard.value()))),
-                None => Ok(None),
-            }
+            Ok(table
+                .get(key.as_slice())
+                .map_err(stor)?
+                .map(|guard| Bytes::copy_from_slice(guard.value())))
         })
         .await
-        .map_err(stor)?
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn put(&self, key: &[u8], value: Bytes) -> Result<(), MetaKvError> {
-        let _permit = self.permit()?;
-        let db = self.db.clone();
         let key = key.to_vec();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |db| {
             let txn = db.begin_write().map_err(stor)?;
             {
                 let mut table = txn.open_table(META_KV).map_err(stor)?;
                 table.insert(key.as_slice(), value.as_ref()).map_err(stor)?;
             }
-            txn.commit().map_err(stor)?;
-            Ok(())
+            txn.commit().map_err(stor)
         })
         .await
-        .map_err(stor)?
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn delete(&self, key: &[u8]) -> Result<(), MetaKvError> {
-        let _permit = self.permit()?;
-        let db = self.db.clone();
         let key = key.to_vec();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |db| {
             let txn = db.begin_write().map_err(stor)?;
             {
                 let mut table = txn.open_table(META_KV).map_err(stor)?;
                 table.remove(key.as_slice()).map_err(stor)?;
             }
-            txn.commit().map_err(stor)?;
-            Ok(())
+            txn.commit().map_err(stor)
         })
         .await
-        .map_err(stor)?
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, MetaKvError> {
-        let _permit = self.permit()?;
-        let db = self.db.clone();
         let prefix = prefix.to_vec();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move |db| {
             let txn = db.begin_read().map_err(stor)?;
             let table = txn.open_table(META_KV).map_err(stor)?;
             let mut out = Vec::new();
@@ -226,7 +225,6 @@ impl MetaKv for RedbMetaKv {
             Ok(out)
         })
         .await
-        .map_err(stor)?
     }
 }
 
@@ -247,14 +245,18 @@ impl<K: MetaKv> MetaKvActionCache<K> {
     }
 
     fn key(action_digest: &Digest) -> Vec<u8> {
-        let mut key = AC_PREFIX.to_vec();
-        key.extend_from_slice(action_digest.hash().as_bytes());
-        key
+        [AC_PREFIX, action_digest.hash().as_bytes()].concat()
     }
 }
 
 #[async_trait]
 impl<K: MetaKv> ActionCache for MetaKvActionCache<K> {
+    #[tracing::instrument(
+        level = "info",
+        name = "metakv::get_action_result",
+        skip_all,
+        fields(action = %action_digest.hash())
+    )]
     async fn get_action_result(
         &self,
         action_digest: &Digest,
@@ -267,6 +269,12 @@ impl<K: MetaKv> ActionCache for MetaKvActionCache<K> {
         Ok(Some(decoded))
     }
 
+    #[tracing::instrument(
+        level = "info",
+        name = "metakv::update_action_result",
+        skip_all,
+        fields(action = %action_digest.hash())
+    )]
     async fn update_action_result(
         &self,
         action_digest: &Digest,
@@ -277,21 +285,30 @@ impl<K: MetaKv> ActionCache for MetaKvActionCache<K> {
         Ok(())
     }
 
+    #[tracing::instrument(level = "info", name = "metakv::list_entries", skip_all)]
     async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
         let entries = self.kv.scan_prefix(AC_PREFIX).await?;
         let mut out = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            // Key layout: `ac/<hash-hex>`; skip anything malformed rather
-            // than failing the whole GC sweep (matches RedbActionCache).
+            // Key layout: `ac/<hash-hex>`. A malformed entry must not fail
+            // the whole GC sweep (matches RedbActionCache) — but on what
+            // becomes the replicated path (I8c) it must not be invisible
+            // either: warn on every skip.
             let Ok(hash) = std::str::from_utf8(&key[AC_PREFIX.len()..]) else {
+                tracing::warn!(key = ?key, "skipping action-cache entry with non-utf8 key");
                 continue;
             };
             // As in `RedbActionCache::list_entries`, the digest size is a
             // stand-in (the encoded length); only the hash keys the cache.
             let Ok(action_digest) = Digest::new(hash.to_string(), value.len() as i64) else {
+                tracing::warn!(
+                    hash,
+                    "skipping action-cache entry with an invalid digest hash"
+                );
                 continue;
             };
             let Ok(decoded) = ActionResult::decode(value.as_ref()) else {
+                tracing::warn!(hash, "skipping an undecodable cached ActionResult");
                 continue;
             };
             out.push((action_digest, decoded));

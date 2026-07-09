@@ -735,9 +735,13 @@ validation, and the churn soak), and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
 - **The consumers never see the seam.** Scheduler and service take
   `Arc<dyn ActionCache>` already; only `main`'s wiring changed. Swapping
   `RedbMetaKv` for `RaftKv` in I8c is a one-line change at the same spot.
-- **`MetaKvError::NotLeader { leader }` is declared now** so the I8c redirect
-  (gRPC `FAILED_PRECONDITION` + leader hint in metadata) extends the enum
-  instead of breaking it.
+- **`NotLeader` is deliberately NOT pre-declared.** The review pass showed
+  that declaring it alongside a catch-all `From<MetaKvError> for CasError`
+  wires the wrong default: the structured leader hint would flatten into a
+  storage-error string and the I8c redirect would silently ship broken. The
+  conversion is instead an exhaustive match — when I8c adds the variant, the
+  compile breaks right there until the redirect (gRPC `FAILED_PRECONDITION`
+  + leader hint in metadata) gets a real propagation path.
 - **Storage location changes** from `action_cache.redb` (table
   `action_results`) to `meta.redb` (table `meta_kv`). Existing cached action
   results are not migrated — it is a cache; it refills. `RedbActionCache`

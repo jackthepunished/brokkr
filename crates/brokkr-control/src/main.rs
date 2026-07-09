@@ -36,7 +36,9 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:7878")]
     listen: SocketAddr,
 
-    /// Directory holding the control plane's persistent state (CAS + action cache).
+    /// Directory holding the control plane's persistent state: the CAS
+    /// (`cas.redb`) and the metadata store (`meta.redb` — action cache today,
+    /// cluster configuration from I8c; not disposable).
     #[arg(long, default_value = "./brokkr-data")]
     data_dir: PathBuf,
 
@@ -319,6 +321,17 @@ async fn main() -> Result<()> {
         RedbMetaKv::open(args.data_dir.join("meta.redb")).context("opening metadata database")?,
     );
     let action_cache = Arc::new(MetaKvActionCache::new(meta_kv));
+    // Pre-I8 deployments kept the action cache in its own database. It is no
+    // longer read — say so, out loud, instead of leaving operators to wonder
+    // which redb file is live (and to explain the post-upgrade cold cache).
+    let legacy_ac = args.data_dir.join("action_cache.redb");
+    if legacy_ac.exists() {
+        tracing::warn!(
+            path = %legacy_ac.display(),
+            "legacy action-cache database is no longer read (the action cache \
+             now lives in meta.redb); the file can be deleted"
+        );
+    }
     // One shared worker registry, three users: the scheduler reads it for
     // platform-constraint admission control, the worker service writes
     // registrations / heartbeats into it, and the eviction reaper prunes
