@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use brokkr_sandbox::{ExitStatus, RootfsSpec, Sandbox, SandboxConfig};
+use brokkr_sandbox::{ExitStatus, ResourceLimits, RootfsSpec, Sandbox, SandboxConfig};
 
 fn runner_path() -> &'static str {
     env!("CARGO_BIN_EXE_brokkr-sandboxd")
@@ -203,5 +203,58 @@ async fn ev13_orphaned_child_does_not_outlive_sandbox() {
     assert!(
         elapsed < Duration::from_secs(5),
         "sandbox took {elapsed:?} — orphaned sleep was not cleaned up"
+    );
+}
+
+/// Regression test for issue #142: on the namespace path with no
+/// cgroup root, the wall-clock timeout must kill the *whole*
+/// process group — runner + namespace init + action. Pre-fix,
+/// `child.kill()` only reached the outer runner; init got
+/// reparented to the host's PID 1 and kept the action alive,
+/// consuming resources the caller believed were reclaimed.
+///
+/// This test deliberately omits `.with_cgroup_root(...)` — the
+/// regression is specifically the no-cgroup namespace + timeout
+/// combination. The fix is `setsid()` in `pre_exec` + `killpg`
+/// on timeout / drop (see `host/linux.rs`).
+#[tokio::test]
+async fn wall_clock_timeout_kills_namespaced_action() {
+    skip_if_unsupported!();
+    let sandbox = Sandbox::new(runner_path());
+    let cfg = SandboxConfig {
+        argv: vec!["/usr/bin/sleep".into(), "60".into()],
+        rootfs: minimal_linux_rootfs(),
+        limits: ResourceLimits {
+            wall_clock_secs: Some(2),
+            ..Default::default()
+        },
+        workdir: Some(PathBuf::from("/work")),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let outcome = sandbox.run(cfg).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        outcome.exit_status,
+        ExitStatus::Timeout,
+        "stderr={}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "timeout took implausibly long: {elapsed:?}"
+    );
+    // The action must be gone from the host. pgrep -f returns
+    // exit 0 when it finds a match; capture both status and
+    // stdout so a spurious match is loud, not silent.
+    let pgrep = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("sleep 60")
+        .output()
+        .expect("pgrep must run");
+    assert!(
+        !pgrep.status.success(),
+        "action process survived pidns teardown — leak. pgrep stdout: {}",
+        String::from_utf8_lossy(&pgrep.stdout)
     );
 }
