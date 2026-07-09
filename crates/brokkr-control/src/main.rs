@@ -71,6 +71,29 @@ struct Args {
     /// JWT claim that carries the tenant id.
     #[arg(long, default_value = "tenant")]
     auth_jwt_tenant_claim: String,
+
+    /// Address to bind the worker-facing gRPC listener on. Defaults to
+    /// `--listen` (single-port mode) when no `--tls-client-ca` is set, or
+    /// `listen+1` otherwise. Ignored when `--single-port` is set.
+    ///
+    /// The worker listener serves `WorkerService` only, and (when mTLS is
+    /// configured) requires a client TLS certificate. Splitting the worker
+    /// plane onto its own port is required by issue #139: the worker's
+    /// `batch_update_blobs` writes hit the same `ContentAddressableStorage`
+    /// backend as client traffic, and that backend is JWT-gated, so workers
+    /// must reach it via an mTLS-authenticated connection instead of a
+    /// tokenless one.
+    #[arg(long)]
+    worker_listen: Option<SocketAddr>,
+
+    /// Bind client-facing services and `WorkerService` on the *same* port
+    /// (`--listen`). Dev-only. Incompatible with `--auth-jwt-*`: if JWT
+    /// auth is on, the worker would share the JWT-gated listener and
+    /// every worker→CAS write would be rejected with `UNAUTHENTICATED`
+    /// (issue #139). The control plane refuses to start in that
+    /// combination; see [`Args::validate_auth_flags`].
+    #[arg(long, default_value_t = false)]
+    single_port: bool,
 }
 
 impl Args {
@@ -138,6 +161,70 @@ impl Args {
         };
         Ok(auth)
     }
+
+    /// Reject flag combinations that would silently mis-configure auth
+    /// (issue #139). Runs before any listener is bound so the operator
+    /// gets a clean startup error instead of a runtime `UNAUTHENTICATED`
+    /// on every action.
+    ///
+    /// The two cases we refuse:
+    ///
+    /// 1. `--single-port` + `--auth-jwt-*`. With single-port mode,
+    ///    `WorkerService` shares the JWT-gated listener, so worker→CAS
+    ///    writes are rejected. There is no fix other than splitting the
+    ///    listener (which `--single-port` opts out of).
+    /// 2. `--auth-jwt-*` + no `--tls-client-ca` + no `--single-port`.
+    ///    Without a client CA the worker port can't authenticate callers,
+    ///    so the worker→CAS path is again unreachable. The operator must
+    ///    either configure mTLS or drop auth (and accept single-port
+    ///    mode).
+    fn validate_auth_flags(&self) -> Result<()> {
+        let auth_on = self.authenticator()?.is_enabled();
+        if self.single_port && auth_on {
+            anyhow::bail!(
+                "--single-port and --auth-jwt-* are incompatible (issue #139): \
+                 WorkerService would share the JWT-gated listener and every \
+                 worker->CAS write would be rejected with UNAUTHENTICATED; \
+                 either drop --single-port so the worker port can use mTLS, \
+                 or drop --auth-jwt-* for local-dev single-port mode"
+            );
+        }
+        if auth_on && self.tls_client_ca.is_none() {
+            anyhow::bail!(
+                "--auth-jwt-* requires --tls-client-ca so WorkerService can be \
+                 authenticated by mTLS on the worker port (issue #139); \
+                 alternatively pass --single-port with --auth-jwt-* disabled for \
+                 local dev"
+            );
+        }
+        Ok(())
+    }
+
+    /// The address the worker listener should bind to. Resolution:
+    ///
+    /// * `--worker-listen` if explicitly set, else
+    /// * `--listen` itself (single-port mode), else
+    /// * `port_one_above(--listen)` (split mode with mTLS).
+    ///
+    /// Only the third case is actually a different address today, but
+    /// this is the single source of truth that commit 2 will use when it
+    /// splits the listener.
+    #[allow(dead_code)] // wired in commit 2 (split listener); see issue #139.
+    fn resolved_worker_listen(&self) -> SocketAddr {
+        if let Some(addr) = self.worker_listen {
+            return addr;
+        }
+        if self.tls_client_ca.is_none() {
+            return self.listen;
+        }
+        let SocketAddr::V4(v4) = self.listen else {
+            // IPv6 / non-v4 is out of scope for the port-bump heuristic.
+            return self.listen;
+        };
+        let mut bumped = v4;
+        bumped.set_port(v4.port().saturating_add(1));
+        SocketAddr::V4(bumped)
+    }
 }
 
 #[tokio::main]
@@ -150,6 +237,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // Reject unsafe auth/TLS combinations up front (issue #139).
+    args.validate_auth_flags()?;
     std::fs::create_dir_all(&args.data_dir)
         .with_context(|| format!("creating data dir {:?}", args.data_dir))?;
     let cas =
