@@ -246,12 +246,19 @@ async fn wall_clock_timeout_kills_namespaced_action() {
     );
     // The action must be gone from the host. pgrep -f returns
     // exit 0 when it finds a match; capture both status and
-    // stdout so a spurious match is loud, not silent.
-    let pgrep = std::process::Command::new("pgrep")
+    // stdout so a spurious match is loud, not silent. Avoiding
+    // `.expect()` here: workspace `clippy::expect_used = "deny"`
+    // overrides the file-level `allow`, so we match the Result
+    // and panic manually (a missing `pgrep` is a test-infra
+    // failure, not a regression).
+    let pgrep = match std::process::Command::new("pgrep")
         .arg("-f")
         .arg("sleep 60")
         .output()
-        .expect("pgrep must run");
+    {
+        Ok(out) => out,
+        Err(e) => panic!("pgrep must run: {e}"),
+    };
     assert!(
         !pgrep.status.success(),
         "action process survived pidns teardown — leak. pgrep stdout: {}",
