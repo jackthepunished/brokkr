@@ -188,6 +188,42 @@ impl BrokkrClient {
     pub fn bearer(&self) -> Option<&str> {
         self.bearer.as_deref()
     }
+
+    /// Read a single blob by digest. Returns `None` if the digest is
+    /// absent. Convenience wrapper around `batch_read_blobs` for the
+    /// split-port integration suite — keeping the public SDK surface
+    /// minimal means tests reach into `brokkr_cas::Cas` via the on-disk
+    /// redb instead. This helper exists because `RedbCas::open` cannot
+    /// acquire the database lock while the control plane is running.
+    pub async fn find_blob(
+        &mut self,
+        hash: &str,
+        size_bytes: i64,
+    ) -> Result<Option<Bytes>, tonic::Status> {
+        let digest = rapi::Digest {
+            hash: hash.to_string(),
+            size_bytes,
+        };
+        let resp = self
+            .cas
+            .batch_read_blobs(rapi::BatchReadBlobsRequest {
+                instance_name: String::new(),
+                digests: vec![digest],
+                digest_function: 0,
+                acceptable_compressors: vec![],
+            })
+            .await?
+            .into_inner();
+        match resp.responses.into_iter().next() {
+            Some(r) => {
+                if r.status.as_ref().map(|s| s.code != 0).unwrap_or(false) {
+                    return Ok(None);
+                }
+                Ok(Some(Bytes::from(r.data)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 /// Concrete shared-interceptor type used by all three stubs. The closure
@@ -529,6 +565,7 @@ fn digest_of(bytes: &[u8]) -> rapi::Digest {
 )]
 mod tests {
     use super::*;
+    use tonic::service::Interceptor as _;
 
     #[test]
     fn operation_error_surfaces_code_for_retry_inspection() {
@@ -592,5 +629,32 @@ mod tests {
         assert!(result.is_err(), "illegal header bytes must abort the RPC");
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn shared_interceptor_adapter_injects_header() {
+        // The path used by `BrokkrClient::from_channel` — the closure
+        // is wrapped in an Arc<Mutex<Box<dyn FnMut ...>>> and the
+        // adapter implements `Interceptor` manually because tonic's
+        // blanket impl only covers plain `FnMut` closures.
+        let token = mint_jwt_via_helper();
+        let mut adapter =
+            SharedInterceptorAdapter(make_shared_interceptor(Some(&Arc::from(token.as_str()))));
+        let req = adapter
+            .call(Request::new(()))
+            .expect("adapter accepts a valid JWT");
+        let auth = req
+            .metadata()
+            .get("authorization")
+            .expect("authorization header is set via the adapter");
+        let s = auth.to_str().unwrap();
+        assert!(s.starts_with("Bearer "), "got {s:?}");
+        assert_eq!(s, format!("Bearer {token}"));
+    }
+
+    fn mint_jwt_via_helper() -> String {
+        // Just any valid string — we don't actually validate it server-side
+        // here, only check the header insertion.
+        "header.payload.sig".to_string()
     }
 }
