@@ -211,20 +211,27 @@ impl Args {
     /// gets a clean startup error instead of a runtime `UNAUTHENTICATED`
     /// on every action.
     ///
-    /// The two cases we refuse:
+    /// The cases we refuse, in order (each with its own actionable message):
     ///
     /// 1. `--single-port` + `--auth-jwt-*`. With single-port mode,
     ///    `WorkerService` shares the JWT-gated listener, so worker→CAS
     ///    writes are rejected. There is no fix other than splitting the
     ///    listener (which `--single-port` opts out of).
-    /// 2. `--auth-jwt-*` + no `--tls-client-ca` + no `--single-port`.
-    ///    Without a client CA the worker port can't authenticate callers,
-    ///    so the worker→CAS path is again unreachable. The operator must
-    ///    either configure mTLS or drop auth (and accept single-port
-    ///    mode).
+    /// 2. `--auth-jwt-*` + no `--tls-client-ca`. Without a client CA the
+    ///    worker port can't authenticate callers, so the worker→CAS path
+    ///    is again unreachable. The operator must either configure mTLS
+    ///    or drop auth (and accept single-port mode).
+    /// 3. `--auth-jwt-*` + a worker listener that *resolves* to the same
+    ///    address as `--listen` — an explicit matching `--worker-listen`,
+    ///    an IPv6 `--listen` (the port-bump heuristic is v4-only), or a
+    ///    port already at 65535. This is single-port mode in everything
+    ///    but the flag, and would mis-configure auth exactly like case 1.
     fn validate_auth_flags(&self) -> Result<()> {
         let auth_on = self.authenticator()?.is_enabled();
-        if self.single_port && auth_on {
+        if !auth_on {
+            return Ok(());
+        }
+        if self.single_port {
             anyhow::bail!(
                 "--single-port and --auth-jwt-* are incompatible (issue #139): \
                  WorkerService would share the JWT-gated listener and every \
@@ -233,7 +240,7 @@ impl Args {
                  or drop --auth-jwt-* for local-dev single-port mode"
             );
         }
-        if auth_on && self.tls_client_ca.is_none() {
+        if self.tls_client_ca.is_none() {
             anyhow::bail!(
                 "--auth-jwt-* requires --tls-client-ca so WorkerService can be \
                  authenticated by mTLS on the worker port (issue #139); \
@@ -241,7 +248,29 @@ impl Args {
                  local dev"
             );
         }
+        if self.effective_single_port() {
+            anyhow::bail!(
+                "--auth-jwt-* is enabled but the worker listener resolves to the \
+                 same address as --listen ({}), which is single-port mode in \
+                 everything but the flag (issue #139): WorkerService would share \
+                 the JWT-gated listener and every worker->CAS write would be \
+                 rejected with UNAUTHENTICATED; pass a --worker-listen distinct \
+                 from --listen (the automatic port bump only applies to IPv4 \
+                 addresses below port 65535)",
+                self.listen
+            );
+        }
         Ok(())
+    }
+
+    /// Whether the server will effectively run one shared listener: the
+    /// explicit `--single-port` flag, or a worker address that resolves to
+    /// `--listen` itself (no client CA, an IPv6 `--listen`, an explicit
+    /// matching `--worker-listen`, or port saturation at 65535). This is the
+    /// single source of truth for both startup validation and listener
+    /// binding in `main`.
+    fn effective_single_port(&self) -> bool {
+        self.single_port || self.resolved_worker_listen() == self.listen
     }
 
     /// The address the worker listener should bind to. Resolution:
@@ -249,11 +278,6 @@ impl Args {
     /// * `--worker-listen` if explicitly set, else
     /// * `--listen` itself (single-port mode), else
     /// * `port_one_above(--listen)` (split mode with mTLS).
-    ///
-    /// Only the third case is actually a different address today, but
-    /// this is the single source of truth that commit 2 will use when it
-    /// splits the listener.
-    #[allow(dead_code)] // wired in commit 2 (split listener); see issue #139.
     fn resolved_worker_listen(&self) -> SocketAddr {
         if let Some(addr) = self.worker_listen {
             return addr;
@@ -321,7 +345,7 @@ async fn main() -> Result<()> {
     }
 
     let worker_listen_addr = args.resolved_worker_listen();
-    let single_port = args.single_port || worker_listen_addr == args.listen;
+    let single_port = args.effective_single_port();
     if single_port {
         tracing::info!(
             client_addr = %args.listen,
@@ -458,4 +482,141 @@ async fn main() -> Result<()> {
         r = worker_handle => r.with_context(|| "worker listener task panicked")??,
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
+mod tests {
+    use super::*;
+
+    /// Parses `Args` from flags, prepending a real HMAC secret file so JWT
+    /// auth is *enabled* (validate_auth_flags short-circuits when it is not).
+    fn args_with_auth(extra: &[&str]) -> (tempfile::TempDir, Args) {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("hmac.key");
+        std::fs::write(&secret, b"test-secret").unwrap();
+        let secret = secret.to_str().unwrap().to_string();
+        let mut argv = vec![
+            "brokkr-control".to_string(),
+            "--auth-jwt-hmac-secret-file".to_string(),
+            secret,
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        let args = Args::try_parse_from(argv).unwrap();
+        (dir, args)
+    }
+
+    #[test]
+    fn auth_with_split_ports_is_accepted() {
+        let (_d, args) = args_with_auth(&[
+            "--listen",
+            "127.0.0.1:50051",
+            "--tls-cert",
+            "/dev/null",
+            "--tls-key",
+            "/dev/null",
+            "--tls-client-ca",
+            "/dev/null",
+        ]);
+        assert!(args.validate_auth_flags().is_ok());
+        assert!(!args.effective_single_port());
+    }
+
+    #[test]
+    fn auth_with_single_port_flag_is_refused() {
+        let (_d, args) = args_with_auth(&[
+            "--single-port",
+            "--tls-cert",
+            "/dev/null",
+            "--tls-key",
+            "/dev/null",
+            "--tls-client-ca",
+            "/dev/null",
+        ]);
+        let err = args.validate_auth_flags().unwrap_err().to_string();
+        assert!(err.contains("--single-port"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_without_client_ca_is_refused() {
+        let (_d, args) = args_with_auth(&[]);
+        let err = args.validate_auth_flags().unwrap_err().to_string();
+        assert!(err.contains("--tls-client-ca"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_with_worker_listen_equal_to_listen_is_refused() {
+        // Effectively single-port even though the flag was never passed.
+        let (_d, args) = args_with_auth(&[
+            "--listen",
+            "127.0.0.1:50051",
+            "--worker-listen",
+            "127.0.0.1:50051",
+            "--tls-cert",
+            "/dev/null",
+            "--tls-key",
+            "/dev/null",
+            "--tls-client-ca",
+            "/dev/null",
+        ]);
+        assert!(args.effective_single_port());
+        let err = args.validate_auth_flags().unwrap_err().to_string();
+        assert!(err.contains("resolves to the same address"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_with_ipv6_listen_is_refused_without_explicit_worker_listen() {
+        // The port-bump heuristic is IPv4-only, so an IPv6 --listen resolves
+        // the worker listener onto the same address.
+        let (_d, args) = args_with_auth(&[
+            "--listen",
+            "[::1]:50051",
+            "--tls-cert",
+            "/dev/null",
+            "--tls-key",
+            "/dev/null",
+            "--tls-client-ca",
+            "/dev/null",
+        ]);
+        assert!(args.effective_single_port());
+        assert!(args.validate_auth_flags().is_err());
+
+        // A distinct explicit worker listener resolves the conflict.
+        let (_d2, args) = args_with_auth(&[
+            "--listen",
+            "[::1]:50051",
+            "--worker-listen",
+            "[::1]:50052",
+            "--tls-cert",
+            "/dev/null",
+            "--tls-key",
+            "/dev/null",
+            "--tls-client-ca",
+            "/dev/null",
+        ]);
+        assert!(args.validate_auth_flags().is_ok());
+    }
+
+    #[test]
+    fn auth_with_saturated_port_is_refused() {
+        // 65535 + 1 saturates back to 65535: the bump silently collapses the
+        // two listeners onto one address.
+        let (_d, args) = args_with_auth(&[
+            "--listen",
+            "127.0.0.1:65535",
+            "--tls-cert",
+            "/dev/null",
+            "--tls-key",
+            "/dev/null",
+            "--tls-client-ca",
+            "/dev/null",
+        ]);
+        assert!(args.effective_single_port());
+        assert!(args.validate_auth_flags().is_err());
+    }
 }
