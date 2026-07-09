@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   smuggle fds across the sandbox boundary. No behavioural change;
   `socketpair` stays allowed because removing it would break legitimate
   in-sandbox IPC for no security gain.
+- `materialize_tree` (and the FUSE inode builder `InodeTable::build`)
+  now reject REAPI `FileNode` / `DirectoryNode` / `SymlinkNode` entries
+  whose `name` is empty, `.`, `..`, contains `/`, or contains NUL. Without
+  this guard, an attacker who can upload CAS blobs could craft a
+  `Directory` proto whose `name` field walked out of the staging
+  directory (e.g. `FileNode { name: "../escape.txt", .. }` writes
+  *outside* the staging root; `name: "/etc/passwd"` *replaces* the base
+  entirely under `Path::join` semantics) — a pre-sandbox arbitrary file
+  write on the worker host (issue #141). The check is in the decode
+  path; `pack_directory` reads from a host FS and is already safe by
+  construction. The `SymlinkNode.target` policy is unchanged and is a
+  worker-side question for a follow-up (the existing project policy
+  preserves targets verbatim per REAPI v2 §`SymlinkNode`).
 
 ### Fixed
 - `brokkr-control` REAPI services (`ContentAddressableStorage`,
