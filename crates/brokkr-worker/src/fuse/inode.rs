@@ -160,6 +160,31 @@ impl InodeTable {
     }
 }
 
+/// REAPI v2 single-segment name check, duplicated from
+/// `brokkr_cas::tree::validate_node_name` so this module stays
+/// self-contained (it is platform-independent on purpose — see
+/// file-level docs above; depending on the cas module's tree
+/// internals would pull extra surface in for a 4-line helper).
+/// Returns `None` when the name is safe to register as a directory
+/// entry, or `Some(reason)` describing why it was rejected. The
+/// reason string is a `&'static str` so the call site can fold it
+/// into a `CasError::Other` without allocating.
+fn validate_node_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty");
+    }
+    if name == "." || name == ".." {
+        return Some("dot or dotdot");
+    }
+    if name.contains('/') {
+        return Some("contains '/'");
+    }
+    if name.contains('\0') {
+        return Some("contains NUL");
+    }
+    None
+}
+
 // Recursive DAG walker. Boxed because async fn can't recurse without
 // it on stable; the alternative is a work-stack. Tree depth is
 // bounded by the action's input tree (Bazel-style: shallow, <20).
@@ -173,6 +198,12 @@ fn build_dir<'a>(
         let directory = fetch_directory(cas, digest).await?;
 
         for file_node in &directory.files {
+            if let Some(reason) = validate_node_name(&file_node.name) {
+                return Err(CasError::Other(format!(
+                    "FileNode {:?}: invalid name ({reason})",
+                    file_node.name
+                )));
+            }
             let file_digest = decode_digest(&file_node.digest, &file_node.name, "FileNode")?;
             let size = u64::try_from(file_digest.size_bytes()).map_err(|_| {
                 CasError::Other(format!(
@@ -193,6 +224,12 @@ fn build_dir<'a>(
         }
 
         for symlink in &directory.symlinks {
+            if let Some(reason) = validate_node_name(&symlink.name) {
+                return Err(CasError::Other(format!(
+                    "SymlinkNode {:?}: invalid name ({reason})",
+                    symlink.name
+                )));
+            }
             let child_ino = push(
                 inodes,
                 InodeKind::Link {
@@ -203,6 +240,12 @@ fn build_dir<'a>(
         }
 
         for child in &directory.directories {
+            if let Some(reason) = validate_node_name(&child.name) {
+                return Err(CasError::Other(format!(
+                    "DirectoryNode {:?}: invalid name ({reason})",
+                    child.name
+                )));
+            }
             let child_digest = decode_digest(&child.digest, &child.name, "DirectoryNode")?;
             let child_ino = push(
                 inodes,
@@ -400,5 +443,51 @@ mod tests {
         let (table, _cas) = build_from_disk(src.path()).await;
         let a = table.resolve(&PathBuf::from("/a.txt")).unwrap();
         assert!(table.lookup(a, OsStr::new("anything")).is_none());
+    }
+
+    /// Parity test for the `brokkr_cas::tree::materialize_tree`
+    /// path-traversal guard (issue #141): `InodeTable::build` must
+    /// reject the same REAPI name shapes. The FUSE builder is not
+    /// exploitable as a path-traversal sink (names go into a
+    /// `HashMap` and the kernel supplies one component at a time)
+    /// but failing fast at the entry point keeps the two tree-
+    /// walking paths symmetric in their error surface.
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_name() {
+        let cas = InMemoryCas::new();
+
+        // Hand-build a Directory whose root FileNode has the literal
+        // `..` as its name. Pre-fix this would have registered an
+        // entry in the root directory's HashMap named ".."; the
+        // resolver already drops `Component::ParentDir` so it never
+        // walked out at lookup time, but accepting the node in the
+        // first place left a confusing surface for future callers.
+        let blob = bytes::Bytes::from_static(b"pwned");
+        let blob_digest = Digest::of(&blob);
+        cas.batch_update_blobs(vec![(blob_digest.clone(), blob)])
+            .await
+            .unwrap();
+
+        let mut directory = rapi::Directory::default();
+        directory.files.push(rapi::FileNode {
+            name: "..".into(),
+            digest: Some(rapi::Digest {
+                hash: blob_digest.hash().to_string(),
+                size_bytes: blob_digest.size_bytes(),
+            }),
+            ..Default::default()
+        });
+        let mut buf = Vec::with_capacity(directory.encoded_len());
+        directory.encode(&mut buf).unwrap();
+        let root_digest = Digest::of(&buf);
+        cas.batch_update_blobs(vec![(root_digest.clone(), bytes::Bytes::from(buf))])
+            .await
+            .unwrap();
+
+        let err = InodeTable::build(&cas, &root_digest).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")),
+            "expected a dotdot rejection, got: {err:?}"
+        );
     }
 }
