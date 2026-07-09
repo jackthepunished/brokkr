@@ -20,6 +20,8 @@ use brokkr_proto::reapi_v2::{
     execution_server::ExecutionServer,
 };
 use clap::Parser;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::transport::ServerTlsConfig;
 
@@ -97,8 +99,11 @@ struct Args {
 }
 
 impl Args {
-    /// Build server TLS configuration from CLI arguments.
-    fn tls_config(&self) -> Result<Option<ServerTlsConfig>> {
+    /// Build the base server TLS configuration: identity (server cert+key)
+    /// plus the client CA root, if `--tls-client-ca` is set. The
+    /// per-port `client_auth_optional` posture is applied on top of
+    /// this by [`Args::tls_config`].
+    fn base_tls_config_opt(&self) -> Result<Option<ServerTlsConfig>> {
         let has_server_cert = self.tls_cert.is_some();
         let has_server_key = self.tls_key.is_some();
         let has_client_ca = self.tls_client_ca.is_some();
@@ -125,6 +130,45 @@ impl Args {
             tracing::warn!("starting without client certificate verification (mTLS disabled)");
         }
 
+        Ok(Some(cfg))
+    }
+
+    /// Per-port TLS configuration.
+    ///
+    /// * `worker_port = true` (the `WorkerService` listener): when
+    ///   `--tls-client-ca` is set, the server **requires** a client
+    ///   certificate signed by that CA (tonic 0.12's `client_auth_optional`
+    ///   defaults to `false` after `client_ca_root`). The worker is
+    ///   authenticated at the transport layer (ADR 0011) — the worker
+    ///   port carries no JWT interceptor.
+    /// * `worker_port = false` (the client-facing listener): when
+    ///   `--tls-client-ca` is set, we mark the cert *optional* on the
+    ///   client port — the JWT `auth_interceptor` is the authoritative
+    ///   auth boundary for client traffic, and a client cert is just an
+    ///   additional identity hint we may use later (cert-CN binding is
+    ///   a deferred ADR-0011 follow-up). Without a CA, both ports
+    ///   behave as plain mTLS-ready-but-not-enforced.
+    fn tls_config(&self, worker_port: bool) -> Result<Option<ServerTlsConfig>> {
+        let Some(base) = self.base_tls_config_opt()? else {
+            return Ok(None);
+        };
+        let has_client_ca = self.tls_client_ca.is_some();
+        let cfg = match (worker_port, has_client_ca) {
+            (true, true) => base, // require cert (tonic default after client_ca_root)
+            (true, false) => {
+                // Defensive: validate_auth_flags() should have refused this
+                // combination, but if we get here, log and proceed without
+                // requiring a cert (the worker port would otherwise be
+                // unable to accept any connection at all).
+                tracing::warn!(
+                    "worker port bound without a client CA; WorkerService is unauthenticated \
+                     (this should have been refused at startup by validate_auth_flags)"
+                );
+                base
+            }
+            (false, true) => base.client_auth_optional(true),
+            (false, false) => base,
+        };
         Ok(Some(cfg))
     }
 
@@ -256,12 +300,13 @@ async fn main() -> Result<()> {
     let scheduler =
         Scheduler::with_worker_registry(cas.clone(), action_cache.clone(), worker_registry.clone());
 
-    let tls_cfg = args.tls_config()?;
-    match &tls_cfg {
-        Some(_) => {
+    let client_tls_cfg = args.tls_config(false)?;
+    let worker_tls_cfg = args.tls_config(true)?;
+    match (&client_tls_cfg, &worker_tls_cfg) {
+        (Some(_), _) | (None, Some(_)) => {
             tracing::warn!("TLS ENABLED — mTLS required for production");
         }
-        None => {
+        (None, None) => {
             tracing::warn!("TLS DISABLED — NOT FOR PRODUCTION USE");
         }
     }
@@ -275,7 +320,21 @@ async fn main() -> Result<()> {
         tracing::warn!("CLIENT AUTH DISABLED — NOT FOR PRODUCTION USE");
     }
 
-    tracing::info!(addr = %args.listen, data_dir = ?args.data_dir, "brokkr-control starting");
+    let worker_listen_addr = args.resolved_worker_listen();
+    let single_port = args.single_port || worker_listen_addr == args.listen;
+    if single_port {
+        tracing::info!(
+            client_addr = %args.listen,
+            "single-port mode: WorkerService shares the client listener (dev-only, no auth)"
+        );
+    } else {
+        tracing::info!(
+            client_addr = %args.listen,
+            worker_addr = %worker_listen_addr,
+            "split-port mode: client-facing services and WorkerService on separate listeners"
+        );
+    }
+    tracing::info!(data_dir = ?args.data_dir, "brokkr-control starting");
 
     let worker_service =
         WorkerServiceImpl::with_registry(scheduler.clone(), worker_registry.clone());
@@ -288,33 +347,98 @@ async fn main() -> Result<()> {
     let reap_interval = (scheduler.lease_duration() / 2).max(Duration::from_secs(1));
     let _lease_reaper = spawn_lease_reaper(scheduler.clone(), reap_interval);
 
-    let mut server = Server::builder();
-    if let Some(tls_cfg) = tls_cfg {
-        server = server.tls_config(tls_cfg)?;
-    }
-    // Client-facing services require client auth (the interceptor injects the
-    // authoritative tenant). The internal WorkerService is mTLS-authenticated,
-    // not token-gated.
-    server
-        .add_service(ContentAddressableStorageServer::with_interceptor(
-            CasService::new(cas),
-            auth_interceptor(auth.clone()),
-        ))
-        .add_service(ActionCacheServer::with_interceptor(
-            ActionCacheService::new(action_cache),
-            auth_interceptor(auth.clone()),
-        ))
-        .add_service(CapabilitiesServer::with_interceptor(
-            CapabilitiesService,
-            auth_interceptor(auth.clone()),
-        ))
-        .add_service(ExecutionServer::with_interceptor(
-            ExecutionService::new(scheduler.clone()),
-            auth_interceptor(auth.clone()),
-        ))
-        .add_service(WorkerServiceServer::new(worker_service))
-        .serve(args.listen)
+    // Bind the client-facing listener. Carries CAS / ActionCache / Capabilities
+    // / Execution (all gated by `auth_interceptor` when JWT auth is on). In
+    // single-port mode it also carries `WorkerService`.
+    let client_listener = TcpListener::bind(args.listen)
         .await
-        .context("control plane server exited")?;
+        .with_context(|| format!("binding client listener on {}", args.listen))?;
+    let mut client_server = Server::builder();
+    if let Some(cfg) = client_tls_cfg {
+        client_server = client_server.tls_config(cfg)?;
+    }
+    let auth_for_client = auth.clone();
+    let action_cache_for_client = action_cache.clone();
+    let cas_for_client = cas.clone();
+    let worker_service_for_client = if single_port {
+        Some(WorkerServiceImpl::with_registry(
+            scheduler.clone(),
+            worker_registry.clone(),
+        ))
+    } else {
+        None
+    };
+    let client_addr = args.listen;
+    let client_handle = tokio::spawn(async move {
+        // Build the service set; WorkerService joins in single-port mode.
+        // `Server::add_service` returns a `Router` whose own `add_service`
+        // consumes self and chains; the original `Server` is *not* consumed
+        // by this call (note `&mut self`). We still hold `client_server` for
+        // the rest of the closure's lifetime to keep its TLS settings.
+        let mut server = client_server;
+        let mut router = server
+            .add_service(ContentAddressableStorageServer::with_interceptor(
+                CasService::new(cas_for_client),
+                auth_interceptor(auth_for_client.clone()),
+            ))
+            .add_service(ActionCacheServer::with_interceptor(
+                ActionCacheService::new(action_cache_for_client),
+                auth_interceptor(auth_for_client.clone()),
+            ))
+            .add_service(CapabilitiesServer::with_interceptor(
+                CapabilitiesService,
+                auth_interceptor(auth_for_client.clone()),
+            ))
+            .add_service(ExecutionServer::with_interceptor(
+                ExecutionService::new(scheduler.clone()),
+                auth_interceptor(auth_for_client.clone()),
+            ));
+        if let Some(ws) = worker_service_for_client {
+            router = router.add_service(WorkerServiceServer::new(ws));
+        }
+        let _ = &mut server; // keep `server` live until we're done with the router.
+        router
+            .serve_with_incoming(TcpListenerStream::new(client_listener))
+            .await
+            .with_context(|| format!("client listener ({client_addr}) exited"))
+    });
+
+    if single_port {
+        // Worker port == client port; no second listener. The client_handle
+        // owns the lifetime.
+        client_handle
+            .await
+            .with_context(|| "client listener task panicked")??;
+        return Ok(());
+    }
+
+    // Split-port mode: bind a second listener dedicated to `WorkerService`.
+    // The worker port requires a client cert when `--tls-client-ca` is set
+    // (tonic 0.12 enforces this implicitly: `client_auth_optional` defaults
+    // to `false` after `client_ca_root`). It carries no JWT interceptor —
+    // the worker is authenticated at the transport layer (ADR 0011).
+    let worker_listener = tokio::net::TcpListener::bind(worker_listen_addr)
+        .await
+        .with_context(|| format!("binding worker listener on {worker_listen_addr}"))?;
+    let mut worker_server = Server::builder();
+    if let Some(cfg) = worker_tls_cfg {
+        worker_server = worker_server.tls_config(cfg)?;
+    }
+    let worker_addr = worker_listen_addr;
+    let worker_handle = tokio::spawn(async move {
+        worker_server
+            .add_service(WorkerServiceServer::new(worker_service))
+            .serve_with_incoming(TcpListenerStream::new(worker_listener))
+            .await
+            .with_context(|| format!("worker listener ({worker_addr}) exited"))
+    });
+
+    // Whichever listener exits first aborts the process. A half-running
+    // control plane (client up, worker down, or vice versa) is not a
+    // useful state to leave behind.
+    tokio::select! {
+        r = client_handle => r.with_context(|| "client listener task panicked")??,
+        r = worker_handle => r.with_context(|| "worker listener task panicked")??,
+    }
     Ok(())
 }
