@@ -2,6 +2,7 @@
 //! "run this command" call.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use brokkr_proto::reapi_v2::{
@@ -14,6 +15,7 @@ use prost::Message;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
+use tonic::{Request, Status};
 
 /// A server-reported execution failure carrying the `google.rpc.Status` code.
 ///
@@ -68,11 +70,24 @@ pub enum ClientError {
 /// Client connection to a Brokkr control plane.
 #[derive(Clone)]
 pub struct BrokkrClient {
-    cas: ContentAddressableStorageClient<Channel>,
-    exec: ExecutionClient<Channel>,
+    cas: ContentAddressableStorageClient<InterceptedChannel>,
+    exec: ExecutionClient<InterceptedChannel>,
     #[allow(dead_code)]
-    ac: ActionCacheClient<Channel>,
+    ac: ActionCacheClient<InterceptedChannel>,
+    /// Optional JWT bearer token. When set, every outbound RPC carries an
+    /// `authorization: Bearer <token>` header injected by the private
+    /// `bearer_interceptor` below. Issued by
+    /// [`BrokkrClient::connect_with_bearer`]; absent for the no-auth
+    /// constructors (ADR 0011, issue #139).
+    bearer: Option<Arc<str>>,
 }
+
+/// Channel type carried by the public stubs after the bearer interceptor
+/// has been applied. All three stubs share the same shared interceptor
+/// (see [`SharedInterceptorAdapter`]) so they all materialise the same
+/// `InterceptedService<Channel, SharedInterceptorAdapter>`.
+type InterceptedChannel =
+    tonic::service::interceptor::InterceptedService<Channel, SharedInterceptorAdapter>;
 
 impl BrokkrClient {
     /// Connect to the control plane at `endpoint` (e.g.
@@ -87,11 +102,7 @@ impl BrokkrClient {
             .connect()
             .await
             .map_err(ClientError::Transport)?;
-        Ok(Self {
-            cas: ContentAddressableStorageClient::new(channel.clone()),
-            exec: ExecutionClient::new(channel.clone()),
-            ac: ActionCacheClient::new(channel),
-        })
+        Ok(Self::from_channel(channel, None))
     }
 
     /// Connect to the control plane at `endpoint` with mTLS authentication.
@@ -101,11 +112,150 @@ impl BrokkrClient {
         tls_cfg: TlsConfig,
     ) -> Result<Self, ClientError> {
         let channel = connect_tls(endpoint, &tls_cfg).await?;
-        Ok(Self {
-            cas: ContentAddressableStorageClient::new(channel.clone()),
-            exec: ExecutionClient::new(channel.clone()),
-            ac: ActionCacheClient::new(channel),
-        })
+        Ok(Self::from_channel(channel, None))
+    }
+
+    /// Connect to the control plane at `endpoint` with a JWT bearer token.
+    ///
+    /// The token is sent in an `authorization: Bearer <token>` header on
+    /// every outbound RPC (CAS, Execution, ActionCache). This is the
+    /// client-side counterpart to the `auth_interceptor` the control
+    /// plane wires up when `--auth-jwt-*` is configured (ADR 0011).
+    ///
+    /// Note: bearer auth is an *application-layer* identity on top of an
+    /// existing transport (plaintext or mTLS). It does not replace TLS;
+    /// production deployments should still pass `--tls-ca` (via
+    /// [`BrokkrClient::connect_with_tls`]) so the bearer token is not
+    /// sent over the wire in cleartext.
+    #[tracing::instrument(name = "client::connect_with_bearer", skip(endpoint, bearer))]
+    pub async fn connect_with_bearer(
+        endpoint: impl Into<String>,
+        bearer: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        let endpoint = endpoint.into();
+        let channel = Endpoint::from_shared(endpoint.clone())
+            .map_err(|e| {
+                ClientError::InvalidEndpoint(format!("invalid endpoint {endpoint:?}: {e}"))
+            })?
+            .connect()
+            .await
+            .map_err(ClientError::Transport)?;
+        Ok(Self::from_channel(channel, Some(Arc::from(bearer.into()))))
+    }
+
+    /// Connect to the control plane at `endpoint` with both mTLS and a JWT
+    /// bearer token. Production target for issue #139: TLS terminates the
+    /// network, mTLS establishes the worker's identity, and the bearer
+    /// token is only relevant for *client* traffic (a worker does not
+    /// have one — that is what the split listener is for).
+    #[tracing::instrument(
+        name = "client::connect_with_tls_and_bearer",
+        skip(endpoint, tls_cfg, bearer)
+    )]
+    pub async fn connect_with_tls_and_bearer(
+        endpoint: impl Into<String>,
+        tls_cfg: TlsConfig,
+        bearer: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        let channel = connect_tls(endpoint, &tls_cfg).await?;
+        Ok(Self::from_channel(channel, Some(Arc::from(bearer.into()))))
+    }
+
+    /// Build the three client stubs from `channel`, applying the bearer
+    /// interceptor to each when a token is configured.
+    fn from_channel(channel: Channel, bearer: Option<Arc<str>>) -> Self {
+        // The interceptor is type-erased behind `Box<dyn FnMut + Send>`
+        // and shared across all three stubs via `Arc`. The adapter
+        // implements tonic's `Interceptor` trait manually because the
+        // blanket impl only covers plain `FnMut` closures. We pass a
+        // borrowed `Option<&Arc<str>>` so the move into the struct
+        // field can happen *after* the closure has captured.
+        let interceptor = SharedInterceptorAdapter(make_shared_interceptor(bearer.as_ref()));
+        Self {
+            cas: ContentAddressableStorageClient::with_interceptor(
+                channel.clone(),
+                interceptor.clone(),
+            ),
+            exec: ExecutionClient::with_interceptor(channel.clone(), interceptor.clone()),
+            ac: ActionCacheClient::with_interceptor(channel, interceptor),
+            bearer,
+        }
+    }
+
+    /// Returns the bearer token this client is sending, if any. Useful
+    /// for tests and for the in-process JWT-client helper used by the
+    /// split-port integration suite.
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
+    }
+}
+
+/// Concrete shared-interceptor type used by all three stubs. The closure
+/// body is heap-allocated and behind a `std::sync::Mutex` so we can
+/// `Clone` it (the gRPC client requires the interceptor to be `Clone`,
+/// and a `Box<dyn FnMut>` is `Clone` only when wrapped in `Arc`).
+///
+/// `std::sync::Mutex` (not `tokio::sync::Mutex`) is intentional: the
+/// interceptor runs synchronously inside the request pipeline before the
+/// call is dispatched. Holding it for the few microseconds it takes to
+/// insert a metadata key is fine, and avoiding an async lock keeps the
+/// interceptor compatible with sync `FnMut` semantics.
+type SharedInterceptor = Arc<
+    std::sync::Mutex<Box<dyn FnMut(Request<()>) -> Result<Request<()>, Status> + Send + 'static>>,
+>;
+
+fn make_shared_interceptor(token: Option<&Arc<str>>) -> SharedInterceptor {
+    Arc::new(std::sync::Mutex::new(Box::new(bearer_interceptor(
+        token.cloned(),
+    ))))
+}
+
+/// Adapter that turns the boxed, mutex-guarded closure into something
+/// tonic's generated `with_interceptor<F: Interceptor>` will accept.
+///
+/// Tonic only blanket-implements `Interceptor` for `FnMut(Request<()>) -> …`,
+/// not for `Arc<Mutex<Box<dyn FnMut …>>>`. This wrapper deref-locks the
+/// mutex for the duration of one request and forwards to the closure.
+#[derive(Clone)]
+struct SharedInterceptorAdapter(SharedInterceptor);
+
+impl tonic::service::Interceptor for SharedInterceptorAdapter {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| Status::internal("bearer interceptor mutex poisoned"))?;
+        (guard)(request)
+    }
+}
+
+/// Build a gRPC interceptor that injects `authorization: Bearer <token>`
+/// on every outbound request. A no-op when `token` is `None` so the same
+/// helper can be used unconditionally in [`BrokkrClient::from_channel`].
+///
+/// `MetadataValue::from_str` only fails on embedded CR/LF/NUL, which a
+/// caller-controlled JWT cannot contain (RFC 7519 §2: JWT is
+/// base64url-encoded JSON, no whitespace). If it ever did, the request
+/// is cancelled with `INVALID_ARGUMENT` rather than silently dropping
+/// the auth header — failing closed is the only safe posture for an
+/// auth interceptor.
+fn bearer_interceptor(
+    token: Option<Arc<str>>,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Send {
+    move |mut req: Request<()>| {
+        let Some(token) = token.as_ref() else {
+            return Ok(req);
+        };
+        let value = format!("Bearer {token}");
+        match value.parse() {
+            Ok(v) => {
+                req.metadata_mut().insert("authorization", v);
+                Ok(req)
+            }
+            Err(_) => Err(Status::invalid_argument(
+                "bearer token contains characters illegal in HTTP header values",
+            )),
+        }
     }
 }
 
@@ -371,7 +521,12 @@ fn digest_of(bytes: &[u8]) -> rapi::Digest {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -402,5 +557,40 @@ mod tests {
             err.downcast_ref::<ExecuteError>(),
             Some(ExecuteError::Status { code: 14, .. })
         ));
+    }
+
+    #[test]
+    fn bearer_interceptor_injects_authorization_header_when_token_present() {
+        let mut interceptor = bearer_interceptor(Some(Arc::from("abc.def.ghi")));
+        let req = Request::new(());
+        let req = interceptor(req).expect("interceptor accepts a valid JWT");
+        let auth = req
+            .metadata()
+            .get("authorization")
+            .expect("authorization header is set");
+        assert_eq!(auth.to_str().unwrap(), "Bearer abc.def.ghi");
+    }
+
+    #[test]
+    fn bearer_interceptor_is_a_noop_when_token_absent() {
+        let mut interceptor = bearer_interceptor(None);
+        let req = Request::new(());
+        let req = interceptor(req).expect("interceptor accepts the no-auth case");
+        assert!(
+            req.metadata().get("authorization").is_none(),
+            "no header should be set when the client was constructed without a token"
+        );
+    }
+
+    #[test]
+    fn bearer_interceptor_rejects_tokens_with_illegal_header_chars() {
+        // A stray CR would let an attacker break out of the header value.
+        // The interceptor must refuse the request rather than silently
+        // dropping the auth header.
+        let mut interceptor = bearer_interceptor(Some(Arc::from("ok\r\nX-Evil: 1")));
+        let result = interceptor(Request::new(()));
+        assert!(result.is_err(), "illegal header bytes must abort the RPC");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }
