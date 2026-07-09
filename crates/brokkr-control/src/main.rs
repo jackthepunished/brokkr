@@ -412,11 +412,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Split-port mode: bind a second listener dedicated to `WorkerService`.
+    // Split-port mode: bind a second listener dedicated to `WorkerService`
+    // AND `ContentAddressableStorage` (so workers can upload stdout/stderr
+    // without a JWT bearer — they authenticate at the TLS layer via the
+    // mTLS client cert they presented on this port; ADR 0011, issue #139).
     // The worker port requires a client cert when `--tls-client-ca` is set
     // (tonic 0.12 enforces this implicitly: `client_auth_optional` defaults
     // to `false` after `client_ca_root`). It carries no JWT interceptor —
-    // the worker is authenticated at the transport layer (ADR 0011).
+    // the worker is authenticated at the transport layer.
+    //
+    // ActionCache / Capabilities / Execution stay on the JWT-gated client
+    // port: they are client-only services and a worker has no business
+    // reading them.
     let worker_listener = tokio::net::TcpListener::bind(worker_listen_addr)
         .await
         .with_context(|| format!("binding worker listener on {worker_listen_addr}"))?;
@@ -424,10 +431,20 @@ async fn main() -> Result<()> {
     if let Some(cfg) = worker_tls_cfg {
         worker_server = worker_server.tls_config(cfg)?;
     }
+    let cas_for_worker = cas.clone();
     let worker_addr = worker_listen_addr;
     let worker_handle = tokio::spawn(async move {
         worker_server
             .add_service(WorkerServiceServer::new(worker_service))
+            // CAS on the worker port is unauthenticated by interceptor
+            // (mTLS already established the worker's identity at the
+            // transport layer). Sharing the same `RedbCas` instance with
+            // the client port means both paths see the same content —
+            // the client uploads inputs here, the worker uploads
+            // stdout/stderr here, both reads see the union.
+            .add_service(ContentAddressableStorageServer::new(CasService::new(
+                cas_for_worker,
+            )))
             .serve_with_incoming(TcpListenerStream::new(worker_listener))
             .await
             .with_context(|| format!("worker listener ({worker_addr}) exited"))

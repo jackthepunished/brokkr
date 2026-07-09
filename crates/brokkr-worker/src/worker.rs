@@ -168,8 +168,23 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
     let worker_ch = build_channel(worker_url, cfg.tls.as_ref()).await?;
     let mut wsc = WorkerServiceClient::new(worker_ch);
 
-    // CAS channel → ContentAddressableStorageClient (client port).
-    let cas_ch = build_channel(cfg.control_endpoint.clone(), cfg.tls.as_ref()).await?;
+    // CAS channel → ContentAddressableStorageClient.
+    //
+    // In split-port mode the control plane serves `ContentAddressableStorage`
+    // on the *worker* port (mTLS-authenticated) as well as on the client
+    // port (JWT-gated). The worker has no bearer token, so it must reach
+    // CAS via the worker port — issue #139. In single-port mode the worker
+    // port and the client port are the same listener, so `worker_endpoint`
+    // and `control_endpoint` are equal and either URL works.
+    //
+    // `cfg.worker_endpoint.is_some()` means the operator set
+    // `--worker-control` (which `derive_default_worker_endpoint` only does
+    // when `--ca` is set), i.e. split-port mode is in effect.
+    let cas_url = cfg
+        .worker_endpoint
+        .clone()
+        .unwrap_or_else(|| cfg.control_endpoint.clone());
+    let cas_ch = build_channel(cas_url, cfg.tls.as_ref()).await?;
     let cas = ContentAddressableStorageClient::new(cas_ch);
 
     let reg = wsc

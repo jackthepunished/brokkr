@@ -18,12 +18,27 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$FIX/ca.key" -out "$FIX/ca.pe
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$FIX/badca.key" -out "$FIX/badca.pem" \
     -subj "/CN=brokkr-test-badca" -days "$DAYS" >/dev/null 2>&1
 
-# Server cert, signed by `ca`.
+# Server cert, signed by `ca`. The SAN includes 127.0.0.1 +
+# localhost so TLS hostname verification (rustls default) passes when
+# tests connect to `https://127.0.0.1:<port>` (issue #139).
+cat > "$FIX/server.cnf" <<EOF
+[req]
+distinguished_name = dn
+req_extensions     = v3_req
+prompt             = no
+[dn]
+CN = brokkr-test-server
+[v3_req]
+subjectAltName = @alt_names
+[alt_names]
+IP.1 = 127.0.0.1
+DNS.1 = localhost
+EOF
 openssl req -newkey rsa:2048 -nodes -keyout "$FIX/server.key" -out "$FIX/server.csr" \
-    -subj "/CN=brokkr-test-server" >/dev/null 2>&1
+    -config "$FIX/server.cnf" >/dev/null 2>&1
 openssl x509 -req -in "$FIX/server.csr" -CA "$FIX/ca.pem" -CAkey "$FIX/ca.key" -CAcreateserial \
-    -out "$FIX/server.pem" -days "$DAYS" >/dev/null 2>&1
-rm -f "$FIX/server.csr" "$FIX/ca.srl"
+    -out "$FIX/server.pem" -days "$DAYS" -extensions v3_req -extfile "$FIX/server.cnf" >/dev/null 2>&1
+rm -f "$FIX/server.csr" "$FIX/server.cnf" "$FIX/ca.srl"
 
 # Worker cert, signed by `ca`.
 openssl req -newkey rsa:2048 -nodes -keyout "$FIX/worker.key" -out "$FIX/worker.csr" \
