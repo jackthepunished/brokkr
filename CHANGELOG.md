@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves targets verbatim per REAPI v2 §`SymlinkNode`).
 
 ### Fixed
+- `brokkr-sandbox` wall-clock timeout now SIGKILLs the namespaced
+  action even when no cgroup is configured. Previously, on the
+  namespace path with no cgroup root, `child.kill()` only reached
+  the outer runner; the namespace PID 1 (init) got reparented to
+  the host's PID 1 and kept the action alive past the deadline
+  while the host reported `Timeout` (issue #142). The runner now
+  calls `setsid()` in `pre_exec`; on timeout (and on host-side
+  error paths before `wait`), the host calls
+  `killpg(-runner_pid, SIGKILL)`, which reaches init and triggers
+  kernel pidns teardown.
 - Enabling JWT client auth (`--auth-jwt-hmac-secret-file` /
   `--auth-jwt-rsa-pem-file`) no longer breaks every job. Previously, the
   worker's `batch_update_blobs` (stdout/stderr) was rejected with
