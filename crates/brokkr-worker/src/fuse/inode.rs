@@ -445,49 +445,126 @@ mod tests {
         assert!(table.lookup(a, OsStr::new("anything")).is_none());
     }
 
-    /// Parity test for the `brokkr_cas::tree::materialize_tree`
-    /// path-traversal guard (issue #141): `InodeTable::build` must
-    /// reject the same REAPI name shapes. The FUSE builder is not
-    /// exploitable as a path-traversal sink (names go into a
-    /// `HashMap` and the kernel supplies one component at a time)
-    /// but failing fast at the entry point keeps the two tree-
-    /// walking paths symmetric in their error surface.
-    #[tokio::test]
-    async fn inode_table_rejects_dotdot_name() {
-        let cas = InMemoryCas::new();
+    // Parity tests for the `brokkr_cas::tree::materialize_tree`
+    // path-traversal guard (issue #141): `InodeTable::build` must
+    // reject the same REAPI name shapes. The FUSE builder is not
+    // exploitable as a path-traversal sink on its own (names go
+    // into a `HashMap` and the kernel supplies one component at a
+    // time) but failing fast at the entry point keeps the two
+    // tree-walking paths symmetric in their error surface. Three
+    // tests cover all three call-site checks in `build_dir`: the
+    // file-node, symlink-node, and directory-node loops.
 
-        // Hand-build a Directory whose root FileNode has the literal
-        // `..` as its name. Pre-fix this would have registered an
-        // entry in the root directory's HashMap named ".."; the
-        // resolver already drops `Component::ParentDir` so it never
-        // walked out at lookup time, but accepting the node in the
-        // first place left a confusing surface for future callers.
-        let blob = bytes::Bytes::from_static(b"pwned");
-        let blob_digest = Digest::of(&blob);
-        cas.batch_update_blobs(vec![(blob_digest.clone(), blob)])
-            .await
-            .unwrap();
-
-        let mut directory = rapi::Directory::default();
-        directory.files.push(rapi::FileNode {
-            name: "..".into(),
-            digest: Some(rapi::Digest {
-                hash: blob_digest.hash().to_string(),
-                size_bytes: blob_digest.size_bytes(),
-            }),
-            ..Default::default()
-        });
+    /// Encode `directory` and store the resulting `Directory` proto
+    /// in `cas` (along with any file blobs the directory references
+    /// — an empty body is enough; the rejection happens before any
+    /// read). Returns the root digest of the encoded proto. Mirrors
+    /// the helper in `brokkr_cas::tree::tests` — kept private here
+    /// because the FUSE tests don't share a crate with the cas
+    /// tests and the surface is too small to be worth a shared
+    /// `#[cfg(test)] pub fn`.
+    async fn encode_and_store_directory(cas: &InMemoryCas, directory: &rapi::Directory) -> Digest {
+        for file in &directory.files {
+            if let Some(d) = &file.digest {
+                let blob = bytes::Bytes::new();
+                let blob_digest = Digest::of(&blob);
+                // The fixture digests are constructed via `Digest::of`
+                // so they're guaranteed valid; the equality check
+                // here exists so a future change to `Digest::of` that
+                // breaks the invariant panics loudly in the test
+                // instead of silently producing a bogus digest.
+                assert_eq!(&d.hash, blob_digest.hash());
+                cas.batch_update_blobs(vec![(blob_digest, blob)])
+                    .await
+                    .unwrap();
+            }
+        }
         let mut buf = Vec::with_capacity(directory.encoded_len());
         directory.encode(&mut buf).unwrap();
         let root_digest = Digest::of(&buf);
         cas.batch_update_blobs(vec![(root_digest.clone(), bytes::Bytes::from(buf))])
             .await
             .unwrap();
+        root_digest
+    }
 
-        let err = InodeTable::build(&cas, &root_digest).await.unwrap_err();
+    /// Build a minimal `FileNode` whose content digest is the empty
+    /// blob — sufficient because `InodeTable::build` never reads the
+    /// file body for a name that's about to be rejected.
+    fn file_node_named(name: &str) -> rapi::FileNode {
+        let empty = bytes::Bytes::new();
+        let digest = Digest::of(&empty);
+        rapi::FileNode {
+            name: name.to_string(),
+            digest: Some(rapi::Digest {
+                hash: digest.hash().to_string(),
+                size_bytes: digest.size_bytes(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_file_name() {
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(file_node_named(".."));
+        let root = encode_and_store_directory(&cas, &directory).await;
+
+        let err = InodeTable::build(&cas, &root).await.unwrap_err();
         assert!(
-            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")),
-            "expected a dotdot rejection, got: {err:?}"
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")
+                && msg.contains("FileNode")),
+            "expected a FileNode dotdot rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_symlink_name() {
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.symlinks.push(rapi::SymlinkNode {
+            name: "..".into(),
+            target: "innocent".into(),
+            ..Default::default()
+        });
+        let root = encode_and_store_directory(&cas, &directory).await;
+
+        let err = InodeTable::build(&cas, &root).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")
+                && msg.contains("SymlinkNode")),
+            "expected a SymlinkNode dotdot rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_directory_name() {
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        // Point at an empty Directory proto so the digest is
+        // resolvable; the rejection happens before any recursion.
+        let child = rapi::Directory::default();
+        let mut buf = Vec::with_capacity(child.encoded_len());
+        child.encode(&mut buf).unwrap();
+        let child_digest = Digest::of(&buf);
+        cas.batch_update_blobs(vec![(child_digest.clone(), bytes::Bytes::from(buf))])
+            .await
+            .unwrap();
+        directory.directories.push(rapi::DirectoryNode {
+            name: "..".into(),
+            digest: Some(rapi::Digest {
+                hash: child_digest.hash().to_string(),
+                size_bytes: child_digest.size_bytes(),
+            }),
+        });
+        let root = encode_and_store_directory(&cas, &directory).await;
+
+        let err = InodeTable::build(&cas, &root).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")
+                && msg.contains("DirectoryNode")),
+            "expected a DirectoryNode dotdot rejection, got: {err:?}"
         );
     }
 }
