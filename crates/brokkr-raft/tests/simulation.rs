@@ -74,6 +74,9 @@ struct Packet {
 /// A deterministic simulated Raft cluster.
 struct Sim {
     ids: Vec<NodeId>,
+    /// The first `founders` ids are the bootstrap voters; the rest are spare
+    /// slots that join as learners during membership churn (I7c).
+    founders: usize,
     /// `None` marks a crashed node (its persistent state survives on disk).
     nodes: Vec<Option<RaftNode>>,
     _dirs: Vec<TempDir>,
@@ -96,8 +99,21 @@ impl Sim {
     /// A sim whose nodes compact automatically once the committed log outgrows
     /// `snapshot_threshold` (I6 exit criteria run the whole campaign at 16).
     fn new_with_threshold(n: usize, base_seed: u64, snapshot_threshold: u64) -> Self {
+        Self::new_with_spares(n, 0, base_seed, snapshot_threshold)
+    }
+
+    /// A sim with `founders` running voters plus `spares` reserved node slots
+    /// (I7c): a spare stays offline until membership churn spawns it as a
+    /// learner via [`Sim::try_add_learner`].
+    fn new_with_spares(
+        founders: usize,
+        spares: usize,
+        base_seed: u64,
+        snapshot_threshold: u64,
+    ) -> Self {
+        let total = founders + spares;
         let t0 = Instant::now();
-        let ids: Vec<NodeId> = (0..n)
+        let ids: Vec<NodeId> = (0..total)
             .map(|i| NodeId::new(format!("n{i}")).unwrap())
             .collect();
         let cfg = Config {
@@ -108,18 +124,23 @@ impl Sim {
         let mut paths = Vec::new();
         let mut nodes = Vec::new();
         let mut seeds = Vec::new();
-        for i in 0..n {
+        for i in 0..total {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("raft.redb");
             let seed = base_seed.wrapping_mul(1103).wrapping_add(i as u64 * 31 + 1);
-            let node = Self::spawn(&ids, i, &path, seed, &cfg, t0);
+            let node = if i < founders {
+                Some(Self::spawn(&ids, founders, i, &path, seed, &cfg, t0))
+            } else {
+                None // spare: joins later as a learner
+            };
             dirs.push(dir);
             paths.push(path);
-            nodes.push(Some(node));
+            nodes.push(node);
             seeds.push(seed);
         }
         Sim {
             ids,
+            founders,
             nodes,
             _dirs: dirs,
             paths,
@@ -133,8 +154,12 @@ impl Sim {
         }
     }
 
+    /// (Re)constructs node `i`. Founders bootstrap as voters of the founding
+    /// set; spares bootstrap as **learners** of it (I7c) — either way, any
+    /// configuration recovered from their log or snapshot takes precedence.
     fn spawn(
         ids: &[NodeId],
+        founders: usize,
         i: usize,
         path: &PathBuf,
         seed: u64,
@@ -142,21 +167,33 @@ impl Sim {
         now: Instant,
     ) -> RaftNode {
         let log = RaftLog::open(path).unwrap();
-        let peers: Vec<NodeId> = ids
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, id)| id.clone())
-            .collect();
-        RaftNode::new(
-            ids[i].clone(),
-            peers,
-            log,
-            Rng::seed_from_u64(seed),
-            cfg.clone(),
-            now,
-        )
-        .unwrap()
+        if i < founders {
+            let peers: Vec<NodeId> = ids[..founders]
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, id)| id.clone())
+                .collect();
+            RaftNode::new(
+                ids[i].clone(),
+                peers,
+                log,
+                Rng::seed_from_u64(seed),
+                cfg.clone(),
+                now,
+            )
+            .unwrap()
+        } else {
+            RaftNode::new_learner(
+                ids[i].clone(),
+                ids[..founders].to_vec(),
+                log,
+                Rng::seed_from_u64(seed),
+                cfg.clone(),
+                now,
+            )
+            .unwrap()
+        }
     }
 
     fn idx(&self, id: &NodeId) -> usize {
@@ -371,6 +408,7 @@ impl Sim {
     fn restart(&mut self, i: usize) {
         let node = Self::spawn(
             &self.ids,
+            self.founders,
             i,
             &self.paths[i],
             self.seeds[i],
@@ -378,6 +416,57 @@ impl Sim {
             self.clock,
         );
         self.nodes[i] = Some(node);
+    }
+
+    // --- membership churn (I7c) -------------------------------------------
+
+    /// The voter set the (presumed) leader `l` currently operates under.
+    fn leader_voters(&self, l: usize) -> BTreeSet<NodeId> {
+        self.nodes[l]
+            .as_ref()
+            .unwrap()
+            .active_config()
+            .voters
+            .clone()
+    }
+
+    /// Spawns spare `i` (if offline) and asks leader `l` to add it as a
+    /// learner. Returns whether the proposal was accepted.
+    fn try_add_learner(&mut self, l: usize, spare: usize) -> bool {
+        if self.nodes[spare].is_none() {
+            self.restart(spare); // first spawn: bootstraps as a learner
+        }
+        let id = self.ids[spare].clone();
+        let now = self.clock;
+        let result = match &mut self.nodes[l] {
+            Some(n) => n.propose_add_learner(id, now),
+            None => return false,
+        };
+        match result {
+            Ok(outs) => {
+                self.enqueue_outbound(l, outs);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Asks leader `l` to move the voter set to `voters` (joint consensus).
+    /// Returns whether the proposal was accepted (the catch-up gate or the
+    /// one-in-flight rule may refuse it — callers just retry later).
+    fn try_conf_change(&mut self, l: usize, voters: BTreeSet<NodeId>) -> bool {
+        let now = self.clock;
+        let result = match &mut self.nodes[l] {
+            Some(n) => n.propose_conf_change(voters, now),
+            None => return false,
+        };
+        match result {
+            Ok(outs) => {
+                self.enqueue_outbound(l, outs);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// The committed command sequence a live node has applied: the history
@@ -697,5 +786,129 @@ fn soak_random_faults(snapshot_threshold: u64) {
     assert!(
         sim.max_commit() > 0,
         "entries were committed despite faults"
+    );
+}
+
+/// **The I7 exit criterion** (plan §17 task 5): the fault campaign stays green
+/// with membership churn added to the mix — spares join as learners, get
+/// promoted through joint consensus once the catch-up gate passes, and
+/// founding voters retire — while compaction runs constantly (threshold 16)
+/// and partitions/crashes/restarts fire at random. The linearizability oracle
+/// must hold after every round.
+#[test]
+fn soak_random_faults_with_membership_churn() {
+    let mut sim = Sim::new_with_spares(5, 2, 3033, 16);
+    let mut fault_rng = Rng::seed_from_u64(4242);
+    let mut writes = 0u32;
+    // The churn plan, attempted in order with retries (proposals may be
+    // refused by the one-in-flight rule or the catch-up gate, or lost to a
+    // fault — the next round tries again):
+    //   0: add n5 as learner       3: add n6 as learner
+    //   1: promote n5 to voter     4: promote n6 to voter
+    //   2: retire a founder        5: retire another founder
+    let mut step = 0usize;
+
+    for round in 0..120 {
+        match fault_rng.gen_range_u64(8) {
+            0 => {
+                // Random 2/3-ish partition across every slot (spares too).
+                let cut = (fault_rng.gen_range_u64(5)) as usize;
+                let a: Vec<usize> = (0..5).filter(|&i| i != cut && i % 2 == 0).collect();
+                let b: Vec<usize> = (0..7).filter(|&i| !a.contains(&i)).collect();
+                if !a.is_empty() && !b.is_empty() {
+                    sim.partition(&[&a, &b]);
+                }
+            }
+            1 => sim.heal(),
+            2 => {
+                if sim.leaders().len() == 1 {
+                    let l = sim.leaders()[0];
+                    sim.crash(l);
+                }
+            }
+            3 => {
+                // Revive any offline slot. A never-added spare comes up as an
+                // idle learner and simply waits.
+                if let Some(i) = (0..7).find(|&i| sim.nodes[i].is_none()) {
+                    sim.restart(i);
+                }
+            }
+            _ => {}
+        }
+
+        sim.advance(Duration::from_millis(120));
+
+        // One churn attempt per round, through the current leader.
+        if sim.leaders().len() == 1 {
+            let l = sim.leaders()[0];
+            let voters = sim.leader_voters(l);
+            let leader_id = sim.nodes[l].as_ref().unwrap().id().clone();
+            match step {
+                0 | 3 => {
+                    let spare = if step == 0 { 5 } else { 6 };
+                    if sim.try_add_learner(l, spare) {
+                        step += 1;
+                    }
+                }
+                1 | 4 => {
+                    let spare = if step == 1 { 5 } else { 6 };
+                    let mut v = voters.clone();
+                    v.insert(sim.ids[spare].clone());
+                    if sim.try_conf_change(l, v) {
+                        step += 1;
+                    }
+                }
+                2 | 5 => {
+                    // Retire the lowest-numbered founding voter that is not
+                    // the current leader, keeping at least 4 voters.
+                    if voters.len() >= 4 {
+                        let victim = (0..5)
+                            .map(|i| sim.ids[i].clone())
+                            .find(|id| voters.contains(id) && *id != leader_id);
+                        if let Some(victim) = victim {
+                            let mut v = voters.clone();
+                            v.remove(&victim);
+                            if sim.try_conf_change(l, v) {
+                                step += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        sim.advance(Duration::from_millis(120));
+        let leaders = sim.leaders();
+        if let Some(&l) = leaders.first() {
+            if sim.propose(l, format!("w{round}").as_bytes()) {
+                writes += 1;
+            }
+        }
+        sim.advance(Duration::from_millis(120));
+
+        // Safety must hold after every single round, churn included.
+        sim.assert_no_divergence();
+    }
+
+    // Heal, revive everything, converge; safety and progress must hold.
+    sim.heal();
+    for _ in 0..5 {
+        if let Some(i) = (0..7).find(|&i| sim.nodes[i].is_none()) {
+            sim.restart(i);
+        }
+        sim.advance(Duration::from_secs(1));
+    }
+    sim.advance(Duration::from_secs(2));
+    sim.assert_no_divergence();
+
+    assert!(
+        step >= 4,
+        "churn made real progress (add → promote → retire → add), stalled at step {step}"
+    );
+    assert!(writes > 0, "the cluster kept serving writes through churn");
+    assert!(
+        sim.max_commit() > 16,
+        "compaction was exercised during churn"
     );
 }
