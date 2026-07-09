@@ -21,10 +21,12 @@
 //! after this change (issue #139's whole point is that the open path
 //! stays the same; only the auth-on path is newly verifiable).
 
-#![allow(clippy::unwrap_used,
+#![allow(
+    clippy::unwrap_used,
     clippy::expect_used,
     clippy::disallowed_methods,
-    clippy::panic)]
+    clippy::panic
+)]
 
 use std::env::consts::EXE_SUFFIX;
 use std::net::TcpStream;

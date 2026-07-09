@@ -63,17 +63,82 @@ action cache.
 
 ## 5. Security (TLS + auth)
 
-Production deployments should enable both:
+Production deployments enable both, and once any JWT auth flag is on the
+control plane binds a separate listener for `WorkerService` + the
+worker's CAS writes (issue #139 — without the split, the worker would
+share the JWT-gated listener and every `batch_update_blobs` would be
+rejected with `UNAUTHENTICATED`). The control plane refuses to start in
+contradictory combinations and prints a clear error.
 
-- **TLS / worker mTLS:** `--tls-cert`, `--tls-key`, and `--tls-client-ca` on
-  `brokkr-control` (and the matching `--ca-cert` / client cert flags on the
-  worker). With `--tls-client-ca` set, the control plane requires worker client
-  certificates.
-- **Client JWT auth:** `--auth-jwt-hmac-secret-file` *or*
-  `--auth-jwt-rsa-pem-file` (plus optional `--auth-jwt-issuer` /
-  `--auth-jwt-audience` / `--auth-jwt-tenant-claim`). Clients then send
-  `authorization: Bearer <jwt>`; the token's tenant claim is authoritative. See
-  ADR 0011.
+### Worked split-port invocation
+
+Generate the certs first (test fixtures at
+`crates/brokkr-control/tests/fixtures/` document the shape; for
+production use your own CA and a SAN that matches your endpoint host):
+
+```sh
+# Terminal 1 — control plane (production posture)
+brokkr-control \
+  --listen 127.0.0.1:7878 \
+  --worker-listen 127.0.0.1:7879 \
+  --data-dir ./brokkr-data \
+  --tls-cert ./certs/server.pem \
+  --tls-key  ./certs/server.key \
+  --tls-client-ca ./certs/ca.pem \
+  --auth-jwt-hmac-secret-file ./certs/jwt.secret
+```
+
+What each listener enforces:
+
+- **`127.0.0.1:7878` (client port)** — TLS + JWT bearer on
+  `ContentAddressableStorage` (client surface), `ActionCache`,
+  `Capabilities`, `Execution`. A client cert is *optional*; the JWT
+  interceptor is the authoritative boundary.
+- **`127.0.0.1:7879` (worker port)** — TLS + **mTLS required** on
+  `WorkerService` AND the worker-side `ContentAddressableStorage` (so
+  workers can upload stdout/stderr). No JWT interceptor; the worker is
+  authenticated by the client cert it presents at the transport layer.
+
+```sh
+# Terminal 2 — worker
+brokkr-worker \
+  --control       https://127.0.0.1:7878 \
+  --worker-control https://127.0.0.1:7879 \
+  --ca            ./certs/ca.pem \
+  --client-cert   ./certs/worker.pem \
+  --client-key    ./certs/worker.key
+```
+
+The worker refuses to start if `--worker-control` is `https://` and no
+client cert/key is set (the server's worker port would reject every
+TLS handshake).
+
+```sh
+# Terminal 3 — client (mint a JWT signed with ./certs/jwt.secret first)
+brokk run \
+  --control      https://127.0.0.1:7878 \
+  --ca           ./certs/ca.pem \
+  --bearer-token "$JWT" \
+  -- /bin/echo "hello mTLS"
+```
+
+Omit `--bearer-token` on the same call and the client port returns
+`UNAUTHENTICATED`. Run with the same JWT twice and the second
+`Execute` hits the action cache.
+
+### Refuse-to-start combinations
+
+The control plane exits with a clear error before binding a listener:
+
+- `--single-port --auth-jwt-*` — the worker would share the JWT-gated
+  listener and `batch_update_blobs` would fail.
+- `--auth-jwt-*` (without `--tls-client-ca`) — the worker port cannot
+  authenticate anyone.
+- `--tls-client-ca` without `--tls-cert`/`--tls-key` — mTLS requires a
+  server identity to present.
+
+See `crates/brokkr-control/src/main.rs::Args::validate_auth_flags` and
+the integration suite at `crates/brokkr-control/tests/split_port_cluster.rs`.
 
 ## 6. Convenience script
 
@@ -86,7 +151,9 @@ one `--no-sandbox` worker locally, for quick experimentation:
 brokk run --control http://127.0.0.1:7878 -- /bin/echo hi
 ```
 
-## 7. Automated two-process test
+## 7. Automated two-process tests
+
+The open-mode end-to-end suite:
 
 ```sh
 cargo build --workspace
@@ -96,6 +163,17 @@ cargo test -p brokkr-control --test two_process_cluster -- --ignored --nocapture
 This spawns the real `brokkr-control` + `brokkr-worker` binaries and runs a job
 through `brokk` end-to-end. It is `#[ignore]` by default (it needs the binaries
 built and spawns processes).
+
+The split-port mTLS+JWT suite (issue #139 verification):
+
+```sh
+cargo test -p brokkr-control --test split_port_cluster -- --ignored --nocapture
+```
+
+Seven tests covering the production posture (TLS server cert + mTLS client cert
+on the worker port + JWT bearer on the client port), the three refuse-to-start
+combinations, and the happy-path `Execute` that round-trips worker stdout/stderr
+through the shared CAS.
 
 ## Known gap
 
