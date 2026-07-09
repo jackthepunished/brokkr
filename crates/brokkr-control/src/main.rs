@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use brokkr_cas::{RedbActionCache, RedbCas};
+use brokkr_cas::RedbCas;
 use brokkr_control::registry::WorkerRegistry;
 use brokkr_control::{
     auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
-    CapabilitiesService, CasService, ExecutionService, JwtAuth, Scheduler, SharedWorkerRegistry,
-    WorkerServiceImpl,
+    CapabilitiesService, CasService, ExecutionService, JwtAuth, MetaKvActionCache, RedbMetaKv,
+    Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
 };
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
@@ -311,10 +311,14 @@ async fn main() -> Result<()> {
         .with_context(|| format!("creating data dir {:?}", args.data_dir))?;
     let cas =
         Arc::new(RedbCas::open(args.data_dir.join("cas.redb")).context("opening CAS database")?);
-    let action_cache = Arc::new(
-        RedbActionCache::open(args.data_dir.join("action_cache.redb"))
-            .context("opening action cache database")?,
+    // Durable control-plane metadata goes through the MetaKv seam (I8): the
+    // action cache lives in `meta.redb` under the `ac/` namespace. Swapping
+    // `RedbMetaKv` for `RaftKv` (I8c) is what makes this state survive a
+    // leader kill; nothing downstream of the trait changes.
+    let meta_kv = Arc::new(
+        RedbMetaKv::open(args.data_dir.join("meta.redb")).context("opening metadata database")?,
     );
+    let action_cache = Arc::new(MetaKvActionCache::new(meta_kv));
     // One shared worker registry, three users: the scheduler reads it for
     // platform-constraint admission control, the worker service writes
     // registrations / heartbeats into it, and the eviction reaper prunes

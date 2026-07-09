@@ -696,3 +696,67 @@ validation, and the churn soak), and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
   (§17 task 6), which begins with the plan's **MANDATORY stop-and-ask**:
   propose to the owner exactly what replicates through Raft before writing
   any code.
+
+## I8 — the stop-and-ask, resolved (§17 task 6)
+
+- **Date:** 2026-07-09
+- **The owner decided** (per the plan's mandatory ask, options + recommendation
+  presented and the recommended cut chosen on both):
+  1. **What replicates:** action-cache writes and cluster-level configuration.
+     **Not** CAS blob bytes (Phase 3 quorum replication owns blob durability)
+     and **not** scheduler queue / worker registry / leases (ephemeral by ADR
+     design — workers re-register and leases reassign on failover). The I9
+     failover story is therefore: builds keep their cache, in-flight jobs
+     re-run.
+  2. **Reads:** implement **ReadIndex** — the leader confirms leadership with
+     a heartbeat round before serving at its commit index. Linearizable reads,
+     the textbook mechanism, small now that heartbeats exist.
+- **Split:** I8a = the `MetaKv` seam (control-plane refactor, no Raft);
+  I8b = the state-machine apply loop + ReadIndex in `brokkr-raft`;
+  I8c = `RaftKv` + follower `NotLeader` redirect + 3-node failover tests +
+  the `--raft` flag (off ⇒ exactly today's behavior).
+
+## I8a — the `MetaKv` seam (§17 task 6)
+
+- **Date:** 2026-07-09
+- **Affected:** `crates/brokkr-control` (`metakv.rs` new; `lib.rs`, `main.rs`).
+- **Outcome:** everything the owner chose to replicate now flows through one
+  trait. `MetaKv` (get/put/delete/scan_prefix over `Bytes`) with the
+  single-node `RedbMetaKv` impl; `MetaKvActionCache<K>` adapts any `MetaKv`
+  to the REAPI `ActionCache` trait, and `main` wires the scheduler and the
+  `ActionCacheService` through it. Zero behavior change.
+
+### Decisions / notes
+
+- **Namespaced keys in one table** (`ac/<digest-hash>`; cluster config claims
+  its own prefix in I8c): one KV instance carries every replicated namespace,
+  `scan_prefix` recovers a namespace wholesale, and the I8c snapshot is one
+  serialized table.
+- **The consumers never see the seam.** Scheduler and service take
+  `Arc<dyn ActionCache>` already; only `main`'s wiring changed. Swapping
+  `RedbMetaKv` for `RaftKv` in I8c is a one-line change at the same spot.
+- **`MetaKvError::NotLeader { leader }` is declared now** so the I8c redirect
+  (gRPC `FAILED_PRECONDITION` + leader hint in metadata) extends the enum
+  instead of breaking it.
+- **Storage location changes** from `action_cache.redb` (table
+  `action_results`) to `meta.redb` (table `meta_kv`). Existing cached action
+  results are not migrated — it is a cache; it refills. `RedbActionCache`
+  stays in `brokkr-cas` for its other users.
+- **The contract suite is reusable:** `metakv_contract_suite<K: MetaKv>` is
+  `pub(crate)` in the test module; I8c runs the same suite against `RaftKv`,
+  which is the plan's "contract suite runs against both impls" requirement.
+
+### Verified per-crate in WSL2
+
+`brokkr-control` and `brokkr-cas` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, tests (**94 lib + all integration
+suites** for control; 5 new: contract suite on `RedbMetaKv`, reopen
+persistence, concurrency limit, AC round-trip through the KV, namespace
+isolation of `list_entries`), and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I8b:** the `StateMachine` apply loop in the `brokkr-raft` driver
+  (apply committed entries / snapshot / restore — the hooks I6 left for
+  "the shell") and **ReadIndex** in the core (leadership confirmation
+  round, read served at the confirmed commit index once applied).
