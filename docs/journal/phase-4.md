@@ -988,6 +988,17 @@ for strategy / tenant weights / quotas.
   `cargo test --workspace` (sandbox seccomp arg-filter tests need a real
   kernel; some CRLF fmt noise), so verification was per-changed-crate with
   Linux CI as the backstop. Honest per-crate green + CI caught the rest.
+- **mTLS "Required" was the silent gap, not JWT (issue #139).** The first
+  cut of the I19 worker mTLS posture loaded the `--tls-client-ca` and
+  logged "TLS ENABLED — mTLS required" but never actually demanded a
+  cert (the tonic 0.12 `client_auth_optional(false)` knob the ADR
+  referred to was never called), so when a real bearer token was turned
+  on, the worker kept sharing the JWT-gated listener and every
+  `batch_update_blobs` returned `UNAUTHENTICATED`. The remedy was a
+  full split-listener refactor plus a `validate_auth_flags` bail-out
+  on the contradictory combinations. Lesson: "mTLS required" in a log
+  line is not a guarantee — wire `client_auth_optional(false)` into a
+  two-process integration test before trusting the message.
 
 ### Phase 4 status: **complete except the Bazel-compat DoD (tracked gap).**
 

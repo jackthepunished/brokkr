@@ -11,9 +11,23 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "brokkr-worker", version, about = "Brokkr worker daemon")]
 struct Args {
-    /// gRPC endpoint of the brokkr-control server (e.g. `http://127.0.0.1:7878`).
+    /// gRPC endpoint of the brokkr-control **client** port (e.g.
+    /// `http://127.0.0.1:7878`). The worker uses this for
+    /// `ContentAddressableStorage` calls (stdout/stderr uploads). In
+    /// single-port mode this is also where `WorkerService` lives.
     #[arg(long, default_value = "http://127.0.0.1:7878")]
     control: String,
+
+    /// gRPC endpoint of the brokkr-control **worker** port (where
+    /// `WorkerService` is served). Defaults to the same scheme and host
+    /// as `--control`, with the port bumped by one (e.g.
+    /// `http://127.0.0.1:7879` for `--control http://127.0.0.1:7878`).
+    /// The control plane only binds a separate worker port when
+    /// `--tls-client-ca` is configured; in open / single-port mode
+    /// this is ignored. With mTLS, this endpoint MUST be `https://` and
+    /// the worker MUST be started with `--client-cert`/`--client-key`.
+    #[arg(long)]
+    worker_control: Option<String>,
 
     /// Run the Phase 2 host-compatibility check and exit. Prints a per-probe
     /// checklist and exits 0 iff the sandbox can run on this host (warnings
@@ -108,13 +122,41 @@ async fn run_daemon(args: Args) -> Result<()> {
         }),
         _ => None,
     };
+    // Default the worker port to "{scheme}://{host}:{port+1}" derived
+    // from --control. The bumped port is only meaningful when the
+    // control plane is in split-port mode — i.e. when mTLS is
+    // configured (--ca). In open / single-port mode the worker port
+    // doesn't exist on the server, so we pass `None` and `run_worker`
+    // falls back to `control_endpoint` for `WorkerService` too.
+    let worker_endpoint = match args.worker_control {
+        Some(s) => Some(s),
+        None if args.ca.is_some() => derive_default_worker_endpoint(&args.control),
+        None => None,
+    };
     let cfg = WorkerConfig {
         control_endpoint: args.control,
+        worker_endpoint,
         hostname: hostname_or("worker".to_string()),
         runner,
         tls,
     };
     run_worker(cfg).await
+}
+
+/// Bump the port of an `http://host:port` / `https://host:port` URL by
+/// one. Returns `None` if the input is not parseable as a URL with a
+/// numeric port — `run_worker` will then fall back to
+/// `control_endpoint` (single-port mode), and the explicit
+/// `https://` fail-fast in `run_worker` will catch any misconfig.
+fn derive_default_worker_endpoint(control: &str) -> Option<String> {
+    let (scheme, rest) = control.split_once("://")?;
+    // Take the authority up to the next `/` (if any).
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Split host:port — last ':' to handle bare IPv6.
+    let (host, port) = authority.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let bumped = port.checked_add(1)?;
+    Some(format!("{scheme}://{host}:{bumped}"))
 }
 
 fn build_runner(args: &Args) -> Result<Runner> {
@@ -175,4 +217,38 @@ fn run_check_host() -> ExitCode {
 
 fn hostname_or(fallback: String) -> String {
     std::env::var("HOSTNAME").unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_default_worker_endpoint;
+
+    #[test]
+    fn bumps_port_for_http_url() {
+        assert_eq!(
+            derive_default_worker_endpoint("http://127.0.0.1:7878"),
+            Some("http://127.0.0.1:7879".to_string())
+        );
+    }
+
+    #[test]
+    fn bumps_port_for_https_url() {
+        assert_eq!(
+            derive_default_worker_endpoint("https://control.example.com:8443"),
+            Some("https://control.example.com:8444".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_path_suffix() {
+        assert_eq!(
+            derive_default_worker_endpoint("http://127.0.0.1:7878/some/path"),
+            Some("http://127.0.0.1:7879".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_unparseable() {
+        assert_eq!(derive_default_worker_endpoint("not-a-url"), None);
+    }
 }

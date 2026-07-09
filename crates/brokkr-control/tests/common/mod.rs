@@ -68,6 +68,10 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
         // brokkr-sandboxd binary and an unprivileged userns.
         let cfg = WorkerConfig {
             control_endpoint: worker_endpoint,
+            // Open / single-port test fixture: WorkerService shares the
+            // client listener, so we let `run_worker` fall back to
+            // `control_endpoint` (issue #139).
+            worker_endpoint: None,
             hostname: "test-worker".to_string(),
             runner: Runner::Plain,
             tls: None,

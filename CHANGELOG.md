@@ -18,6 +18,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-sandbox IPC for no security gain.
 
 ### Fixed
+- Enabling JWT client auth (`--auth-jwt-hmac-secret-file` /
+  `--auth-jwt-rsa-pem-file`) no longer breaks every job. Previously, the
+  worker's `batch_update_blobs` (stdout/stderr) was rejected with
+  `UNAUTHENTICATED` because `ContentAddressableStorage` lived only on
+  the JWT-gated client listener and the worker has no bearer token
+  (issue #139). The control plane now binds a second listener
+  (`--worker-listen`) dedicated to `WorkerService` AND
+  `ContentAddressableStorage`. With `--tls-client-ca` configured,
+  `client_auth_optional` defaults to `false` on that listener, so the
+  worker port requires a client TLS cert — the worker authenticates
+  at the transport layer by presenting the same client cert it uses
+  for `Register`/`Heartbeat`/`Stream`. `ContentAddressableStorage` is
+  shared across both ports against the same on-disk `RedbCas`, so
+  client uploads and worker uploads are visible through either path.
+  The control plane now refuses to start in the contradictory flag
+  combinations that would silently re-introduce the bug
+  (`--single-port --auth-jwt-*`, `--auth-jwt-*` without
+  `--tls-client-ca`); both checks live in
+  `Args::validate_auth_flags`. The split-port, JWT + mTLS posture is
+  covered end-to-end by the new
+  `crates/brokkr-control/tests/split_port_cluster.rs` suite (7
+  `#[ignore]` tests); the open-mode `two_process_cluster` suite is
+  unchanged. `brokk run` gains `--bearer-token <jwt>` /
+  `--bearer-token-file <path>` so operators can inject a token
+  directly; `brokkr-sdk::BrokkrClient::connect_with_bearer` is the
+  equivalent in-process constructor. ADR 0011 is amended to record
+  the now-enforced mTLS posture.
 - `brokkr-control` REAPI services (`ContentAddressableStorage`,
   `ActionCache`, `Execution`, `Capabilities`) now reject any request
   carrying a non-empty `instance_name` with `INVALID_ARGUMENT` instead

@@ -35,8 +35,18 @@ pub struct TlsConfig {
 /// Worker daemon configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// Endpoint of the brokkr-control gRPC server.
+    /// Endpoint of the brokkr-control gRPC server (the **client** port —
+    /// CAS / ActionCache / Capabilities / Execution). The worker uses
+    /// this to call `ContentAddressableStorage::BatchUpdateBlobs` for
+    /// stdout/stderr uploads.
     pub control_endpoint: String,
+    /// Endpoint of the brokkr-control gRPC **worker** port
+    /// (`WorkerService`). When unset, the worker falls back to
+    /// [`Self::control_endpoint`] (single-port mode). In split-port mode
+    /// the operator must point this at the worker port and configure
+    /// mTLS on both sides; the worker port requires a client TLS
+    /// certificate (ADR 0011, issue #139).
+    pub worker_endpoint: Option<String>,
     /// Hostname to advertise (informational).
     pub hostname: String,
     /// How to actually execute each action. Defaults to
@@ -53,6 +63,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             control_endpoint: "http://127.0.0.1:7878".to_string(),
+            worker_endpoint: None,
             hostname: "worker".to_string(),
             runner: Runner::Plain,
             tls: None,
@@ -128,10 +139,53 @@ fn default_capability_labels() -> std::collections::HashMap<String, String> {
 /// unrecoverable error occurs.
 #[tracing::instrument(name = "worker::run", skip(cfg))]
 pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
-    let channel = build_channel(cfg.control_endpoint.clone(), cfg.tls.as_ref()).await?;
+    // Resolve the worker port. When `worker_endpoint` is unset, fall back
+    // to `control_endpoint` (single-port mode — the worker port and the
+    // client port are the same listener).
+    let worker_url = cfg
+        .worker_endpoint
+        .clone()
+        .unwrap_or_else(|| cfg.control_endpoint.clone());
 
-    let mut wsc = WorkerServiceClient::new(channel.clone());
-    let cas = ContentAddressableStorageClient::new(channel);
+    // Fail fast: the server's worker port requires a client TLS cert
+    // (ADR 0011, issue #139). If the operator pointed the worker at an
+    // https endpoint but did not configure --client-cert, every
+    // Register/Heartbeat/Stream call would fail at the TLS handshake.
+    let has_client_cert = cfg
+        .tls
+        .as_ref()
+        .and_then(|t| t.client_cert.as_ref())
+        .is_some();
+    if worker_url.starts_with("https://") && !has_client_cert {
+        anyhow::bail!(
+            "control plane worker endpoint is https but no --client-cert/--client-key configured; \
+             refusing to start (would fail every Register/Heartbeat/Stream with TLS handshake error — issue #139)"
+        );
+    }
+
+    // Worker channel → WorkerServiceClient (worker port, mTLS required in
+    // production).
+    let worker_ch = build_channel(worker_url, cfg.tls.as_ref()).await?;
+    let mut wsc = WorkerServiceClient::new(worker_ch);
+
+    // CAS channel → ContentAddressableStorageClient.
+    //
+    // In split-port mode the control plane serves `ContentAddressableStorage`
+    // on the *worker* port (mTLS-authenticated) as well as on the client
+    // port (JWT-gated). The worker has no bearer token, so it must reach
+    // CAS via the worker port — issue #139. In single-port mode the worker
+    // port and the client port are the same listener, so `worker_endpoint`
+    // and `control_endpoint` are equal and either URL works.
+    //
+    // `cfg.worker_endpoint.is_some()` means the operator set
+    // `--worker-control` (which `derive_default_worker_endpoint` only does
+    // when `--ca` is set), i.e. split-port mode is in effect.
+    let cas_url = cfg
+        .worker_endpoint
+        .clone()
+        .unwrap_or_else(|| cfg.control_endpoint.clone());
+    let cas_ch = build_channel(cas_url, cfg.tls.as_ref()).await?;
+    let cas = ContentAddressableStorageClient::new(cas_ch);
 
     let reg = wsc
         .register(RegisterWorkerRequest {
