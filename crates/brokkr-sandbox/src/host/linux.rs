@@ -112,7 +112,7 @@ pub(super) async fn run_action(
         });
     }
 
-    let mut child = cmd.spawn().map_err(|e| SandboxError::Setup {
+    let child = cmd.spawn().map_err(|e| SandboxError::Setup {
         step: "spawn runner",
         source: e,
     })?;
@@ -414,12 +414,11 @@ impl KillpgOnDrop {
     }
 
     /// Take the child out of the wrapper so Drop becomes a no-op.
-    /// Returns `None` if `wait` has already been called (shouldn't
-    /// happen — `wait` is the only consumer of `take`).
-    fn take(&mut self) -> tokio::process::Child {
-        self.child
-            .take()
-            .expect("KillpgOnDrop::take called after child was already taken")
+    /// Only `Drop` calls this; the wrapper's other methods pass
+    /// through to the inner child via `&mut`. The invariant is
+    /// "Drop is the only consumer of `take`" — easy to audit.
+    fn take(&mut self) -> Option<tokio::process::Child> {
+        self.child.take()
     }
 
     /// `tokio::process::Child::id` — pid, captured once at spawn
@@ -451,20 +450,32 @@ impl KillpgOnDrop {
         // bails out before `wait()`.
         match self.child.as_mut() {
             Some(c) => c.kill().await,
-            None => Ok(()), // already taken via wait(); nothing to do
+            None => Ok(()), // already taken via Drop or wait(); nothing to do
         }
     }
 
-    /// `tokio::process::Child::wait` — takes the child out of the
-    /// wrapper so Drop becomes a no-op on the happy path.
+    /// `tokio::process::Child::wait` — does NOT take the child; the
+    /// child stays in the wrapper and Drop still fires killpg if
+    /// `wait` returns an error and the host bails out before
+    /// consuming the child. On the happy path, the caller drops
+    /// the wrapper after this returns; Drop sees `Some(child)` and
+    /// calls killpg, which is a no-op (ESRCH) because the runner
+    /// already exited. So `killpg on drop` doesn't cost an extra
+    /// syscall on the happy path, only on error paths.
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.take().wait().await
+        match self.child.as_mut() {
+            Some(c) => c.wait().await,
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "KillpgOnDrop::wait called after child was taken",
+            )),
+        }
     }
 }
 
 impl Drop for KillpgOnDrop {
     fn drop(&mut self) {
-        if self.child.take().is_some() {
+        if self.take().is_some() {
             // Best-effort killpg. ESRCH means the runner already
             // exited (e.g. M2 path where the runner IS the action
             // and self-exited before the host could wait); treat
