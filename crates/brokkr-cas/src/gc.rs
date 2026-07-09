@@ -319,4 +319,132 @@ mod tests {
         assert_eq!(sweep(&cas, &ac).await.unwrap(), 1);
         assert_eq!(sweep(&cas, &ac).await.unwrap(), 0);
     }
+
+    // --- #143 cross-decorator regression tests ---
+    //
+    // These run `sweep` end-to-end through each of the three
+    // decorator types. Pre-fix, the trait default no-opped and
+    // every sweep returned 0 while leaving data on disk; these
+    // tests would have failed at the `sweep returns 1` line.
+
+    #[tokio::test]
+    async fn sweep_works_through_tiered_decorator() {
+        use crate::tiered::TieredCas;
+        use std::sync::Arc;
+
+        let warm = Arc::new(InMemoryCas::new());
+        let cas = TieredCas::new(warm.clone(), 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let ac = RedbActionCache::open(dir.path().join("ac.redb")).unwrap();
+        let (live, _) = blob(b"live-tiered");
+        let (dead, _) = blob(b"dead-tiered");
+        cas.batch_update_blobs(vec![
+            (live.clone(), Bytes::from_static(b"live-tiered")),
+            (dead.clone(), Bytes::from_static(b"dead-tiered")),
+        ])
+        .await
+        .unwrap();
+        ac.update_action_result(&Digest::of(b"a"), ar_with_outputs(&[&live]))
+            .await
+            .unwrap();
+
+        assert_eq!(sweep(&cas, &ac).await.unwrap(), 1);
+
+        // The dead blob is gone from warm.
+        let read = warm.batch_read_blobs(&[dead.clone()]).await.unwrap();
+        assert!(matches!(read[0], Err(CasError::NotFound(_))));
+        // The live blob survives.
+        let live_read = warm.batch_read_blobs(&[live]).await.unwrap();
+        assert!(live_read[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn sweep_works_through_bloom_decorator() {
+        use crate::bloom_cas::BloomCas;
+        use std::sync::Arc;
+
+        let inner = Arc::new(InMemoryCas::new());
+        let cas = BloomCas::new(inner.clone(), 1024, 0.01);
+        let dir = tempfile::tempdir().unwrap();
+        let ac = RedbActionCache::open(dir.path().join("ac.redb")).unwrap();
+        let (live, _) = blob(b"live-bloom");
+        let (dead, _) = blob(b"dead-bloom");
+        cas.batch_update_blobs(vec![
+            (live.clone(), Bytes::from_static(b"live-bloom")),
+            (dead.clone(), Bytes::from_static(b"dead-bloom")),
+        ])
+        .await
+        .unwrap();
+        ac.update_action_result(&Digest::of(b"a"), ar_with_outputs(&[&live]))
+            .await
+            .unwrap();
+
+        assert_eq!(sweep(&cas, &ac).await.unwrap(), 1);
+
+        // The dead blob is gone from the inner store.
+        let read = inner.batch_read_blobs(&[dead.clone()]).await.unwrap();
+        assert!(matches!(read[0], Err(CasError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn sweep_works_through_replicated_decorator() {
+        use crate::replicated::{ReplicatedCas, StaticPool};
+        use crate::ring::NodeStatus;
+        use std::sync::Arc;
+
+        // Build a 3-node cluster with R=2.
+        let mut pool = StaticPool::new();
+        let backends: Vec<Arc<InMemoryCas>> =
+            (0..3).map(|_| Arc::new(InMemoryCas::new())).collect();
+        for (i, c) in backends.iter().enumerate() {
+            pool.insert(format!("n{i}"), c.clone() as Arc<dyn crate::traits::Cas>);
+        }
+        let topo = Arc::new(crate::Topology {
+            generation: 1,
+            replication_factor: 2,
+            nodes: (0..3)
+                .map(|i| crate::ring::RingNode {
+                    node_id: format!("n{i}"),
+                    endpoint: format!("http://n{i}:7980"),
+                    status: NodeStatus::Healthy,
+                })
+                .collect(),
+        });
+        let cas = ReplicatedCas::new(Arc::new(pool), topo);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ac = RedbActionCache::open(dir.path().join("ac.redb")).unwrap();
+        let (live, _) = blob(b"live-repl");
+        let (dead, _) = blob(b"dead-repl");
+        cas.batch_update_blobs(vec![
+            (live.clone(), Bytes::from_static(b"live-repl")),
+            (dead.clone(), Bytes::from_static(b"dead-repl")),
+        ])
+        .await
+        .unwrap();
+        ac.update_action_result(&Digest::of(b"a"), ar_with_outputs(&[&live]))
+            .await
+            .unwrap();
+
+        // sweep reports 1 (one unreachable digest), even though
+        // the underlying fan-out deletes hit R=2 replicas.
+        assert_eq!(sweep(&cas, &ac).await.unwrap(), 1);
+
+        // Every replica the ring selected for `dead` is now
+        // missing it.
+        let holders_with_dead: Vec<usize> = backends
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                futures::executor::block_on(c.find_missing_blobs(&[dead.clone()]))
+                    .map(|m| m.is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            holders_with_dead.is_empty(),
+            "replicas still hold the deleted blob: {holders_with_dead:?}"
+        );
+    }
 }

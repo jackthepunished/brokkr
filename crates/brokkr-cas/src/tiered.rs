@@ -108,6 +108,17 @@ impl<W: Cas> TieredCas<W> {
             Err(p) => p.into_inner().put(digest, bytes),
         }
     }
+
+    fn hot_delete(&self, digest: &Digest) {
+        match self.hot.lock() {
+            Ok(mut g) => {
+                g.delete(digest);
+            }
+            Err(p) => {
+                p.into_inner().delete(digest);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -169,6 +180,28 @@ impl<W: Cas + 'static> Cas for TieredCas<W> {
             out[i] = Some(warm_res);
         }
         Ok(out.into_iter().flatten().collect())
+    }
+
+    async fn list_digests(&self) -> Result<Vec<Digest>, CasError> {
+        // Hot is a cache, not an authoritative store. In practice
+        // hot ⊆ warm because `batch_update_blobs` populates warm
+        // before hot (so a warm miss never happens for a
+        // hot-resident digest), but the GC planner only needs
+        // authoritative enumeration. Delegate.
+        self.warm.list_digests().await
+    }
+
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), CasError> {
+        // Drop from hot *first* so a re-read races correctly: a
+        // concurrent batch_read that hits hot before this delete
+        // finishes sees a (now-stale) hit, and the next read
+        // after we return will miss hot and consult warm, which
+        // has also been dropped. Idempotent on both sides (hot's
+        // `delete` returns `bool` we discard; warm's
+        // `HashMap::remove` and redb's `table.remove` are both
+        // no-ops on missing keys).
+        self.hot_delete(digest);
+        self.warm.delete_blob(digest).await
     }
 }
 
@@ -270,6 +303,23 @@ impl HotTier {
             self.bytes = self.bytes.saturating_sub(victim_len);
             self.recycle(victim);
         }
+    }
+
+    /// Remove a single entry by digest. Returns `true` if it was
+    /// present. Idempotent: a second call with the same digest
+    /// returns `false` and is a no-op. Mirrors `put`'s
+    /// unlink+recycle shape from `evict_until_under_capacity`
+    /// so the LRU invariants stay intact after delete.
+    fn delete(&mut self, digest: &Digest) -> bool {
+        let Some(&idx) = self.map.get(digest) else {
+            return false;
+        };
+        let len = self.nodes[idx].bytes.len();
+        self.unlink(idx);
+        self.map.remove(digest);
+        self.bytes = self.bytes.saturating_sub(len);
+        self.recycle(idx);
+        true
     }
 
     fn alloc(&mut self, digest: Digest, bytes: Bytes) -> NodeIdx {
@@ -486,5 +536,54 @@ mod tests {
         // And the read still surfaces NotFound.
         let read = cas.batch_read_blobs(&[lying]).await.unwrap();
         assert!(matches!(read[0], Err(CasError::NotFound(_))));
+    }
+
+    // --- #143 regression tests ---
+
+    #[tokio::test]
+    async fn tiered_cas_delete_blob_drops_from_warm_and_hot() {
+        let warm = Arc::new(InMemoryCas::new());
+        let cas = TieredCas::new(warm.clone(), 1024);
+        let (d, b) = blob(b"ephemeral");
+        cas.batch_update_blobs(vec![(d.clone(), b)]).await.unwrap();
+        // Sanity: both tiers hold it.
+        assert_eq!(cas.hot_len(), 1);
+        assert_eq!(cas.list_digests().await.unwrap(), vec![d.clone()]);
+
+        cas.delete_blob(&d).await.unwrap();
+
+        // Hot is gone.
+        assert_eq!(cas.hot_len(), 0);
+        // Warm is gone.
+        assert!(warm.batch_read_blobs(&[d.clone()]).await.unwrap()[0].is_err());
+        // Public read surfaces NotFound.
+        let read = cas.batch_read_blobs(&[d.clone()]).await.unwrap();
+        assert!(matches!(read[0], Err(CasError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn tiered_cas_delete_blob_on_missing_digest_is_ok() {
+        // Idempotent contract: a missing digest must return Ok(()).
+        let cas = TieredCas::new(Arc::new(InMemoryCas::new()), 1024);
+        let phantom = Digest::of(b"never stored");
+        cas.delete_blob(&phantom).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tiered_cas_list_digests_delegates_to_warm() {
+        // Hot capacity zero keeps this test focused on the
+        // delegation: nothing in hot, two in warm, list returns 2.
+        let warm = Arc::new(InMemoryCas::new());
+        let cas = TieredCas::new(warm, 0);
+        let (d1, b1) = blob(b"a");
+        let (d2, b2) = blob(b"b");
+        cas.batch_update_blobs(vec![(d1.clone(), b1), (d2.clone(), b2)])
+            .await
+            .unwrap();
+        let listed: std::collections::HashSet<Digest> =
+            cas.list_digests().await.unwrap().into_iter().collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&d1));
+        assert!(listed.contains(&d2));
     }
 }
