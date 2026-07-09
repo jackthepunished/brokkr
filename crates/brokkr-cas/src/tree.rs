@@ -431,14 +431,20 @@ mod tests {
         // Upload every file blob the directory references.
         for file in &directory.files {
             if let Some(d) = &file.digest {
-                if let Ok(digest) = Digest::new(d.hash.clone(), d.size_bytes) {
-                    // The tests only need the blob to exist in CAS so
-                    // `batch_read_blobs` doesn't return NotFound; an
-                    // empty body is fine.
-                    cas.batch_update_blobs(vec![(digest, Bytes::new())])
-                        .await
-                        .unwrap();
-                }
+                // `malicious_file_node` constructs well-formed
+                // digests via `Digest::of(b"")`, so a malformed
+                // fixture digest panics here loudly — surfacing a
+                // test-fixture bug at the point of construction
+                // rather than as a silent NotFound later.
+                let digest = Digest::new(d.hash.clone(), d.size_bytes)
+                    .expect("malicious_file_node must produce a valid Digest");
+                // The tests only need the blob to exist in CAS so
+                // `batch_read_blobs` doesn't return NotFound; an
+                // empty body is fine (the rejection happens before
+                // any read).
+                cas.batch_update_blobs(vec![(digest, Bytes::new())])
+                    .await
+                    .unwrap();
             }
         }
         let mut buf = Vec::with_capacity(directory.encoded_len());
