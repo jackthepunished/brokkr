@@ -160,6 +160,31 @@ impl InodeTable {
     }
 }
 
+/// REAPI v2 single-segment name check, duplicated from
+/// `brokkr_cas::tree::validate_node_name` so this module stays
+/// self-contained (it is platform-independent on purpose — see
+/// file-level docs above; depending on the cas module's tree
+/// internals would pull extra surface in for a 4-line helper).
+/// Returns `None` when the name is safe to register as a directory
+/// entry, or `Some(reason)` describing why it was rejected. The
+/// reason string is a `&'static str` so the call site can fold it
+/// into a `CasError::Other` without allocating.
+fn validate_node_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty");
+    }
+    if name == "." || name == ".." {
+        return Some("dot or dotdot");
+    }
+    if name.contains('/') {
+        return Some("contains '/'");
+    }
+    if name.contains('\0') {
+        return Some("contains NUL");
+    }
+    None
+}
+
 // Recursive DAG walker. Boxed because async fn can't recurse without
 // it on stable; the alternative is a work-stack. Tree depth is
 // bounded by the action's input tree (Bazel-style: shallow, <20).
@@ -173,6 +198,12 @@ fn build_dir<'a>(
         let directory = fetch_directory(cas, digest).await?;
 
         for file_node in &directory.files {
+            if let Some(reason) = validate_node_name(&file_node.name) {
+                return Err(CasError::Other(format!(
+                    "FileNode {:?}: invalid name ({reason})",
+                    file_node.name
+                )));
+            }
             let file_digest = decode_digest(&file_node.digest, &file_node.name, "FileNode")?;
             let size = u64::try_from(file_digest.size_bytes()).map_err(|_| {
                 CasError::Other(format!(
@@ -193,6 +224,12 @@ fn build_dir<'a>(
         }
 
         for symlink in &directory.symlinks {
+            if let Some(reason) = validate_node_name(&symlink.name) {
+                return Err(CasError::Other(format!(
+                    "SymlinkNode {:?}: invalid name ({reason})",
+                    symlink.name
+                )));
+            }
             let child_ino = push(
                 inodes,
                 InodeKind::Link {
@@ -203,6 +240,12 @@ fn build_dir<'a>(
         }
 
         for child in &directory.directories {
+            if let Some(reason) = validate_node_name(&child.name) {
+                return Err(CasError::Other(format!(
+                    "DirectoryNode {:?}: invalid name ({reason})",
+                    child.name
+                )));
+            }
             let child_digest = decode_digest(&child.digest, &child.name, "DirectoryNode")?;
             let child_ino = push(
                 inodes,
@@ -400,5 +443,128 @@ mod tests {
         let (table, _cas) = build_from_disk(src.path()).await;
         let a = table.resolve(&PathBuf::from("/a.txt")).unwrap();
         assert!(table.lookup(a, OsStr::new("anything")).is_none());
+    }
+
+    // Parity tests for the `brokkr_cas::tree::materialize_tree`
+    // path-traversal guard (issue #141): `InodeTable::build` must
+    // reject the same REAPI name shapes. The FUSE builder is not
+    // exploitable as a path-traversal sink on its own (names go
+    // into a `HashMap` and the kernel supplies one component at a
+    // time) but failing fast at the entry point keeps the two
+    // tree-walking paths symmetric in their error surface. Three
+    // tests cover all three call-site checks in `build_dir`: the
+    // file-node, symlink-node, and directory-node loops.
+
+    /// Encode `directory` and store the resulting `Directory` proto
+    /// in `cas` (along with any file blobs the directory references
+    /// — an empty body is enough; the rejection happens before any
+    /// read). Returns the root digest of the encoded proto. Mirrors
+    /// the helper in `brokkr_cas::tree::tests` — kept private here
+    /// because the FUSE tests don't share a crate with the cas
+    /// tests and the surface is too small to be worth a shared
+    /// `#[cfg(test)] pub fn`.
+    async fn encode_and_store_directory(cas: &InMemoryCas, directory: &rapi::Directory) -> Digest {
+        for file in &directory.files {
+            if let Some(d) = &file.digest {
+                let blob = bytes::Bytes::new();
+                let blob_digest = Digest::of(&blob);
+                // The fixture digests are constructed via `Digest::of`
+                // so they're guaranteed valid; the equality check
+                // here exists so a future change to `Digest::of` that
+                // breaks the invariant panics loudly in the test
+                // instead of silently producing a bogus digest.
+                assert_eq!(&d.hash, blob_digest.hash());
+                cas.batch_update_blobs(vec![(blob_digest, blob)])
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut buf = Vec::with_capacity(directory.encoded_len());
+        directory.encode(&mut buf).unwrap();
+        let root_digest = Digest::of(&buf);
+        cas.batch_update_blobs(vec![(root_digest.clone(), bytes::Bytes::from(buf))])
+            .await
+            .unwrap();
+        root_digest
+    }
+
+    /// Build a minimal `FileNode` whose content digest is the empty
+    /// blob — sufficient because `InodeTable::build` never reads the
+    /// file body for a name that's about to be rejected.
+    fn file_node_named(name: &str) -> rapi::FileNode {
+        let empty = bytes::Bytes::new();
+        let digest = Digest::of(&empty);
+        rapi::FileNode {
+            name: name.to_string(),
+            digest: Some(rapi::Digest {
+                hash: digest.hash().to_string(),
+                size_bytes: digest.size_bytes(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_file_name() {
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(file_node_named(".."));
+        let root = encode_and_store_directory(&cas, &directory).await;
+
+        let err = InodeTable::build(&cas, &root).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")
+                && msg.contains("FileNode")),
+            "expected a FileNode dotdot rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_symlink_name() {
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.symlinks.push(rapi::SymlinkNode {
+            name: "..".into(),
+            target: "innocent".into(),
+            ..Default::default()
+        });
+        let root = encode_and_store_directory(&cas, &directory).await;
+
+        let err = InodeTable::build(&cas, &root).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")
+                && msg.contains("SymlinkNode")),
+            "expected a SymlinkNode dotdot rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inode_table_rejects_dotdot_directory_name() {
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        // Point at an empty Directory proto so the digest is
+        // resolvable; the rejection happens before any recursion.
+        let child = rapi::Directory::default();
+        let mut buf = Vec::with_capacity(child.encoded_len());
+        child.encode(&mut buf).unwrap();
+        let child_digest = Digest::of(&buf);
+        cas.batch_update_blobs(vec![(child_digest.clone(), bytes::Bytes::from(buf))])
+            .await
+            .unwrap();
+        directory.directories.push(rapi::DirectoryNode {
+            name: "..".into(),
+            digest: Some(rapi::Digest {
+                hash: child_digest.hash().to_string(),
+                size_bytes: child_digest.size_bytes(),
+            }),
+        });
+        let root = encode_and_store_directory(&cas, &directory).await;
+
+        let err = InodeTable::build(&cas, &root).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")
+                && msg.contains("DirectoryNode")),
+            "expected a DirectoryNode dotdot rejection, got: {err:?}"
+        );
     }
 }

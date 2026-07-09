@@ -84,6 +84,41 @@ pub struct MaterializationStats {
     pub bytes: u64,
 }
 
+/// REAPI v2 §`FileNode.name` / §`DirectoryNode.name` / §`SymlinkNode.name`
+/// require a single non-empty path segment: no `/`, no NUL, not `.`
+/// or `..`. Returns `None` if the name is safe to join onto a parent
+/// directory, or `Some(reason)` describing why it was rejected. The
+/// reason string is a `&'static str` so the call site can fold it into
+/// a `CasError::Other` without allocating.
+///
+/// Path-traversal guard for issue #141: `Path::join` is unsafe against
+/// attacker input — a `name` of `..` walks out of the base, and an
+/// absolute `name` *replaces* the base entirely. A REAPI `Directory`
+/// proto is an opaque CAS blob, so any client that can `BatchUpdateBlobs`
+/// can plant the payload. The check has to be here, in the decode
+/// path; the encode path (`pack_directory` below) reads from a host
+/// filesystem and is already safe by construction.
+///
+/// Note: `..` is rejected as a literal single-segment name (REAPI
+/// disallows it). A name like `../escape.txt` is rejected by the
+/// slash check first because it's not a single path segment at all —
+/// both are rejected, with different reasons.
+fn validate_node_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty");
+    }
+    if name == "." || name == ".." {
+        return Some("dot or dotdot");
+    }
+    if name.contains('/') {
+        return Some("contains '/'");
+    }
+    if name.contains('\0') {
+        return Some("contains NUL");
+    }
+    None
+}
+
 // Recursive walker. Boxed because async + recursion isn't a
 // thing without it; the alternative is an explicit work stack
 // (more code, same behaviour). The recursion depth is bounded
@@ -99,6 +134,12 @@ fn materialize_directory<'a>(
         let directory = fetch_directory(cas, digest).await?;
 
         for file_node in &directory.files {
+            if let Some(reason) = validate_node_name(&file_node.name) {
+                return Err(CasError::Other(format!(
+                    "FileNode {:?}: invalid name ({reason})",
+                    file_node.name
+                )));
+            }
             let digest = match &file_node.digest {
                 Some(d) => Digest::new(d.hash.clone(), d.size_bytes).map_err(|e| {
                     CasError::Other(format!("invalid file digest {}: {e}", file_node.name))
@@ -117,6 +158,12 @@ fn materialize_directory<'a>(
         }
 
         for symlink in &directory.symlinks {
+            if let Some(reason) = validate_node_name(&symlink.name) {
+                return Err(CasError::Other(format!(
+                    "SymlinkNode {:?}: invalid name ({reason})",
+                    symlink.name
+                )));
+            }
             let path = dir.join(&symlink.name);
             // The target is interpreted as-is per REAPI v2 §SymlinkNode.
             if path.exists() || path.is_symlink() {
@@ -127,6 +174,12 @@ fn materialize_directory<'a>(
         }
 
         for child in &directory.directories {
+            if let Some(reason) = validate_node_name(&child.name) {
+                return Err(CasError::Other(format!(
+                    "DirectoryNode {:?}: invalid name ({reason})",
+                    child.name
+                )));
+            }
             let child_path = dir.join(&child.name);
             std::fs::create_dir_all(&child_path).map_err(CasError::Io)?;
             stats.dirs += 1;
@@ -357,5 +410,166 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CasError::NotFound(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Path-traversal guard for issue #141. The four tests below hand-
+    // build a `Directory` proto with an attacker-controlled `name` on
+    // a `FileNode` and assert that `materialize_tree` rejects it
+    // before the file is written. The `build_tree_into` helper can't
+    // produce these (it reads from a host FS, which only yields single-
+    // segment names), so we craft the proto and its blob by hand and
+    // push them into the CAS ourselves.
+    // -----------------------------------------------------------------
+
+    /// Encode `directory` and store the bytes (and any file blobs it
+    /// references) into `cas`, returning the root `Digest` of the
+    /// encoded `Directory` proto. Caller passes a fully-formed
+    /// `rapi::Directory`; we do not validate the name fields here —
+    /// that's what the tests are for.
+    async fn store_malicious_directory(cas: &InMemoryCas, directory: &rapi::Directory) -> Digest {
+        // Upload every file blob the directory references.
+        for file in &directory.files {
+            if let Some(d) = &file.digest {
+                // `malicious_file_node` constructs well-formed
+                // digests via `Digest::of(b"")`, so a malformed
+                // fixture digest panics here loudly — surfacing a
+                // test-fixture bug at the point of construction
+                // rather than as a silent NotFound later.
+                let digest = Digest::new(d.hash.clone(), d.size_bytes)
+                    .expect("malicious_file_node must produce a valid Digest");
+                // The tests only need the blob to exist in CAS so
+                // `batch_read_blobs` doesn't return NotFound; an
+                // empty body is fine (the rejection happens before
+                // any read).
+                cas.batch_update_blobs(vec![(digest, Bytes::new())])
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut buf = Vec::with_capacity(directory.encoded_len());
+        directory.encode(&mut buf).unwrap();
+        let root = Digest::of(&buf);
+        cas.batch_update_blobs(vec![(root.clone(), Bytes::from(buf))])
+            .await
+            .unwrap();
+        root
+    }
+
+    /// Build a `FileNode` whose `name` is the attacker's payload. The
+    /// blob digest is the digest of an empty body (the test never
+    /// reads the bytes — the rejection happens before the file write).
+    fn malicious_file_node(name: &str) -> rapi::FileNode {
+        let empty = Digest::of(b"");
+        rapi::FileNode {
+            name: name.to_string(),
+            digest: Some(rapi::Digest {
+                hash: empty.hash().to_string(),
+                size_bytes: empty.size_bytes(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_tree_rejects_dotdot_name() {
+        // Issue #141: a FileNode whose name is the literal `..` would
+        // walk out of the staging root under `Path::join`. REAPI v2
+        // disallows `.` and `..` as single-segment names; reject them
+        // before the join so the operator's log line is specific.
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(malicious_file_node(".."));
+        let root = store_malicious_directory(&cas, &directory).await;
+
+        let dst = tempfile::tempdir().unwrap();
+        let err = materialize_tree(&cas, &root, dst.path()).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")),
+            "expected a dotdot rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_tree_rejects_dot_name() {
+        // `FileNode { name: ".", .. }` is also disallowed by REAPI v2
+        // (`.` is a single-segment reference to the current directory;
+        // the join is a no-op for the file write but the entry would
+        // shadow the staging root in the next read). Reject for
+        // consistency with the dotdot guard.
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(malicious_file_node("."));
+        let root = store_malicious_directory(&cas, &directory).await;
+
+        let dst = tempfile::tempdir().unwrap();
+        let err = materialize_tree(&cas, &root, dst.path()).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("dot or dotdot")),
+            "expected a dot rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_tree_rejects_name_with_slash() {
+        // Issue #141 reproduction recipe. `Path::join` with a `..`-led
+        // name walks out of the base; with an absolute name it
+        // *replaces* the base. Either way, the file is written outside
+        // the staging directory. Reject at the gate; the reason is
+        // "contains '/'" because the name is not a single path
+        // segment (REAPI conformance), distinct from the dotdot case.
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(malicious_file_node("../escape.txt"));
+        let root = store_malicious_directory(&cas, &directory).await;
+
+        let dst = tempfile::tempdir().unwrap();
+        let err = materialize_tree(&cas, &root, dst.path()).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("contains '/'")),
+            "expected a slash-in-name rejection, got: {err:?}"
+        );
+        assert!(
+            !dst.path().parent().unwrap().join("escape.txt").exists(),
+            "staging directory escaped via dotdot-prefixed name"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_tree_rejects_absolute_name() {
+        // `Path::join("/tmp/staging", "/etc/passwd")` returns
+        // `/etc/passwd` — the base is replaced entirely. An attacker
+        // who can set `name = "/etc/passwd"` would otherwise overwrite
+        // the host file. The slash check rejects before the join.
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(malicious_file_node("/etc/passwd"));
+        let root = store_malicious_directory(&cas, &directory).await;
+
+        let dst = tempfile::tempdir().unwrap();
+        let err = materialize_tree(&cas, &root, dst.path()).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("contains '/'")),
+            "expected a slash-in-name rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_tree_rejects_empty_name() {
+        // Empty names are not single segments; `Path::join` with an
+        // empty `right` returns the base unchanged, which is a
+        // confused-deputy risk (the file would shadow the staging
+        // directory itself). Reject at the gate.
+        let cas = InMemoryCas::new();
+        let mut directory = rapi::Directory::default();
+        directory.files.push(malicious_file_node(""));
+        let root = store_malicious_directory(&cas, &directory).await;
+
+        let dst = tempfile::tempdir().unwrap();
+        let err = materialize_tree(&cas, &root, dst.path()).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Other(ref msg) if msg.contains("empty")),
+            "expected an empty-name rejection, got: {err:?}"
+        );
     }
 }
