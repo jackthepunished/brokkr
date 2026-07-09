@@ -1137,6 +1137,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   campaigns deposed the leader of the cluster it had left; a stale minority
   leader still steps down via AppendEntries terms, so liveness holds.
   Driver: `RaftHandle::propose_conf_change` + `DriverStatus.config`.
+- `brokkr-control` `MetaKv` metadata seam (milestone I8a, `docs/plan.md`
+  §17 task 6): the I8 stop-and-ask resolved — **action-cache writes and
+  cluster-level config replicate through Raft; CAS blob bytes and scheduler
+  queue/registry/leases stay ephemeral** — and everything in the replicated
+  set now flows through one trait. `MetaKv` (get/put/delete/scan_prefix over
+  `Bytes`) with the single-node `RedbMetaKv` impl (same spawn_blocking +
+  semaphore discipline as the other redb stores);
+  `MetaKvActionCache<K: MetaKv>` adapts any `MetaKv` to the REAPI
+  `ActionCache` trait under namespaced `ac/<digest-hash>` keys. `main` wires
+  the scheduler and `ActionCacheService` through it — zero behavior change;
+  swapping in `RaftKv` (I8c) is a one-line change at the same spot.
+  The `MetaKvError`→`CasError` conversion is an exhaustive match on
+  purpose: adding I8c's `NotLeader` variant fails to compile until the
+  follower redirect gets a real propagation path.
+  Note: the action cache moves from `action_cache.redb` to `meta.redb`;
+  existing cached results are not migrated (it is a cache; it refills).
 - `brokkr-raft` learners + catch-up gate (milestone I7c, `docs/plan.md` §17
   task 5, thesis ch. 4 — completes I7): fresh nodes join as **non-voting
   learners** and are promoted only once caught up. `RaftNode::new_learner`

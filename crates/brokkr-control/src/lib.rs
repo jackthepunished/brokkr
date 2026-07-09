@@ -11,6 +11,7 @@ pub mod fairqueue;
 pub mod lease;
 pub mod matching;
 pub mod membership;
+pub mod metakv;
 pub mod registry;
 pub mod scheduler;
 pub mod scheduling;
@@ -22,6 +23,7 @@ pub use fairqueue::FairQueue;
 pub use lease::LeaseTable;
 pub use matching::{eligible_workers, labels_satisfy_platform, worker_satisfies};
 pub use membership::{Membership, MembershipServiceImpl};
+pub use metakv::{MetaKv, MetaKvActionCache, MetaKvError, RedbMetaKv};
 pub use registry::{
     HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
 };

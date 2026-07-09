@@ -6,10 +6,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brokkr_cas::{RedbActionCache, RedbCas};
+use brokkr_cas::RedbCas;
 use brokkr_common::Digest;
 use brokkr_control::{
-    ActionCacheService, CapabilitiesService, CasService, ExecutionService, Scheduler,
+    ActionCacheService, CapabilitiesService, CasService, ExecutionService, MetaKvActionCache,
+    RedbMetaKv, Scheduler,
 };
 use brokkr_proto::reapi_v2::{
     self as rapi, action_cache_client::ActionCacheClient, action_cache_server::ActionCacheServer,
@@ -24,7 +25,9 @@ use tonic::transport::{Channel, Server};
 async fn boot_server() -> (String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let cas = Arc::new(RedbCas::open(dir.path().join("cas.redb")).unwrap());
-    let ac = Arc::new(RedbActionCache::open(dir.path().join("ac.redb")).unwrap());
+    // Same backend main.rs ships (I8a): the action cache behind the MetaKv seam.
+    let meta_kv = Arc::new(RedbMetaKv::open(dir.path().join("meta.redb")).unwrap());
+    let ac = Arc::new(MetaKvActionCache::new(meta_kv));
     let scheduler = Scheduler::new(cas.clone(), ac.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
