@@ -158,13 +158,12 @@ pub(super) async fn run_action(
 
     // Take stdout / stderr off the child so we can drive `wait` and
     // pipe-draining concurrently — wait_with_output wouldn't let us
-    // SIGKILL on timeout because it consumes the Child. The wrapper
-    // forwards `.stdout`/`.stderr` directly.
-    let stdout = child.stdout.take().ok_or_else(|| SandboxError::Setup {
+    // SIGKILL on timeout because it consumes the Child.
+    let stdout = child.stdout().ok_or_else(|| SandboxError::Setup {
         step: "take stdout",
         source: io::Error::other("child stdout already taken"),
     })?;
-    let stderr = child.stderr.take().ok_or_else(|| SandboxError::Setup {
+    let stderr = child.stderr().ok_or_else(|| SandboxError::Setup {
         step: "take stderr",
         source: io::Error::other("child stderr already taken"),
     })?;
@@ -392,6 +391,15 @@ fn join_capture(joined: Result<Vec<u8>, tokio::task::JoinError>, stream: &str) -
 /// action alive on the host. `Command::kill_on_drop(true)` only
 /// reaches the immediate child, which is not enough on the
 /// namespace path.
+///
+/// The wrapper exposes a deliberately narrow surface — only the
+/// methods the host actually uses (`id`, `stdout`, `stderr`, `kill`,
+/// `wait`). It deliberately does not `Deref` to `tokio::process::Child`,
+/// because methods like `start_kill` would let a caller bypass the
+/// killpg-on-drop contract (sending SIGKILL to the immediate child
+/// only, leaving the namespace init + action alive). Adding new
+/// methods here requires also adding a comment justifying why the
+/// bypass-safe contract still holds.
 struct KillpgOnDrop {
     child: Option<tokio::process::Child>,
     runner_pid: i32,
@@ -407,44 +415,50 @@ impl KillpgOnDrop {
 
     /// Take the child out of the wrapper so Drop becomes a no-op.
     /// Returns `None` if `wait` has already been called (shouldn't
-    /// happen — we only expose `wait` and `id`, both of which take
-    /// the child exactly once).
+    /// happen — `wait` is the only consumer of `take`).
     fn take(&mut self) -> tokio::process::Child {
         self.child
             .take()
             .expect("KillpgOnDrop::take called after child was already taken")
     }
 
-    /// Pass-through to `tokio::process::Child::id`.
+    /// `tokio::process::Child::id` — pid, captured once at spawn
+    /// time, never changes.
     fn id(&self) -> Option<u32> {
         self.child.as_ref().and_then(|c| c.id())
     }
 
-    /// Pass-through to `tokio::process::Child::wait`. Takes the
-    /// child out of the wrapper on the first call so Drop becomes a
-    /// no-op; a second call would have panicked on `take()` anyway.
+    /// `tokio::process::Child::stdout` — borrowed so the host can
+    /// `.take()` it once. Safe to call any number of times; the
+    /// inner `Option<ChildStdout>` is `None` after the first take.
+    fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.as_mut().and_then(|c| c.stdout.take())
+    }
+
+    /// `tokio::process::Child::stderr` — see `stdout`.
+    fn stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.as_mut().and_then(|c| c.stderr.take())
+    }
+
+    /// `tokio::process::Child::kill` — SIGKILL the immediate child
+    /// only. The host uses this as a last-ditch fallback when
+    /// `killpg` itself failed for a reason other than `ESRCH`. The
+    /// wrapper's Drop guard remains the primary cleanup path.
+    async fn kill(&mut self) -> std::io::Result<()> {
+        // Use the inner `Option<Child>` directly so we don't
+        // accidentally consume the child here — Drop should still
+        // fire killpg if kill() returned an error and the host
+        // bails out before `wait()`.
+        match self.child.as_mut() {
+            Some(c) => c.kill().await,
+            None => Ok(()), // already taken via wait(); nothing to do
+        }
+    }
+
+    /// `tokio::process::Child::wait` — takes the child out of the
+    /// wrapper so Drop becomes a no-op on the happy path.
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.take().wait().await
-    }
-}
-
-impl std::ops::Deref for KillpgOnDrop {
-    type Target = tokio::process::Child;
-    fn deref(&self) -> &Self::Target {
-        // Safe: `child` is only `None` after `take` (i.e. after
-        // `wait` was called), and post-`wait` the wrapper is
-        // about to be dropped without further field access.
-        self.child
-            .as_ref()
-            .expect("KillpgOnDrop::deref called after child was taken")
-    }
-}
-
-impl std::ops::DerefMut for KillpgOnDrop {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.child
-            .as_mut()
-            .expect("KillpgOnDrop::deref_mut called after child was taken")
     }
 }
 

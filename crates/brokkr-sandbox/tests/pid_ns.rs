@@ -241,7 +241,7 @@ async fn wall_clock_timeout_kills_namespaced_action() {
         String::from_utf8_lossy(&outcome.stderr)
     );
     assert!(
-        elapsed < Duration::from_secs(8),
+        elapsed < Duration::from_secs(4),
         "timeout took implausibly long: {elapsed:?}"
     );
     // The action must be gone from the host. pgrep -f returns
