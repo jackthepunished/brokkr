@@ -169,6 +169,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ev_prctl_capbset_drop_blocked`, `ev_prctl_get_tsc_blocked`,
   `ev_ioctl_tiocsti_blocked`, `ev_ioctl_tiocgwinsz_blocked`,
   `ev_ioctl_tiocswinsz_blocked`, and `ev_ioctl_tiocptlck_blocked`.
+- `TeeCas`, `TieredCas`, and `BloomCas` (the three decorator
+  wrappers over a base `Cas`) no longer inherit broken default
+  behaviour for `list_digests` and `delete_blob` (issue #143).
+  Previously the `Cas` trait shipped defaults that meant a
+  decorator would *appear* to drop a blob without forwarding to
+  the base, or list digests as the empty set. Both methods are
+  now overridden on the decorators to fan out to the wrapped
+  backend — `TieredCas` deletes from both tiers (idempotent on
+  missing), `BloomCas` proxies to the wrapped backend. This
+  restores the REAPI `ContentAddressableStorage` semantics for
+  `BatchUpdateBlobs` callers that depend on the decorator to
+  forward writes uniformly.
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require

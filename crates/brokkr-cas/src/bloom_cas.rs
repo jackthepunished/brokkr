@@ -159,6 +159,29 @@ impl<C: Cas + 'static> Cas for BloomCas<C> {
         // delegate.
         self.inner.batch_read_blobs(digests).await
     }
+
+    async fn list_digests(&self) -> Result<Vec<Digest>, CasError> {
+        // The bloom is a fast-path, not an authoritative store.
+        // GC needs every digest the backend actually holds;
+        // delegate.
+        self.inner.list_digests().await
+    }
+
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), CasError> {
+        // Delegate the primary effect to the inner store. We
+        // intentionally DO NOT touch the bloom: a Bloom filter
+        // cannot support per-entry remove (deletes do not
+        // subtract, per `docs/phase-3-plan.md` §5.2; the bloom
+        // is always a superset of the actual contents and the
+        // periodic `rebuild_from` path re-tightens it). Leaving
+        // a stale bit cannot cause a correctness violation —
+        // `find_missing_blobs` (above) asks the backend on every
+        // bloom-yes, so a "present" hit on a deleted digest just
+        // falls through to a backend `NotFound`. The bloom's
+        // `approximate_items()` metric will be slightly inflated
+        // until the next rebuild; that's a `/metrics` cosmetic.
+        self.inner.delete_blob(digest).await
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +285,60 @@ mod tests {
         let (d, _) = blob(b"unseen");
         let results = cas.batch_read_blobs(&[d]).await.unwrap();
         assert!(matches!(results[0], Err(CasError::NotFound(_))));
+    }
+
+    // --- #143 regression tests ---
+
+    #[tokio::test]
+    async fn bloom_cas_delete_blob_delegates_to_inner() {
+        let inner: Arc<InMemoryCas> = Arc::new(InMemoryCas::new());
+        let cas = BloomCas::new(inner.clone(), 1024, 0.01);
+        let (d, b) = blob(b"will be deleted");
+        cas.batch_update_blobs(vec![(d.clone(), b)]).await.unwrap();
+        // Sanity: backend has it before delete.
+        assert!(inner.batch_read_blobs(&[d.clone()]).await.unwrap()[0].is_ok());
+
+        cas.delete_blob(&d).await.unwrap();
+
+        // Backend is gone.
+        let read = inner.batch_read_blobs(&[d.clone()]).await.unwrap();
+        assert!(matches!(read[0], Err(CasError::NotFound(_))));
+        // And a re-read through the decorator also returns
+        // NotFound — even though the bloom still has a stale
+        // bit for `d`, `batch_read_blobs` is bloom-independent
+        // and the backend says missing.
+        let dec_read = cas.batch_read_blobs(&[d.clone()]).await.unwrap();
+        assert!(matches!(dec_read[0], Err(CasError::NotFound(_))));
+        // `find_missing_blobs` must also surface this digest as
+        // missing — the stale bloom bit would otherwise cause a
+        // "maybe present" answer; the backend then confirms the
+        // miss. This is the documented staleness tolerance.
+        let missing = cas.find_missing_blobs(&[d.clone()]).await.unwrap();
+        assert_eq!(missing, vec![d]);
+    }
+
+    #[tokio::test]
+    async fn bloom_cas_delete_blob_on_missing_is_ok() {
+        // Idempotent contract: deleting an absent digest must
+        // return Ok(()).
+        let cas = BloomCas::new(Arc::new(InMemoryCas::new()), 1024, 0.01);
+        let phantom = Digest::of(b"never stored");
+        cas.delete_blob(&phantom).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bloom_cas_list_digests_delegates_to_inner() {
+        let inner: Arc<InMemoryCas> = Arc::new(InMemoryCas::new());
+        let cas = BloomCas::new(inner.clone(), 1024, 0.01);
+        let (d1, b1) = blob(b"a");
+        let (d2, b2) = blob(b"b");
+        cas.batch_update_blobs(vec![(d1.clone(), b1), (d2.clone(), b2)])
+            .await
+            .unwrap();
+        let listed: std::collections::HashSet<Digest> =
+            cas.list_digests().await.unwrap().into_iter().collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&d1));
+        assert!(listed.contains(&d2));
     }
 }

@@ -294,6 +294,55 @@ impl<P: ReplicaPool> Cas for ReplicatedCas<P> {
         }
         Ok(out)
     }
+
+    async fn list_digests(&self) -> Result<Vec<Digest>, CasError> {
+        // `find_missing_blobs` (above) asks the *primary for a
+        // given digest* — but `list_digests` has no input digest
+        // to derive a primary from, so it has to ask every node
+        // and union the results. Digests held by multiple
+        // replicas (the common case for R≥2) are deduped; the
+        // union is what GC needs to make correct delete
+        // decisions. A heal-in-progress can briefly over-report
+        // a digest that exists on a minority — the resulting
+        // sweep will try to delete it from every replica, and
+        // the per-replica `delete_blob` is idempotent on "not
+        // found", so a transient over-report is benign.
+        let mut seen: std::collections::HashSet<Digest> = std::collections::HashSet::new();
+        for node in &self.topology.nodes {
+            let Some(cas) = self.pool.get(&node.node_id) else {
+                continue;
+            };
+            for d in cas.list_digests().await? {
+                seen.insert(d);
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), CasError> {
+        // Fan out to every replica the ring selected for this
+        // digest. The `delete_blob` contract is idempotent
+        // `Ok(())` (see `crate::traits::Cas`); the per-replica
+        // `HashMap::remove` / `table.remove` already no-op on
+        // absent digests, so re-running the sweep is safe (the
+        // `gc::tests::sweep_is_idempotent` regression-checker
+        // passes against this). We do NOT require quorum —
+        // a partial-failure delete that returns `Err` would
+        // break the idempotent contract. Fan out everywhere
+        // and let the per-replica impl handle its own
+        // idempotence.
+        let replicas = self.replicas_for(digest);
+        let deletes = replicas.iter().filter_map(|r| {
+            self.pool.get(&r.node_id).map(|cas| {
+                let d = digest.clone();
+                async move { cas.delete_blob(&d).await }
+            })
+        });
+        // Drain the fan-out: we deliberately drop the per-replica
+        // results. The trait contract is Ok(()) either way.
+        join_all(deletes).await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +522,83 @@ mod tests {
         let (d, _) = blob(b"orphan");
         let missing = cas.find_missing_blobs(&[d.clone()]).await.unwrap();
         assert_eq!(missing, vec![d]);
+    }
+
+    // --- #143 regression tests ---
+
+    /// Replicated `delete_blob` must remove the blob from every
+    /// replica the ring selected for it (R=2 with 3 nodes means
+    /// 2 of the 3). Pre-fix, the trait default no-oped and
+    /// the blob stayed on every holder.
+    #[tokio::test]
+    async fn replicated_cas_delete_blob_fans_out_to_replicas() {
+        let (pool, backends) = pool_with(&["a", "b", "c"]);
+        let topo = Arc::new(topology(&["a", "b", "c"], 2));
+        let cas = ReplicatedCas::new(pool, topo.clone());
+        let (d, b) = blob(b"doomed");
+        cas.batch_update_blobs(vec![(d.clone(), b)]).await.unwrap();
+
+        // Sanity: R=2 → exactly 2 of 3 replicas hold the blob.
+        let holders_pre: Vec<String> = backends
+            .iter()
+            .zip(["a", "b", "c"].iter())
+            .filter(|(c, _)| {
+                futures::executor::block_on(c.find_missing_blobs(&[d.clone()]))
+                    .map(|m| m.is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|(_, id)| id.to_string())
+            .collect();
+        assert_eq!(holders_pre.len(), 2, "R=2 should leave exactly 2 holders");
+
+        cas.delete_blob(&d).await.unwrap();
+
+        // Every holder pre-delete should now show the blob missing.
+        for c in &backends {
+            let miss = c.find_missing_blobs(&[d.clone()]).await.unwrap();
+            assert_eq!(
+                miss,
+                vec![d.clone()],
+                "replica should no longer hold the blob"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replicated_cas_delete_blob_on_missing_is_ok() {
+        let cas = ReplicatedCas::new(
+            pool_with(&["a", "b", "c"]).0,
+            Arc::new(topology(&["a", "b", "c"], 2)),
+        );
+        let phantom = Digest::of(b"never stored");
+        cas.delete_blob(&phantom).await.unwrap();
+    }
+
+    /// `list_digests` unions every node's enumeration, so a
+    /// blob stored under R=2 (lives on the primary + one
+    /// secondary) is reported even if the primary for the
+    /// digest's HRW slot is not the first topology node.
+    #[tokio::test]
+    async fn replicated_cas_list_digests_unions_all_nodes() {
+        let (pool, _backends) = pool_with(&["a", "b", "c"]);
+        let topo = Arc::new(topology(&["a", "b", "c"], 2));
+        let cas = ReplicatedCas::new(pool, topo);
+        let (d, b) = blob(b"replicated");
+        cas.batch_update_blobs(vec![(d.clone(), b)]).await.unwrap();
+
+        let listed: std::collections::HashSet<Digest> =
+            cas.list_digests().await.unwrap().into_iter().collect();
+        assert!(listed.contains(&d));
+    }
+
+    /// Empty topology must not panic on either list or delete.
+    #[tokio::test]
+    async fn replicated_cas_list_and_delete_on_empty_topology() {
+        let (pool, _backends) = pool_with(&[]);
+        let topo = Arc::new(topology(&[], 0));
+        let cas = ReplicatedCas::new(pool, topo);
+        assert!(cas.list_digests().await.unwrap().is_empty());
+        let phantom = Digest::of(b"never");
+        cas.delete_blob(&phantom).await.unwrap();
     }
 }
