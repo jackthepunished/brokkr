@@ -627,10 +627,12 @@ fn crashed_follower_restarts_and_catches_up() {
     sim.restart(follower);
     sim.advance(Duration::from_secs(2));
     sim.assert_no_divergence();
+    // No-ops (I8b) commit without producing history, so lengths are compared
+    // history-to-history, not history-to-commit-index.
     assert_eq!(
-        sim.committed(follower).len() as u64,
-        sim.nodes[leader].as_ref().unwrap().commit_index().get(),
-        "restarted follower caught up to the leader's commit index"
+        sim.committed(follower),
+        sim.committed(leader),
+        "restarted follower caught up to the leader's applied history"
     );
 }
 
@@ -656,7 +658,9 @@ fn constant_compaction_preserves_history() {
             node.snapshot_meta().is_some(),
             "n{i} compacted at least once under threshold 16"
         );
-        assert_eq!(sim.committed(i).len() as u64, node.commit_index().get());
+        // History equality (not history-vs-commit-index: no-ops commit
+        // without producing output, I8b).
+        assert_eq!(sim.committed(i), sim.committed(0));
     }
 }
 

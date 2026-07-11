@@ -76,6 +76,10 @@ pub struct AppendEntries {
     pub entries: Vec<LogEntry>,
     /// Leader's commit index.
     pub leader_commit: LogIndex,
+    /// Monotonic per-leader sequence number, echoed in the reply (I8b,
+    /// ReadIndex): proves a response answers a request sent after a given
+    /// registration point.
+    pub seq: u64,
 }
 
 /// The reply to an [`AppendEntries`].
@@ -94,6 +98,8 @@ pub struct AppendEntriesResponse {
     /// leader (`prev_log_index + entries.len()`); the leader sets
     /// `matchIndex[follower]` to this. [`LogIndex::ZERO`] on failure.
     pub match_index: LogIndex,
+    /// `seq` of the request this reply answers (I8b, ReadIndex).
+    pub seq: u64,
 }
 
 /// An `InstallSnapshot` call (Raft §7).
@@ -180,6 +186,7 @@ impl From<AppendEntries> for pb::AppendEntriesRequest {
             prev_log_term: r.prev_log_term.get(),
             entries: r.entries.iter().map(pb::LogEntry::from).collect(),
             leader_commit: r.leader_commit.get(),
+            seq: r.seq,
         }
     }
 }
@@ -198,6 +205,7 @@ impl TryFrom<pb::AppendEntriesRequest> for AppendEntries {
                 .map(LogEntry::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
             leader_commit: LogIndex::new(p.leader_commit),
+            seq: p.seq,
         })
     }
 }
@@ -210,6 +218,7 @@ impl From<AppendEntriesResponse> for pb::AppendEntriesReply {
             conflict_term: r.conflict_term.get(),
             conflict_index: r.conflict_index.get(),
             match_index: r.match_index.get(),
+            seq: r.seq,
         }
     }
 }
@@ -222,6 +231,7 @@ impl From<pb::AppendEntriesReply> for AppendEntriesResponse {
             conflict_term: Term::new(p.conflict_term),
             conflict_index: LogIndex::new(p.conflict_index),
             match_index: LogIndex::new(p.match_index),
+            seq: p.seq,
         }
     }
 }
@@ -607,6 +617,7 @@ mod tests {
                 LogEntry::new(Term::new(5), LogIndex::new(9), Bytes::from_static(b"b")),
             ],
             leader_commit: LogIndex::new(7),
+            seq: 7,
         };
         let proto = pb::AppendEntriesRequest::from(ae.clone());
         assert_eq!(proto.entries.len(), 2);
@@ -646,6 +657,7 @@ mod tests {
             conflict_term: Term::new(7),
             conflict_index: LogIndex::new(12),
             match_index: LogIndex::ZERO,
+            seq: 42,
         };
         let proto = pb::AppendEntriesReply::from(resp);
         let back = AppendEntriesResponse::from(proto);
@@ -689,6 +701,7 @@ mod tests {
                 conflict_term: Term::ZERO,
                 conflict_index: req.prev_log_index,
                 match_index: req.prev_log_index,
+                seq: req.seq,
             })
         }
 
@@ -743,6 +756,7 @@ mod tests {
             prev_log_term: Term::new(1),
             entries: vec![],
             leader_commit: LogIndex::new(3),
+            seq: 7,
         };
         let ae_resp = transport.append_entries(&node("peer"), ae).await.unwrap();
         assert!(ae_resp.success);

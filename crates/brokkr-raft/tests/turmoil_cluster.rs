@@ -43,8 +43,33 @@ use turmoil::net::{TcpListener, TcpStream};
 
 use brokkr_raft::{
     Config, NodeId, RaftDriver, RaftHandle, RaftLog, RaftNode, RaftServiceAdapter, Rng,
-    TonicTransport,
+    StateMachine, TonicTransport,
 };
+
+/// Minimal test state machine: applied commands accumulate as a
+/// length-prefixed byte log; snapshot/restore move the raw blob.
+#[derive(Default)]
+struct TestMachine {
+    state: Vec<u8>,
+}
+
+impl StateMachine for TestMachine {
+    fn apply(&mut self, entry: &brokkr_raft::LogEntry) {
+        if let Some(command) = entry.command() {
+            self.state
+                .extend_from_slice(&u32::try_from(command.len()).unwrap().to_le_bytes());
+            self.state.extend_from_slice(command);
+        }
+    }
+
+    fn snapshot(&self) -> Bytes {
+        Bytes::from(self.state.clone())
+    }
+
+    fn restore(&mut self, snapshot: &[u8]) {
+        self.state = snapshot.to_vec();
+    }
+}
 
 const PORT: u16 = 9100;
 const N: usize = 3;
@@ -159,7 +184,12 @@ fn spawn_cluster(sim: &mut turmoil::Sim<'_>, registry: &Registry) {
                     Config::default(),
                     tokio::time::Instant::now().into_std(),
                 )?;
-                let (driver, handle) = RaftDriver::new(node, Arc::new(transport), TICK);
+                let (driver, handle) = RaftDriver::new(
+                    node,
+                    Box::new(TestMachine::default()),
+                    Arc::new(transport),
+                    TICK,
+                );
                 registry.lock().unwrap().insert(host(i), handle.clone());
                 // Surface a driver-loop failure instead of letting it
                 // masquerade as "no leader found" in a later assertion.
@@ -271,7 +301,8 @@ fn grpc_cluster_survives_leader_partition_and_heals() {
         let (leader_name, leader) = await_leader(&reg, &all).await;
         let old_term = leader.status().await?.term;
         leader.propose(Bytes::from_static(b"cmd-1")).await?;
-        await_commit_everywhere(&reg, 1).await;
+        // No-op at 1 (I8b), the command at 2.
+        await_commit_everywhere(&reg, 2).await;
 
         // Cut the leader off from both followers: its heartbeats and any
         // AppendEntries stop crossing the simulated network.
@@ -297,7 +328,7 @@ fn grpc_cluster_survives_leader_partition_and_heals() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(
             leader.status().await?.commit_index.get(),
-            1,
+            2,
             "a minority-partitioned leader cannot advance its commit index"
         );
 
@@ -305,7 +336,8 @@ fn grpc_cluster_survives_leader_partition_and_heals() {
         for follower in &followers {
             turmoil::repair(leader_name.as_str(), follower.as_str());
         }
-        await_commit_everywhere(&reg, 2).await;
+        // New leader's log: no-op@1, cmd-1@2, its own no-op@3, cmd-2@4.
+        await_commit_everywhere(&reg, 4).await;
         let (final_name, _) = await_leader(&reg, &all).await;
         assert_eq!(
             final_name, new_leader_name,
@@ -315,12 +347,12 @@ fn grpc_cluster_survives_leader_partition_and_heals() {
         assert!(!old.is_leader, "the deposed leader steps down");
         assert_eq!(
             old.commit_index.get(),
-            2,
+            4,
             "the deposed leader catches up to the committed log"
         );
         assert_eq!(
             old.last_log_index.get(),
-            2,
+            4,
             "the uncommitted minority entry was overwritten, not kept"
         );
         Ok(())

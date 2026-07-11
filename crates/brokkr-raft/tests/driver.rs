@@ -24,8 +24,33 @@ use bytes::Bytes;
 
 use brokkr_raft::{
     AppendEntries, AppendEntriesResponse, Config, NodeId, RaftDriver, RaftHandle, RaftLog,
-    RaftNode, RaftRpc, RequestVote, RequestVoteResponse, Rng, Transport,
+    RaftNode, RaftRpc, RequestVote, RequestVoteResponse, Rng, StateMachine, Transport,
 };
+
+/// Minimal test state machine: applied commands accumulate as a
+/// length-prefixed byte log; snapshot/restore move the raw blob.
+#[derive(Default)]
+struct TestMachine {
+    state: Vec<u8>,
+}
+
+impl StateMachine for TestMachine {
+    fn apply(&mut self, entry: &brokkr_raft::LogEntry) {
+        if let Some(command) = entry.command() {
+            self.state
+                .extend_from_slice(&u32::try_from(command.len()).unwrap().to_le_bytes());
+            self.state.extend_from_slice(command);
+        }
+    }
+
+    fn snapshot(&self) -> Bytes {
+        Bytes::from(self.state.clone())
+    }
+
+    fn restore(&mut self, snapshot: &[u8]) {
+        self.state = snapshot.to_vec();
+    }
+}
 
 /// The node id for cluster member `i` (nodes are named `n0`, `n1`, …).
 fn node_id(i: usize) -> NodeId {
@@ -140,7 +165,12 @@ fn cluster(n: usize) -> (Fabric, Vec<RaftHandle>, Vec<tempfile::TempDir>) {
             me: ids[i].clone(),
             fabric: fabric.clone(),
         });
-        let (driver, handle) = RaftDriver::new(node, transport, Duration::from_millis(15));
+        let (driver, handle) = RaftDriver::new(
+            node,
+            Box::new(TestMachine::default()),
+            transport,
+            Duration::from_millis(15),
+        );
         fabric.register(ids[i].clone(), handle.clone());
         handles.push(handle);
         dirs.push(dir);
@@ -198,7 +228,13 @@ async fn driver_cluster_elects_a_leader_and_commits() {
 
     let status = handles[leader].status().await.unwrap();
     assert!(status.is_leader);
-    assert_eq!(status.commit_index.get(), 1, "the write committed");
+    // No-op at 1, the proposal at 2 (I8b).
+    assert_eq!(status.commit_index.get(), 2, "the write committed");
+    assert_eq!(
+        status.last_applied.get(),
+        2,
+        "the state machine applied everything committed"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -255,15 +291,15 @@ async fn driver_compacts_and_ships_snapshot_to_partitioned_member() {
     }
     assert_eq!(
         handles[leader].status().await.unwrap().commit_index.get(),
-        5
+        6 // no-op + five writes (I8b)
     );
 
     // Compact the leader (I6): the shell supplies the machine blob.
     let meta = handles[leader]
-        .compact(Bytes::from_static(b"machine@5"))
+        .compact(Bytes::from_static(b"machine@6"))
         .await
         .unwrap();
-    assert_eq!(meta.last_included_index.get(), 5);
+    assert_eq!(meta.last_included_index.get(), 6);
     assert_eq!(
         handles[leader]
             .status()
@@ -273,7 +309,7 @@ async fn driver_compacts_and_ships_snapshot_to_partitioned_member() {
             .unwrap()
             .last_included_index
             .get(),
-        5
+        6
     );
     // Compacting again with nothing new is refused.
     assert!(handles[leader].compact(Bytes::new()).await.is_err());
@@ -283,15 +319,22 @@ async fn driver_compacts_and_ships_snapshot_to_partitioned_member() {
     fabric.heal();
     settle(Duration::from_secs(2)).await;
     let status = handles[lagging].status().await.unwrap();
-    assert_eq!(
-        status.commit_index.get(),
-        5,
-        "caught up to the commit index"
+    // The lagging voter campaigned while partitioned, so the heal may depose
+    // the old leader and a re-election appends another no-op: the commit
+    // index is *at least* the compacted prefix, possibly more.
+    assert!(
+        status.commit_index.get() >= 6,
+        "caught up to the compacted prefix (commit {})",
+        status.commit_index
     );
     assert_eq!(
         status.snapshot.unwrap().last_included_index.get(),
-        5,
+        6,
         "caught up via snapshot, not log replay"
+    );
+    assert_eq!(
+        status.last_applied, status.commit_index,
+        "the machine restored from the shipped snapshot and applied the tail (I8b)"
     );
 }
 
@@ -329,4 +372,62 @@ async fn driver_conf_change_shrinks_the_cluster() {
         .unwrap();
     settle(Duration::from_secs(1)).await;
     assert!(handles[leader].status().await.unwrap().commit_index.get() >= 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn driver_read_index_serves_linearizable_reads() {
+    let (_fabric, handles, _dirs) = cluster(3);
+    settle(Duration::from_secs(2)).await;
+    let leader = leaders(&handles).await[0];
+    handles[leader]
+        .propose(Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    settle(Duration::from_secs(1)).await;
+
+    // The read needs its confirmation heartbeat round to fly while the
+    // paused clock advances, so it runs as its own task.
+    let h = handles[leader].clone();
+    let read = tokio::spawn(async move { h.read_index().await });
+    settle(Duration::from_secs(1)).await;
+    let index = read.await.unwrap().unwrap();
+    assert!(
+        index.get() >= 2,
+        "the read observes at least the no-op and the committed write"
+    );
+    let status = handles[leader].status().await.unwrap();
+    assert!(
+        status.last_applied >= index,
+        "by resolution time the machine has applied up to the read index"
+    );
+
+    // A follower refuses immediately: reads go to the leader.
+    let follower = (0..3).find(|&i| i != leader).unwrap();
+    let err = handles[follower].read_index().await.unwrap_err();
+    assert!(matches!(err, brokkr_raft::RaftError::NotLeader { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn driver_read_index_fails_on_a_deposed_leader() {
+    let (fabric, handles, _dirs) = cluster(3);
+    settle(Duration::from_secs(2)).await;
+    let leader = leaders(&handles).await[0];
+    let others: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
+
+    // Isolate the leader, then ask it for a linearizable read: the
+    // confirmation round can never reach a quorum.
+    fabric.partition(&[&[leader], &others]);
+    let h = handles[leader].clone();
+    let read = tokio::spawn(async move { h.read_index().await });
+    settle(Duration::from_secs(2)).await;
+
+    // Heal: the majority elected a higher term; the old leader is deposed
+    // and must FAIL the read rather than serve stale state.
+    fabric.heal();
+    settle(Duration::from_secs(2)).await;
+    let result = read.await.unwrap();
+    assert!(
+        matches!(result, Err(brokkr_raft::RaftError::NotLeader { .. })),
+        "a deposed leader must not serve a read it could not confirm: {result:?}"
+    );
 }
