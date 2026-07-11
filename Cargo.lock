@@ -239,6 +239,7 @@ dependencies = [
  "brokkr-cas",
  "brokkr-common",
  "brokkr-proto",
+ "brokkr-raft",
  "brokkr-sdk",
  "brokkr-worker",
  "bytes",

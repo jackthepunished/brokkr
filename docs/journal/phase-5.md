@@ -837,3 +837,66 @@ read with apply catch-up, deposed-leader read failure), and
   planned), runs the MetaKv contract suite, and lands the 3-node
   kill-the-leader failover test plus the `--raft` flag (off ⇒ exactly
   today's behavior).
+
+## I8c — `RaftKv` (§17 task 6, completes I8)
+
+- **Date:** 2026-07-10
+- **Affected:** `crates/brokkr-raft` (`driver.rs` `propose_committed` +
+  term-checked apply waiters), `crates/brokkr-cas` (`error.rs`
+  `NotLeader`), `crates/brokkr-control` (`raftkv.rs` new; `metakv.rs`,
+  `services/action_cache.rs`, `main.rs` `--raft`, `lib.rs`;
+  `tests/raft_kv_cluster.rs` new).
+- **Outcome:** the from-scratch Raft carries real control-plane traffic.
+  `RaftKv` satisfies the same `MetaKv` contract as the redb store, writes
+  survive killing the leader, and followers redirect with a structured
+  leader hint. I8's exit criterion holds: `--raft` off is byte-for-byte
+  today's behavior.
+
+### Decisions / notes
+
+- **Write acks mean applied, not appended.** `RaftHandle::propose` resolves
+  on append (unchanged); the new `propose_committed` resolves when the
+  entry is committed *and applied*, so a subsequent leader-local read
+  observes the write. The apply waiter records the proposal's term and
+  verifies it against the entry actually applied at that index: if a new
+  leader truncated and overwrote it, the caller gets `NotLeader` — never a
+  false success. A snapshot-jump over a waiter resolves it as
+  outcome-unknown rather than guessing.
+- **The materialized map is in-memory, and that is correct.** The plan
+  sketched a "redb-backed materialized state machine"; the durable layer is
+  the Raft **log + snapshots** (both redb), and I8b's restore-plus-replay
+  rebuilds the map on restart. A second durable store would just be a cache
+  of the log with its own consistency questions. Deviation noted here per
+  the working rules.
+- **The I8a forcing function fired.** Adding `MetaKvError::NotLeader`
+  broke the exhaustive `From<MetaKvError> for CasError` at compile time —
+  exactly the designed effect — which drove `CasError::NotLeader` and the
+  `ActionCacheService` mapping (gRPC `FAILED_PRECONDITION`, leader identity
+  in `x-brokkr-leader` metadata). The hint carries the leader's node id;
+  I9's peer wiring maps ids to addresses at the service edge.
+- **`--raft` is single-voter in I8c.** It exercises the full write/read
+  path (election, no-op, propose, apply, ReadIndex, snapshots) on one node;
+  peers/failover/bring-up are I9's `--node-id`/`--raft-peer` work. Reads on
+  followers are leader-served in I8c (`NotLeader` redirect) — follower
+  reads at the read index are a possible I9+ optimization, not a
+  correctness need.
+
+### Verified per-crate in WSL2
+
+`brokkr-raft`, `brokkr-cas`, `brokkr-control` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, tests (**98 control lib + all
+integration suites**; new: the `MetaKv` contract suite against `RaftKv`,
+write-visible-to-read, `KvMachine` snapshot round-trip incl. truncated-blob
+tolerance, `cas_status` redirect mapping, and the 3-node cluster tests —
+write → kill leader → linearizable read from the new leader, and
+follower write/read refused with the leader hint), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I9 — HA control plane + the DoD runs** (§17 tasks 7–8): `--node-id` /
+  `--raft-peer id=addr` flags and the `RaftService` server wired into
+  `brokkr-control`, three-process bring-up docs + script, the real-process
+  kill-the-leader test measuring **time-to-new-leader < 2 s** (DoD 1),
+  partition semantics via turmoil (DoD 2), and the **1M-op certification
+  run** with seeds recorded in this journal (DoD 3).
