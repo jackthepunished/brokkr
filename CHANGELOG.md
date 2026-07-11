@@ -1137,6 +1137,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   campaigns deposed the leader of the cluster it had left; a stale minority
   leader still steps down via AppendEntries terms, so liveness holds.
   Driver: `RaftHandle::propose_conf_change` + `DriverStatus.config`.
+- `brokkr-control` `RaftKv` — the Raft-replicated metadata store
+  (milestone I8c, `docs/plan.md` §17 task 6, completes I8): the second
+  `MetaKv` implementation behind the I8a seam. Writes are prost-encoded
+  `KvCommand`s proposed through `brokkr-raft` and acknowledged only once
+  **committed and applied** (the new `RaftHandle::propose_committed`, which
+  verifies the applied entry's term so a proposal overwritten by a new
+  leader resolves `NotLeader`, never a false success); reads run
+  **ReadIndex** and serve from the applied `KvMachine` — linearizable end
+  to end. The materialized state is an in-memory map; durability lives in
+  the redb-backed Raft log + snapshots (restart = restore + tail replay,
+  the I8b recovery path). A follower write/read fails with structured
+  `MetaKvError::NotLeader { leader }` — the I8a exhaustive-`From` forcing
+  function tripped exactly as designed, adding `CasError::NotLeader` and a
+  service mapping to gRPC `FAILED_PRECONDITION` with the leader identity
+  in `x-brokkr-leader` metadata (plan task 7: followers redirect). New
+  `--raft` flag runs a single-voter Raft locally (log in
+  `data_dir/raft.redb`); **off by default ⇒ exactly today's redb
+  behavior** — the plan's I8 exit criterion. The `MetaKv` contract suite
+  now runs against both implementations; a 3-node in-process cluster test
+  writes via the leader, kills it, and linearizably reads the value from
+  the new leader.
 - `brokkr-raft` state-machine apply loop + ReadIndex linearizable reads
   (milestone I8b, `docs/plan.md` §17 task 6): the driver now owns a
   `StateMachine` (`apply` / `snapshot` / `restore`) and feeds it every

@@ -12,6 +12,7 @@ pub mod lease;
 pub mod matching;
 pub mod membership;
 pub mod metakv;
+pub mod raftkv;
 pub mod registry;
 pub mod scheduler;
 pub mod scheduling;
@@ -24,6 +25,7 @@ pub use lease::LeaseTable;
 pub use matching::{eligible_workers, labels_satisfy_platform, worker_satisfies};
 pub use membership::{Membership, MembershipServiceImpl};
 pub use metakv::{MetaKv, MetaKvActionCache, MetaKvError, RedbMetaKv};
+pub use raftkv::{KvMachine, RaftKv};
 pub use registry::{
     HeartbeatPolicy, RegistryError, WorkerCapabilities, WorkerRecord, WorkerRegistry,
 };

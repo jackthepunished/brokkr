@@ -89,6 +89,7 @@ enum Inbound {
     ConfChange(BTreeSet<NodeId>, oneshot::Sender<Result<(), RaftError>>),
     AddLearner(NodeId, oneshot::Sender<Result<(), RaftError>>),
     ReadIndex(oneshot::Sender<Result<LogIndex, RaftError>>),
+    ProposeCommitted(Bytes, oneshot::Sender<Result<LogIndex, RaftError>>),
     Status(oneshot::Sender<DriverStatus>),
 }
 
@@ -152,6 +153,16 @@ impl RaftHandle {
         self.query(Inbound::ReadIndex).await?
     }
 
+    /// Proposes a client command and resolves only once it is **committed
+    /// and applied** to the state machine (I8c) — a subsequent leader-local
+    /// read observes it. Returns the entry's log index. Errors with
+    /// [`RaftError::NotLeader`] on a non-leader, or if leadership is lost
+    /// and the entry is overwritten before committing.
+    pub async fn propose_committed(&self, command: Bytes) -> Result<LogIndex, RaftError> {
+        self.query(|tx| Inbound::ProposeCommitted(command, tx))
+            .await?
+    }
+
     /// Begins a joint-consensus membership change to `new_voters` (I7b).
     /// Resolves once the leader has appended C_old,new; the C_new phase and
     /// any step-down happen automatically as commits advance.
@@ -198,6 +209,22 @@ impl RaftRpc for RaftHandle {
     }
 }
 
+/// Consumes an [`AppliedWaiter`]'s sender inside `retain_mut` (a oneshot
+/// sender must be moved to send; swap in a dummy channel's sender).
+fn take_sender(w: &mut AppliedWaiter) -> oneshot::Sender<Result<LogIndex, RaftError>> {
+    let (dummy, _) = oneshot::channel();
+    std::mem::replace(&mut w.sender, dummy)
+}
+
+/// A caller waiting for the state machine to apply up to `index`.
+struct AppliedWaiter {
+    index: LogIndex,
+    /// `Some(term)` for a committed-proposal ack: the entry applied at
+    /// `index` must carry this term, or the proposal was overwritten.
+    expected_term: Option<Term>,
+    sender: oneshot::Sender<Result<LogIndex, RaftError>>,
+}
+
 /// Runs a [`RaftNode`] as an async task over a [`Transport`], applying
 /// committed entries to a [`StateMachine`] (I8b).
 pub struct RaftDriver<T: Transport> {
@@ -206,8 +233,11 @@ pub struct RaftDriver<T: Transport> {
     /// Highest log index fed to `machine` (P9: never regresses below the
     /// snapshot index).
     last_applied: LogIndex,
-    /// Confirmed reads waiting for `last_applied` to reach their index.
-    reads_awaiting_apply: Vec<(LogIndex, oneshot::Sender<Result<LogIndex, RaftError>>)>,
+    /// Waiters for `last_applied` reaching an index: confirmed reads (no
+    /// term expectation) and committed-proposal acks (the applied entry must
+    /// carry the proposal's term, else leadership changed and the entry was
+    /// overwritten — resolved as `NotLeader`, never as a false success).
+    awaiting_apply: Vec<AppliedWaiter>,
     /// Registered reads waiting for the node to confirm leadership.
     reads_awaiting_confirm:
         std::collections::HashMap<u64, oneshot::Sender<Result<LogIndex, RaftError>>>,
@@ -242,7 +272,7 @@ impl<T: Transport + 'static> RaftDriver<T> {
             node,
             machine,
             last_applied: LogIndex::ZERO,
-            reads_awaiting_apply: Vec::new(),
+            awaiting_apply: Vec::new(),
             reads_awaiting_confirm: std::collections::HashMap::new(),
             transport,
             inbound: inbound_rx,
@@ -330,15 +360,29 @@ impl<T: Transport + 'static> RaftDriver<T> {
     fn post_event(&mut self) -> Result<(), RaftError> {
         // A leader-installed snapshot (I6) jumps state past the log we hold:
         // restore the machine from it instead of replaying (the covered
-        // entries are gone).
+        // entries are gone). Term-checked proposal waiters skipped over by
+        // the jump cannot verify their outcome — fail them rather than
+        // guessing (reads are index-only and stay valid).
         if self.node.snapshot_index() > self.last_applied {
             if let Some((meta, blob)) = self.node.snapshot()? {
                 self.machine.restore(&blob);
                 self.last_applied = meta.last_included_index;
+                let jumped_to = self.last_applied;
+                self.awaiting_apply.retain_mut(|w| {
+                    if w.index <= jumped_to && w.expected_term.is_some() {
+                        let _ = take_sender(w).send(Err(RaftError::Transport(
+                            "proposal outcome unknown: state jumped via snapshot".to_string(),
+                        )));
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
         }
 
-        // Apply the committed tail, in order, exactly once per index.
+        // Apply the committed tail, in order, exactly once per index —
+        // resolving each index's waiters against the entry actually applied.
         while self.last_applied < self.node.commit_index() {
             let next = self.last_applied.next();
             let entry = self.node.log_entry(next)?.ok_or_else(|| {
@@ -346,6 +390,21 @@ impl<T: Transport + 'static> RaftDriver<T> {
             })?;
             self.machine.apply(&entry);
             self.last_applied = next;
+            self.awaiting_apply.retain_mut(|w| {
+                if w.index != next {
+                    return true;
+                }
+                let result = match w.expected_term {
+                    // A committed-proposal ack: the applied entry must be
+                    // OUR entry; a different term means it was overwritten.
+                    Some(expected) if entry.term != expected => {
+                        Err(RaftError::NotLeader { leader: None })
+                    }
+                    _ => Ok(next),
+                };
+                let _ = take_sender(w).send(result);
+                false
+            });
         }
 
         // Auto-compaction (I8b): once the committed log outgrows the
@@ -356,7 +415,7 @@ impl<T: Transport + 'static> RaftDriver<T> {
         }
 
         // Settle reads: confirmations (or leadership-loss failures) from the
-        // node, then any confirmed reads whose index is now applied.
+        // node, then any confirmed reads whose index is already applied.
         for (ticket, result) in self.node.drain_read_results() {
             let Some(sender) = self.reads_awaiting_confirm.remove(&ticket) else {
                 continue; // caller gave up (dropped receiver)
@@ -365,25 +424,16 @@ impl<T: Transport + 'static> RaftDriver<T> {
                 Ok(index) if index <= self.last_applied => {
                     let _ = sender.send(Ok(index));
                 }
-                Ok(index) => self.reads_awaiting_apply.push((index, sender)),
+                Ok(index) => self.awaiting_apply.push(AppliedWaiter {
+                    index,
+                    expected_term: None,
+                    sender,
+                }),
                 Err(e) => {
                     let _ = sender.send(Err(e));
                 }
             }
         }
-        let applied = self.last_applied;
-        self.reads_awaiting_apply.retain_mut(|(index, sender)| {
-            if *index <= applied {
-                // `retain_mut` gives &mut; a oneshot sender must be consumed,
-                // so swap in a dummy channel's sender.
-                let (dummy, _) = oneshot::channel();
-                let sender = std::mem::replace(sender, dummy);
-                let _ = sender.send(Ok(*index));
-                false
-            } else {
-                true
-            }
-        });
         Ok(())
     }
 
@@ -445,6 +495,25 @@ impl<T: Transport + 'static> RaftDriver<T> {
                     let _ = reply.send(Err(e));
                 }
             },
+            Inbound::ProposeCommitted(command, reply) => {
+                match self.node.propose(command, now) {
+                    Ok(outs) => {
+                        // Single-writer loop: the entry we just appended is
+                        // the last log index, at the current term.
+                        let index = self.node.last_log_index()?;
+                        let term = self.node.current_term();
+                        self.awaiting_apply.push(AppliedWaiter {
+                            index,
+                            expected_term: Some(term),
+                            sender: reply,
+                        });
+                        self.dispatch(outs);
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
             Inbound::Status(reply) => {
                 let status = DriverStatus {
                     is_leader: self.node.is_leader(),

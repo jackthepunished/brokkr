@@ -98,6 +98,16 @@ struct Args {
     /// combination; see [`Args::validate_auth_flags`].
     #[arg(long, default_value_t = false)]
     single_port: bool,
+
+    /// EXPERIMENTAL (Phase 5 I8c): replicate control-plane metadata (the
+    /// action cache; cluster config to follow) through the embedded
+    /// from-scratch Raft instead of plain redb. Runs a single-voter Raft on
+    /// this node — writes are committed-and-applied log entries, reads are
+    /// ReadIndex-linearizable, and the log + snapshots live in
+    /// `data_dir/raft.redb`. Multi-node HA (peers, failover) arrives with
+    /// I9. Off by default: exactly the single-node redb behavior.
+    #[arg(long, default_value_t = false)]
+    raft: bool,
 }
 
 impl Args {
@@ -317,10 +327,48 @@ async fn main() -> Result<()> {
     // action cache lives in `meta.redb` under the `ac/` namespace. Swapping
     // `RedbMetaKv` for `RaftKv` (I8c) is what makes this state survive a
     // leader kill; nothing downstream of the trait changes.
-    let meta_kv = Arc::new(
-        RedbMetaKv::open(args.data_dir.join("meta.redb")).context("opening metadata database")?,
-    );
-    let action_cache = Arc::new(MetaKvActionCache::new(meta_kv));
+    let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
+        // I8c: a single-voter Raft replicates the metadata locally. The
+        // materialized map is rebuilt from the redb-backed log + snapshots
+        // on restart (restore + tail replay); leadership is immediate after
+        // one election timeout.
+        let raft_log = brokkr_raft::RaftLog::open(args.data_dir.join("raft.redb"))
+            .map_err(|e| anyhow::anyhow!("opening raft log: {e}"))?;
+        let node_id = brokkr_raft::NodeId::new("control-0")
+            .map_err(|e| anyhow::anyhow!("raft node id: {e}"))?;
+        let node = brokkr_raft::RaftNode::new(
+            node_id,
+            Vec::new(),
+            raft_log,
+            brokkr_raft::Rng::seed_from_u64(0),
+            brokkr_raft::Config::default(),
+            std::time::Instant::now(),
+        )
+        .map_err(|e| anyhow::anyhow!("initializing raft node: {e}"))?;
+        let machine = brokkr_control::KvMachine::default();
+        let shared = machine.shared();
+        let (driver, handle) = brokkr_raft::RaftDriver::new(
+            node,
+            Box::new(machine),
+            Arc::new(brokkr_raft::TonicTransport::new()),
+            Duration::from_millis(50),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = driver.run().await {
+                tracing::error!(error = %e, "raft driver exited");
+            }
+        });
+        tracing::warn!("METADATA VIA RAFT (single-voter, I8c) — experimental");
+        Arc::new(MetaKvActionCache::new(Arc::new(
+            brokkr_control::RaftKv::new(handle, shared),
+        )))
+    } else {
+        let meta_kv = Arc::new(
+            RedbMetaKv::open(args.data_dir.join("meta.redb"))
+                .context("opening metadata database")?,
+        );
+        Arc::new(MetaKvActionCache::new(meta_kv))
+    };
     // Pre-I8 deployments kept the action cache in its own database. It is no
     // longer read — say so, out loud, instead of leaving operators to wonder
     // which redb file is live (and to explain the post-upgrade cold cache).

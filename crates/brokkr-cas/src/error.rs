@@ -34,6 +34,15 @@ pub enum CasError {
         /// The configured concurrency limit that was exceeded.
         limit: usize,
     },
+
+    /// The write reached a metadata replica that is not the Raft leader
+    /// (Phase 5 I8c). Carries the leader's identity when known so the
+    /// service layer can redirect the caller instead of failing hard.
+    #[error("not the metadata leader (leader hint: {leader:?})")]
+    NotLeader {
+        /// The current leader, if known.
+        leader: Option<String>,
+    },
 }
 
 impl From<redb::Error> for CasError {
