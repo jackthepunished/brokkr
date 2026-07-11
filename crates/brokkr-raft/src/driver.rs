@@ -37,7 +37,27 @@ use crate::transport::{
     AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, RaftRpc,
     RequestVote, RequestVoteResponse, Transport,
 };
-use crate::types::{ClusterConfig, LogIndex, NodeId, SnapshotMeta, Term};
+use crate::types::{ClusterConfig, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+
+/// The replicated state machine the shell applies committed entries to
+/// (I8b, plan §17 task 6). `brokkr-raft` stays payload-agnostic: the driver
+/// feeds **every** committed entry through [`StateMachine::apply`] in log
+/// order (implementations typically ignore `Noop` and `Config` payloads),
+/// asks for a serialized snapshot when the log outgrows the compaction
+/// threshold, and restores from a snapshot blob at startup or when the
+/// leader installs one.
+pub trait StateMachine: Send + 'static {
+    /// Applies one committed entry. Called exactly once per index, in order.
+    fn apply(&mut self, entry: &LogEntry);
+
+    /// Serializes the current state — everything applied so far. Used as the
+    /// snapshot blob (I6): restoring it and replaying the log tail must
+    /// reproduce this exact state (P9).
+    fn snapshot(&self) -> Bytes;
+
+    /// Replaces the current state with a deserialized snapshot blob.
+    fn restore(&mut self, snapshot: &[u8]);
+}
 
 /// A point-in-time snapshot of a driver's node state, for observability/tests.
 #[derive(Debug, Clone)]
@@ -48,6 +68,8 @@ pub struct DriverStatus {
     pub term: Term,
     /// The node's commit index.
     pub commit_index: LogIndex,
+    /// The highest index applied to the state machine (I8b).
+    pub last_applied: LogIndex,
     /// The node's last log index.
     pub last_log_index: LogIndex,
     /// The leader the node currently recognizes, if any.
@@ -66,6 +88,7 @@ enum Inbound {
     Compact(Bytes, oneshot::Sender<Result<SnapshotMeta, RaftError>>),
     ConfChange(BTreeSet<NodeId>, oneshot::Sender<Result<(), RaftError>>),
     AddLearner(NodeId, oneshot::Sender<Result<(), RaftError>>),
+    ReadIndex(oneshot::Sender<Result<LogIndex, RaftError>>),
     Status(oneshot::Sender<DriverStatus>),
 }
 
@@ -111,11 +134,22 @@ impl RaftHandle {
 
     /// Compacts the node's committed log prefix into a snapshot whose opaque
     /// blob is `data` — the state machine's serialized state at the node's
-    /// current commit index (I6). The shell calls this when the committed log
-    /// outgrows the snapshot threshold; for I8's KV it is wired to the state
-    /// machine's `snapshot()` callback.
+    /// current commit index (I6). Compaction also happens automatically once
+    /// the committed log outgrows `Config::snapshot_threshold` (I8b), using
+    /// [`StateMachine::snapshot`]; this manual entry point remains for tests
+    /// and operational tooling. `data` must describe the fully-applied state.
     pub async fn compact(&self, data: Bytes) -> Result<SnapshotMeta, RaftError> {
         self.query(|tx| Inbound::Compact(data, tx)).await?
+    }
+
+    /// Performs the ReadIndex protocol (I8b): confirms this node is still the
+    /// leader with a quorum round, then resolves with an index such that any
+    /// state-machine read served **after** this call returns linearizable
+    /// data — the driver has applied at least up to the returned index.
+    /// Errors with [`RaftError::NotLeader`] on a non-leader or if leadership
+    /// is lost during confirmation.
+    pub async fn read_index(&self) -> Result<LogIndex, RaftError> {
+        self.query(Inbound::ReadIndex).await?
     }
 
     /// Begins a joint-consensus membership change to `new_voters` (I7b).
@@ -164,9 +198,19 @@ impl RaftRpc for RaftHandle {
     }
 }
 
-/// Runs a [`RaftNode`] as an async task over a [`Transport`].
+/// Runs a [`RaftNode`] as an async task over a [`Transport`], applying
+/// committed entries to a [`StateMachine`] (I8b).
 pub struct RaftDriver<T: Transport> {
     node: RaftNode,
+    machine: Box<dyn StateMachine>,
+    /// Highest log index fed to `machine` (P9: never regresses below the
+    /// snapshot index).
+    last_applied: LogIndex,
+    /// Confirmed reads waiting for `last_applied` to reach their index.
+    reads_awaiting_apply: Vec<(LogIndex, oneshot::Sender<Result<LogIndex, RaftError>>)>,
+    /// Registered reads waiting for the node to confirm leadership.
+    reads_awaiting_confirm:
+        std::collections::HashMap<u64, oneshot::Sender<Result<LogIndex, RaftError>>>,
     transport: Arc<T>,
     inbound: mpsc::Receiver<Inbound>,
     proposals: mpsc::Receiver<Proposal>,
@@ -176,11 +220,17 @@ pub struct RaftDriver<T: Transport> {
 }
 
 impl<T: Transport + 'static> RaftDriver<T> {
-    /// Creates a driver for `node` that reaches peers via `transport`, ticking
-    /// every `tick_period` of (possibly simulated) time. Returns the driver
-    /// (call [`RaftDriver::run`] on its own task) and a [`RaftHandle`] to drive
-    /// it. `tick_period` should be well below the election timeout.
-    pub fn new(node: RaftNode, transport: Arc<T>, tick_period: Duration) -> (Self, RaftHandle) {
+    /// Creates a driver for `node` that applies committed entries to
+    /// `machine` and reaches peers via `transport`, ticking every
+    /// `tick_period` of (possibly simulated) time. Returns the driver (call
+    /// [`RaftDriver::run`] on its own task) and a [`RaftHandle`] to drive it.
+    /// `tick_period` should be well below the election timeout.
+    pub fn new(
+        node: RaftNode,
+        machine: Box<dyn StateMachine>,
+        transport: Arc<T>,
+        tick_period: Duration,
+    ) -> (Self, RaftHandle) {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         let (proposal_tx, proposal_rx) = mpsc::channel(256);
         let (peer_reply_tx, peer_reply_rx) = mpsc::unbounded_channel();
@@ -190,6 +240,10 @@ impl<T: Transport + 'static> RaftDriver<T> {
         };
         let driver = RaftDriver {
             node,
+            machine,
+            last_applied: LogIndex::ZERO,
+            reads_awaiting_apply: Vec::new(),
+            reads_awaiting_confirm: std::collections::HashMap::new(),
             transport,
             inbound: inbound_rx,
             proposals: proposal_rx,
@@ -211,6 +265,15 @@ impl<T: Transport + 'static> RaftDriver<T> {
     pub async fn run(mut self) -> Result<(), RaftError> {
         let span = tracing::info_span!("raft_driver", node = %self.node.id());
         async move {
+            // Startup restore (I8b): the state machine resumes from the
+            // snapshot, then the committed log tail replays through the
+            // ordinary apply path below (P9).
+            if let Some((meta, blob)) = self.node.snapshot()? {
+                self.machine.restore(&blob);
+                self.last_applied = meta.last_included_index;
+            }
+            self.post_event()?;
+
             let mut ticker = tokio::time::interval(self.tick_period);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -251,11 +314,77 @@ impl<T: Transport + 'static> RaftDriver<T> {
                         self.dispatch(outs);
                     }
                 }
+                // Every arm may have moved the commit index, installed a
+                // snapshot, or resolved/failed a pending read.
+                self.post_event()?;
             }
             Ok(())
         }
         .instrument(span)
         .await
+    }
+
+    /// The I8b bookkeeping run after every node interaction: restore from a
+    /// freshly installed snapshot, apply newly committed entries, auto-compact
+    /// past the threshold, and settle linearizable reads.
+    fn post_event(&mut self) -> Result<(), RaftError> {
+        // A leader-installed snapshot (I6) jumps state past the log we hold:
+        // restore the machine from it instead of replaying (the covered
+        // entries are gone).
+        if self.node.snapshot_index() > self.last_applied {
+            if let Some((meta, blob)) = self.node.snapshot()? {
+                self.machine.restore(&blob);
+                self.last_applied = meta.last_included_index;
+            }
+        }
+
+        // Apply the committed tail, in order, exactly once per index.
+        while self.last_applied < self.node.commit_index() {
+            let next = self.last_applied.next();
+            let entry = self.node.log_entry(next)?.ok_or_else(|| {
+                RaftError::Storage(format!("committed entry {next} missing from the log"))
+            })?;
+            self.machine.apply(&entry);
+            self.last_applied = next;
+        }
+
+        // Auto-compaction (I8b): once the committed log outgrows the
+        // threshold, snapshot the fully-applied machine. `last_applied ==
+        // commit_index` here, which is exactly the basis `compact` uses.
+        if self.node.needs_snapshot() {
+            self.node.compact(self.machine.snapshot())?;
+        }
+
+        // Settle reads: confirmations (or leadership-loss failures) from the
+        // node, then any confirmed reads whose index is now applied.
+        for (ticket, result) in self.node.drain_read_results() {
+            let Some(sender) = self.reads_awaiting_confirm.remove(&ticket) else {
+                continue; // caller gave up (dropped receiver)
+            };
+            match result {
+                Ok(index) if index <= self.last_applied => {
+                    let _ = sender.send(Ok(index));
+                }
+                Ok(index) => self.reads_awaiting_apply.push((index, sender)),
+                Err(e) => {
+                    let _ = sender.send(Err(e));
+                }
+            }
+        }
+        let applied = self.last_applied;
+        self.reads_awaiting_apply.retain_mut(|(index, sender)| {
+            if *index <= applied {
+                // `retain_mut` gives &mut; a oneshot sender must be consumed,
+                // so swap in a dummy channel's sender.
+                let (dummy, _) = oneshot::channel();
+                let sender = std::mem::replace(sender, dummy);
+                let _ = sender.send(Ok(*index));
+                false
+            } else {
+                true
+            }
+        });
+        Ok(())
     }
 
     fn handle_inbound(&mut self, msg: Inbound) -> Result<(), RaftError> {
@@ -307,11 +436,21 @@ impl<T: Transport + 'static> RaftDriver<T> {
                     let _ = reply.send(Err(e));
                 }
             },
+            Inbound::ReadIndex(reply) => match self.node.start_read(now) {
+                Ok((ticket, outs)) => {
+                    self.reads_awaiting_confirm.insert(ticket, reply);
+                    self.dispatch(outs);
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
             Inbound::Status(reply) => {
                 let status = DriverStatus {
                     is_leader: self.node.is_leader(),
                     term: self.node.current_term(),
                     commit_index: self.node.commit_index(),
+                    last_applied: self.last_applied,
                     last_log_index: self.node.last_log_index()?,
                     leader: self.node.leader_id().cloned(),
                     snapshot: self.node.snapshot_meta(),

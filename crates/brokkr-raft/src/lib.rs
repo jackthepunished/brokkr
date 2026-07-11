@@ -51,7 +51,7 @@ pub mod storage;
 pub mod transport;
 pub mod types;
 
-pub use driver::{DriverStatus, RaftDriver, RaftHandle};
+pub use driver::{DriverStatus, RaftDriver, RaftHandle, StateMachine};
 pub use error::RaftError;
 pub use node::{Config, Outbound, RaftNode};
 pub use rng::Rng;

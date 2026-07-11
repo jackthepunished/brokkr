@@ -87,6 +87,11 @@ message AppendEntriesRequest {
   repeated LogEntry entries = 5;
   // Leader's commitIndex.
   uint64 leader_commit = 6;
+  // Monotonic per-leader sequence number, echoed verbatim in the reply
+  // (I8b, ReadIndex). Lets the leader prove a response answers a request
+  // sent *after* a given moment — a delayed reply to an older request
+  // cannot confirm current leadership for a linearizable read.
+  uint64 seq = 7;
 }
 
 message AppendEntriesReply {
@@ -104,6 +109,8 @@ message AppendEntriesReply {
   // match the leader (prev_log_index + len(entries)). The leader sets
   // matchIndex[follower] to this. Zero on failure.
   uint64 match_index = 5;
+  // `seq` of the request this reply answers (I8b, ReadIndex).
+  uint64 seq = 6;
 }
 
 // InstallSnapshot (Raft §7). Sent by the leader to a follower that has fallen so

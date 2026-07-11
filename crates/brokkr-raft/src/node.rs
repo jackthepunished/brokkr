@@ -74,6 +74,21 @@ impl Default for Config {
     }
 }
 
+/// A linearizable read waiting for leadership confirmation (I8b, ReadIndex).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRead {
+    /// Caller-visible ticket, matched by the driver to a waiting client.
+    id: u64,
+    /// The index the read must observe: `max(commit_index, term_start_index)`
+    /// at registration — the linearization point.
+    read_index: LogIndex,
+    /// Only responses to requests with `seq >= confirm_seq` prove leadership
+    /// *after* registration; older in-flight replies cannot confirm.
+    confirm_seq: u64,
+    /// Voters that have acked a post-registration request (self included).
+    acks: BTreeSet<NodeId>,
+}
+
 /// Per-peer replication bookkeeping a leader keeps (`docs/raft-notes.md` §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeaderState {
@@ -83,6 +98,15 @@ struct LeaderState {
     /// For each peer, the highest index known to be replicated on it (truth;
     /// monotonic, initialized to 0).
     match_index: BTreeMap<NodeId, LogIndex>,
+    /// Monotonic sequence stamped on every outbound `AppendEntries` and echoed
+    /// in its reply (I8b): lets ReadIndex distinguish post-registration acks.
+    ae_seq: u64,
+    /// The index of this leader's start-of-term no-op. ReadIndex is safe only
+    /// once an entry of the current term is committed (`docs/raft-notes.md`
+    /// §8 / paper §8); reads never resolve below this.
+    term_start_index: LogIndex,
+    /// Reads awaiting a post-registration quorum of acks.
+    pending_reads: Vec<PendingRead>,
 }
 
 /// The server's current role (`docs/raft-notes.md` §2.1).
@@ -244,6 +268,12 @@ pub struct RaftNode {
     election_deadline: Instant,
     /// When, if a leader, this node will next emit heartbeats.
     heartbeat_deadline: Instant,
+    /// Ticket counter for [`RaftNode::start_read`] (I8b, ReadIndex).
+    read_seq: u64,
+    /// Resolved reads awaiting pickup by the shell: `(ticket, read index)` on
+    /// confirmation, or the error when leadership was lost first. Drained via
+    /// [`RaftNode::drain_read_results`].
+    read_results: Vec<(u64, Result<LogIndex, RaftError>)>,
 }
 
 impl RaftNode {
@@ -339,6 +369,8 @@ impl RaftNode {
             config,
             election_deadline: now,
             heartbeat_deadline: now,
+            read_seq: 0,
+            read_results: Vec::new(),
         };
         node.arm_election_timer(now);
         Ok(node)
@@ -426,7 +458,7 @@ impl RaftNode {
     }
 
     /// The index of the last entry the current snapshot covers (ZERO if none).
-    fn snapshot_index(&self) -> LogIndex {
+    pub(crate) fn snapshot_index(&self) -> LogIndex {
         self.snapshot
             .as_ref()
             .map(|m| m.last_included_index)
@@ -527,13 +559,26 @@ impl RaftNode {
 
     // --- term handling ----------------------------------------------------
 
+    /// Reverts to follower. Any linearizable reads still awaiting leadership
+    /// confirmation fail with [`RaftError::NotLeader`] (I8b) — a read must
+    /// never resolve against a leader that could not prove it still is one.
+    fn step_down_to_follower(&mut self) {
+        if let Role::Leader(state) = &mut self.role {
+            for read in state.pending_reads.drain(..) {
+                self.read_results
+                    .push((read.id, Err(RaftError::NotLeader { leader: None })));
+            }
+        }
+        self.role = Role::Follower;
+    }
+
     /// The universal rule (`docs/raft-notes.md` §2.2): if `term` exceeds our
     /// own, adopt it, revert to follower, and clear the vote — persisting the
     /// new hard state. Returns whether a step-down occurred.
     fn observe_term(&mut self, term: Term, now: Instant) -> Result<bool, RaftError> {
         if term > self.hard.current_term {
             self.hard = self.hard.stepped_to(term);
-            self.role = Role::Follower;
+            self.step_down_to_follower();
             self.leader_id = None;
             self.log.save_hard_state(&self.hard)?;
             // Re-arm the election timer. A node that just stepped down is a fresh
@@ -599,49 +644,65 @@ impl RaftNode {
             next_index.insert(peer.clone(), last.next());
             match_index.insert(peer, LogIndex::ZERO);
         }
+        // The start-of-term no-op (I8b, paper §8 / `docs/raft-notes.md` §7):
+        // committing an entry of our *own* term is what lets the commit rule
+        // sweep in inherited entries (Figure 8) without waiting for client
+        // traffic — and ReadIndex is safe only after it commits, so reads
+        // never resolve below `term_start_index`.
+        let noop_index = last.next();
+        let noop = LogEntry::with_payload(self.hard.current_term, noop_index, EntryPayload::Noop);
+        self.log.append(&noop)?;
         self.role = Role::Leader(LeaderState {
             next_index,
             match_index,
+            ae_seq: 0,
+            term_start_index: noop_index,
+            pending_reads: Vec::new(),
         });
         self.leader_id = Some(self.id.clone());
         self.arm_heartbeat_timer(now);
-        // NOTE: Raft recommends appending a no-op entry here so the leader can
-        // commit and learn its commit index for its term (docs/raft-notes.md §7,
-        // §11). It is a read-safety / commit-latency optimization, not required
-        // for replication *safety*; it is deferred to the linearizable-read work
-        // (I8/read path). Until then a fresh leader commits its inherited entries
-        // once a client `propose` provides a current-term entry that reaches a
-        // majority — which is exactly the Figure-8 current-term commit rule.
-        self.replicate_all()
+        // A cluster whose quorum this node satisfies alone commits the no-op
+        // immediately (and may trigger config follow-ups).
+        let mut outs = self.advance_commit_index(now)?;
+        outs.extend(self.replicate_all()?);
+        Ok(outs)
     }
 
     /// Builds an `AppendEntries` for every replication target starting at its
-    /// `nextIndex`. An up-to-date peer receives an empty (heartbeat) request.
-    fn replicate_all(&self) -> Result<Vec<Outbound>, RaftError> {
-        let Role::Leader(state) = &self.role else {
-            return Ok(Vec::new());
-        };
+    /// `nextIndex`, each stamped with a fresh `seq`. An up-to-date peer
+    /// receives an empty (heartbeat) request.
+    fn replicate_all(&mut self) -> Result<Vec<Outbound>, RaftError> {
         let targets = self.replication_targets();
-        let mut out = Vec::with_capacity(targets.len());
-        for peer in &targets {
-            out.push(self.append_entries_for(peer, state)?);
+        let mut plans = Vec::with_capacity(targets.len());
+        {
+            let Role::Leader(state) = &mut self.role else {
+                return Ok(Vec::new());
+            };
+            for peer in targets {
+                let next = state
+                    .next_index
+                    .get(&peer)
+                    .copied()
+                    .unwrap_or_else(|| LogIndex::new(1));
+                state.ae_seq += 1;
+                plans.push((peer, next, state.ae_seq));
+            }
         }
-        Ok(out)
+        plans
+            .into_iter()
+            .map(|(peer, next, seq)| self.append_entries_for(&peer, next, seq))
+            .collect()
     }
 
-    /// Builds the `AppendEntries` to send `peer` given the leader `state` — or
-    /// an `InstallSnapshot` (I6, Raft §7) when the entries the peer needs were
-    /// compacted away (`nextIndex <= snapshot.last_included_index`).
+    /// Builds the `AppendEntries` to send `peer` from `next` — or an
+    /// `InstallSnapshot` (I6, Raft §7) when the entries the peer needs were
+    /// compacted away (`next <= snapshot.last_included_index`).
     fn append_entries_for(
         &self,
         peer: &NodeId,
-        state: &LeaderState,
+        next: LogIndex,
+        seq: u64,
     ) -> Result<Outbound, RaftError> {
-        let next = state
-            .next_index
-            .get(peer)
-            .copied()
-            .unwrap_or_else(|| LogIndex::new(1));
         if next <= self.snapshot_index() {
             let (meta, data) = self.log.snapshot()?.ok_or_else(|| {
                 RaftError::Snapshot("snapshot metadata cached but blob missing".to_string())
@@ -679,17 +740,27 @@ impl RaftNode {
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
+                seq,
             },
         })
     }
 
     /// Rebuilds the `AppendEntries` for a single peer (after its `nextIndex`
     /// moved on a success or a back-off).
-    fn replicate_to(&self, peer: &NodeId) -> Result<Vec<Outbound>, RaftError> {
-        let Role::Leader(state) = &self.role else {
-            return Ok(Vec::new());
+    fn replicate_to(&mut self, peer: &NodeId) -> Result<Vec<Outbound>, RaftError> {
+        let plan = {
+            let Role::Leader(state) = &mut self.role else {
+                return Ok(Vec::new());
+            };
+            let next = state
+                .next_index
+                .get(peer)
+                .copied()
+                .unwrap_or_else(|| LogIndex::new(1));
+            state.ae_seq += 1;
+            (next, state.ae_seq)
         };
-        Ok(vec![self.append_entries_for(peer, state)?])
+        Ok(vec![self.append_entries_for(peer, plan.0, plan.1)?])
     }
 
     /// Aligns the leader's per-peer bookkeeping with the active configuration
@@ -854,12 +925,12 @@ impl RaftNode {
 
         // Step 1: reject a stale leader.
         if request.term < term {
-            return Ok(Self::reject(term));
+            return Ok(Self::reject(term, request.seq));
         }
 
         // Valid leader for this term: accept its authority, step down if we were
         // campaigning, and suppress our own election timer.
-        self.role = Role::Follower;
+        self.step_down_to_follower();
         self.leader_id = Some(request.leader_id.clone());
         self.last_leader_contact = Some(now);
         self.arm_election_timer(now);
@@ -874,6 +945,7 @@ impl RaftNode {
                 conflict_term,
                 conflict_index,
                 match_index: LogIndex::ZERO,
+                seq: request.seq,
             });
         }
 
@@ -895,16 +967,18 @@ impl RaftNode {
             conflict_term: Term::ZERO,
             conflict_index: LogIndex::ZERO,
             match_index,
+            seq: request.seq,
         })
     }
 
-    fn reject(term: Term) -> AppendEntriesResponse {
+    fn reject(term: Term, seq: u64) -> AppendEntriesResponse {
         AppendEntriesResponse {
             term,
             success: false,
             conflict_term: Term::ZERO,
             conflict_index: LogIndex::ZERO,
             match_index: LogIndex::ZERO,
+            seq,
         }
     }
 
@@ -1014,6 +1088,12 @@ impl RaftNode {
             return Ok(Vec::new());
         }
 
+        // Any term-current response — success or log-mismatch — proves the
+        // peer accepted our leadership when it answered; that is what a
+        // pending ReadIndex needs (I8b), and the echoed `seq` proves the
+        // answer postdates the read's registration.
+        self.note_leadership_ack(&from, response.seq);
+
         if response.success {
             self.record_match(&from, response.match_index);
             let mut outs = self.advance_commit_index(now)?;
@@ -1025,6 +1105,29 @@ impl RaftNode {
             self.back_off(&from, response.conflict_index);
             self.replicate_to(&from)
         }
+    }
+
+    /// Credits `from`'s reply (to the request stamped `seq`) against every
+    /// pending read it can confirm, resolving those whose ack set now reaches
+    /// the active configuration's quorum (I8b, ReadIndex).
+    fn note_leadership_ack(&mut self, from: &NodeId, seq: u64) {
+        let active = self.configs.active().clone();
+        let Role::Leader(state) = &mut self.role else {
+            return;
+        };
+        let mut ready = Vec::new();
+        state.pending_reads.retain_mut(|read| {
+            if seq >= read.confirm_seq {
+                read.acks.insert(from.clone());
+            }
+            if active.has_quorum(&read.acks) {
+                ready.push((read.id, Ok(read.read_index)));
+                false
+            } else {
+                true
+            }
+        });
+        self.read_results.extend(ready);
     }
 
     fn record_match(&mut self, peer: &NodeId, match_index: LogIndex) {
@@ -1131,7 +1234,7 @@ impl RaftNode {
         }
         if !active.voters.contains(&self.id) {
             // A committed C_new excludes us: our job is done; step down.
-            self.role = Role::Follower;
+            self.step_down_to_follower();
             self.leader_id = None;
             self.arm_election_timer(now);
         }
@@ -1194,7 +1297,7 @@ impl RaftNode {
         }
 
         // A valid leader for this term, exactly as in `handle_append_entries`.
-        self.role = Role::Follower;
+        self.step_down_to_follower();
         self.leader_id = Some(request.leader_id.clone());
         self.last_leader_contact = Some(now);
         self.arm_election_timer(now);
@@ -1318,6 +1421,63 @@ impl RaftNode {
         let mut outs = self.advance_commit_index(now)?;
         outs.extend(self.replicate_all()?);
         Ok(outs)
+    }
+
+    /// Registers a **linearizable read** (I8b, ReadIndex — `docs/raft-notes.md`
+    /// §8, thesis §6.4) and returns its ticket plus the heartbeat round that
+    /// confirms leadership. The read's index is
+    /// `max(commit_index, term_start_index)` at registration — never below the
+    /// start-of-term no-op, so it always covers an entry of the current term.
+    ///
+    /// The ticket resolves through [`RaftNode::drain_read_results`]: with the
+    /// confirmed index once a quorum answers a *post-registration* request
+    /// (proven by the echoed `seq`), or with [`RaftError::NotLeader`] if
+    /// leadership is lost first. The shell then waits until it has applied up
+    /// to that index before serving the read.
+    pub fn start_read(&mut self, _now: Instant) -> Result<(u64, Vec<Outbound>), RaftError> {
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader: self.leader_id.as_ref().map(|l| l.to_string()),
+            });
+        }
+        self.read_seq += 1;
+        let id = self.read_seq;
+
+        let self_is_quorum = {
+            let mut just_us = BTreeSet::new();
+            just_us.insert(self.id.clone());
+            self.configs.active().has_quorum(&just_us)
+        };
+        let read_index = {
+            let Role::Leader(state) = &mut self.role else {
+                unreachable!("checked is_leader above");
+            };
+            let read_index = state.term_start_index.max(self.commit_index);
+            if !self_is_quorum {
+                state.pending_reads.push(PendingRead {
+                    id,
+                    read_index,
+                    confirm_seq: state.ae_seq + 1,
+                    acks: BTreeSet::from([self.id.clone()]),
+                });
+            }
+            read_index
+        };
+        if self_is_quorum {
+            // A single-voter quorum needs no confirmation round.
+            self.read_results.push((id, Ok(read_index)));
+            return Ok((id, Vec::new()));
+        }
+        // A fresh round whose seqs are all >= confirm_seq.
+        let outs = self.replicate_all()?;
+        Ok((id, outs))
+    }
+
+    /// Drains resolved linearizable reads: `(ticket, Ok(read index))` once a
+    /// post-registration quorum confirmed leadership, or `Err(NotLeader)` if
+    /// it was lost first. The shell polls this after every node interaction.
+    pub fn drain_read_results(&mut self) -> Vec<(u64, Result<LogIndex, RaftError>)> {
+        std::mem::take(&mut self.read_results)
     }
 
     /// Begins a joint-consensus membership change to `new_voters` (I7b, Raft
@@ -1656,6 +1816,10 @@ mod tests {
             Cluster { _dirs: dirs, nodes }
         }
 
+        fn idx(&self, id: &NodeId) -> usize {
+            self.nodes.iter().position(|n| n.id() == id).unwrap()
+        }
+
         fn leaders(&self) -> Vec<usize> {
             self.nodes
                 .iter()
@@ -1794,6 +1958,7 @@ mod tests {
                     conflict_term: Term::ZERO,
                     conflict_index: LogIndex::ZERO,
                     match_index: LogIndex::ZERO,
+                    seq: 0,
                 },
                 now,
             )
@@ -1902,6 +2067,7 @@ mod tests {
             prev_log_term: Term::new(prev_term),
             entries,
             leader_commit: LogIndex::new(leader_commit),
+            seq: 0,
         }
     }
 
@@ -1916,12 +2082,14 @@ mod tests {
         let out = c.nodes[0].propose(Bytes::from_static(b"x"), now).unwrap();
         c.deliver_all(batch(0, out), now);
 
-        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(1));
+        // Index 1 is the leader's start-of-term no-op (I8b); the proposal
+        // lands at 2 and both commit together.
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(2));
         for i in 0..3 {
-            assert_eq!(c.nodes[i].last_log_index().unwrap(), LogIndex::new(1));
+            assert_eq!(c.nodes[i].last_log_index().unwrap(), LogIndex::new(2));
             assert_eq!(
                 c.nodes[i]
-                    .log_entry(LogIndex::new(1))
+                    .log_entry(LogIndex::new(2))
                     .unwrap()
                     .unwrap()
                     .command()
@@ -1938,10 +2106,15 @@ mod tests {
         let now = t0 + Duration::from_secs(1);
         node.tick(now).unwrap();
         assert!(node.is_leader());
-        node.propose(Bytes::from_static(b"only"), now).unwrap();
         assert_eq!(
             node.commit_index(),
             LogIndex::new(1),
+            "a single-voter leader commits its no-op at election"
+        );
+        node.propose(Bytes::from_static(b"only"), now).unwrap();
+        assert_eq!(
+            node.commit_index(),
+            LogIndex::new(2),
             "self is its own majority"
         );
     }
@@ -2060,9 +2233,10 @@ mod tests {
             }
         }
         assert!(n0.is_leader());
-        // Both followers, initially empty, were backfilled to n0's full log.
-        assert_eq!(n1.last_log_index().unwrap(), LogIndex::new(3));
-        assert_eq!(n2.last_log_index().unwrap(), LogIndex::new(3));
+        // Both followers, initially empty, were backfilled to n0's full log —
+        // its three inherited entries plus the term-1 no-op at index 4.
+        assert_eq!(n1.last_log_index().unwrap(), LogIndex::new(4));
+        assert_eq!(n2.last_log_index().unwrap(), LogIndex::new(4));
     }
 
     fn route_rv(
@@ -2095,57 +2269,72 @@ mod tests {
 
     /// **The Figure-8 regression test** (`docs/raft-notes.md` §7). A prior-term
     /// entry that reaches a majority *via a later leader's replication* must NOT
-    /// be committed by replica count; it commits only once a current-term entry
-    /// commits over it.
+    /// be committed by replica count; it commits only once an entry of the new
+    /// leader's own term — since I8b, its start-of-term no-op — commits over it.
     #[test]
     fn figure_8_prior_term_entry_not_committed_by_replica_count() {
         let t0 = Instant::now();
         let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
         let now = t0 + Duration::from_secs(1);
 
-        // n0 wins term 1.
-        c.tick_and_deliver(0, now);
+        // n0 campaigns; deliver only the votes, holding back the no-op
+        // replication its victory triggers.
+        let outs = c.nodes[0].tick(now).unwrap();
+        for target in ["n1", "n2"] {
+            let Outbound::RequestVote { request, .. } = rv_to(&outs, target) else {
+                unreachable!()
+            };
+            let ti = c.idx(&nid(target));
+            let resp = c.nodes[ti].handle_request_vote(request, now).unwrap();
+            let _held_back = c.nodes[0]
+                .handle_request_vote_response(nid(target), resp, now)
+                .unwrap();
+        }
         assert!(c.nodes[0].is_leader());
         assert_eq!(c.nodes[0].current_term(), Term::new(1));
 
-        // n0 proposes entry A (term 1) and we place it on the majority {n0, n1}
-        // WITHOUT n0 learning n1 stored it — so A is on a majority but uncommitted.
-        let out = c.nodes[0].propose(Bytes::from_static(b"A"), now).unwrap();
-        let ae_to_n1 = rv_or_ae_to(&out, "n1");
-        if let Outbound::AppendEntries { request, .. } = ae_to_n1 {
-            let _ = c.nodes[1].handle_append_entries(request, now).unwrap();
+        // n0's term-1 no-op reaches n1 only, and n0 never learns (the
+        // response is dropped): a term-1 entry now sits on the majority
+        // {n0, n1} while n0's commit index stays 0.
+        let outs = c.nodes[0].tick(now + Duration::from_millis(60)).unwrap();
+        if let Outbound::AppendEntries { request, .. } = rv_or_ae_to(&outs, "n1") {
+            let _resp_dropped = c.nodes[1].handle_append_entries(request, now).unwrap();
         }
-        assert_eq!(
-            c.nodes[0].commit_index(),
-            LogIndex::ZERO,
-            "A is not committed yet"
-        );
-        assert_eq!(c.nodes[0].last_log_index().unwrap(), LogIndex::new(1));
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::ZERO);
         assert_eq!(c.nodes[1].last_log_index().unwrap(), LogIndex::new(1));
 
-        // n1 (whose log holds A) wins term 2; n0 steps down. Becoming leader,
-        // n1 re-replicates A (a *term-1* entry) to the whole cluster.
+        // n1 (holding the term-1 entry) wins term 2 with n2's vote; its own
+        // no-op replication is held back too.
         let now2 = now + Duration::from_secs(1);
-        c.tick_and_deliver(1, now2);
+        let outs = c.nodes[1].tick(now2).unwrap();
+        let Outbound::RequestVote { request, .. } = rv_to(&outs, "n2") else {
+            unreachable!()
+        };
+        let resp = c.nodes[2].handle_request_vote(request, now2).unwrap();
+        let _held_back = c.nodes[1]
+            .handle_request_vote_response(nid("n2"), resp, now2)
+            .unwrap();
         assert!(c.nodes[1].is_leader());
         assert_eq!(c.nodes[1].current_term(), Term::new(2));
 
-        // KEY ASSERTION: A is now on a majority (re-replicated by n1), but because
-        // it is from a prior term, the current-term rule forbids committing it.
+        // KEY ASSERTION: the term-1 entry is on a majority, yet the new
+        // leader must NOT commit it by replica count.
         assert_eq!(
             c.nodes[1].commit_index(),
             LogIndex::ZERO,
             "a prior-term entry on a majority must NOT be committed by replica count (Figure 8)"
         );
 
-        // n1 proposes B (term 2). When B reaches a majority, commit jumps to 2 —
-        // committing A indirectly via the Log Matching Property.
-        let out = c.nodes[1].propose(Bytes::from_static(b"B"), now2).unwrap();
-        c.deliver_all(batch(1, out), now2);
+        // Deliver n1's replication: its term-2 no-op reaches a majority and
+        // commits — sweeping the term-1 entry in via the Log Matching
+        // Property. Commitment only ever arrives through the new term.
+        let now3 = now2 + Duration::from_millis(60);
+        let outs = c.nodes[1].tick(now3).unwrap();
+        c.deliver_all(batch(1, outs), now3);
         assert_eq!(
             c.nodes[1].commit_index(),
             LogIndex::new(2),
-            "a current-term entry on a majority commits, sweeping the prior-term entry in"
+            "the current-term no-op commits, sweeping the prior-term entry in"
         );
     }
 
@@ -2187,30 +2376,31 @@ mod tests {
             node.propose(Bytes::copy_from_slice(&k.to_le_bytes()), now)
                 .unwrap();
         }
-        assert_eq!(node.commit_index(), LogIndex::new(5));
+        // Index 1 is the start-of-term no-op (I8b): commit = 1 + 5 proposals.
+        assert_eq!(node.commit_index(), LogIndex::new(6));
 
-        let meta = node.compact(Bytes::from_static(b"machine@5")).unwrap();
-        assert_eq!(meta.last_included_index, LogIndex::new(5));
+        let meta = node.compact(Bytes::from_static(b"machine@6")).unwrap();
+        assert_eq!(meta.last_included_index, LogIndex::new(6));
         assert_eq!(meta.last_included_term, Term::new(1));
         // The whole log was committed, so compaction empties it — but the
         // last (index, term) must survive via the snapshot fallback.
         assert_eq!(node.first_log_index().unwrap(), LogIndex::ZERO);
-        assert_eq!(node.last_log_index().unwrap(), LogIndex::new(5));
+        assert_eq!(node.last_log_index().unwrap(), LogIndex::new(6));
         assert!(node.log_entry(LogIndex::new(3)).unwrap().is_none());
 
         // Appending continues seamlessly above the snapshot.
-        node.propose(Bytes::from_static(b"six"), now).unwrap();
-        assert_eq!(node.last_log_index().unwrap(), LogIndex::new(6));
-        assert_eq!(node.first_log_index().unwrap(), LogIndex::new(6));
+        node.propose(Bytes::from_static(b"seven"), now).unwrap();
+        assert_eq!(node.last_log_index().unwrap(), LogIndex::new(7));
+        assert_eq!(node.first_log_index().unwrap(), LogIndex::new(7));
 
         // Restart: snapshot metadata recovers and floors the commit index (P9).
         drop(node);
         let node = mk(t0 + Duration::from_secs(2));
         assert_eq!(node.snapshot_meta(), Some(meta.clone()));
-        assert!(node.commit_index() >= LogIndex::new(5));
+        assert!(node.commit_index() >= LogIndex::new(6));
         let (m, data) = node.snapshot().unwrap().unwrap();
         assert_eq!(m, meta);
-        assert_eq!(data, Bytes::from_static(b"machine@5"));
+        assert_eq!(data, Bytes::from_static(b"machine@6"));
     }
 
     #[test]
@@ -2242,8 +2432,10 @@ mod tests {
         let mut node =
             RaftNode::new(nid("solo"), vec![], log, Rng::seed_from_u64(1), cfg, t0).unwrap();
         let now = t0 + Duration::from_secs(1);
+        // Election commits the no-op (1 entry); three proposals reach the
+        // threshold of 4 exactly, the fourth crosses it.
         node.tick(now).unwrap();
-        for k in 0..4u32 {
+        for k in 0..3u32 {
             node.propose(Bytes::copy_from_slice(&k.to_le_bytes()), now)
                 .unwrap();
         }
@@ -2271,7 +2463,7 @@ mod tests {
             c.deliver_all(batch(0, out), now);
         }
         c.tick_and_deliver(0, now + Duration::from_millis(60));
-        assert_eq!(c.nodes[2].commit_index(), LogIndex::new(3));
+        assert_eq!(c.nodes[2].commit_index(), LogIndex::new(4));
 
         // Entry 4 reaches only n1 (a majority with the leader): committed on
         // n0 while n2 is left behind at index 3.
@@ -2283,31 +2475,31 @@ mod tests {
                 .handle_append_entries_response(nid("n1"), resp, now)
                 .unwrap();
         }
-        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(4));
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(5));
 
-        // The leader compacts everything it committed; index 4 is now gone
+        // The leader compacts everything it committed; index 5 is now gone
         // from its log, so n2 can only be caught up by snapshot.
         c.nodes[0]
-            .compact(Bytes::from_static(b"machine@4"))
+            .compact(Bytes::from_static(b"machine@5"))
             .unwrap();
         let outs = c.nodes[0].tick(now + Duration::from_millis(120)).unwrap();
         let to_n2 = rv_or_ae_to(&outs, "n2");
         let Outbound::InstallSnapshot { request, .. } = to_n2 else {
             panic!("expected InstallSnapshot for the lagging follower, got {to_n2:?}");
         };
-        assert_eq!(request.last_included_index, LogIndex::new(4));
+        assert_eq!(request.last_included_index, LogIndex::new(5));
         assert!(request.done && request.offset == 0, "single-shot");
 
-        // n2 installs it: conflicting basis (it never saw entry 4) discards
+        // n2 installs it: conflicting basis (it never saw entry 5) discards
         // the log; state jumps to the snapshot.
         let resp = c.nodes[2].handle_install_snapshot(request, now).unwrap();
-        assert_eq!(c.nodes[2].commit_index(), LogIndex::new(4));
+        assert_eq!(c.nodes[2].commit_index(), LogIndex::new(5));
         assert_eq!(
             c.nodes[2].snapshot_meta().unwrap().last_included_index,
-            LogIndex::new(4)
+            LogIndex::new(5)
         );
         assert_eq!(c.nodes[2].first_log_index().unwrap(), LogIndex::ZERO);
-        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(4));
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(5));
 
         // The leader records the catch-up; n2 is no longer behind.
         let more = c.nodes[0]
@@ -2316,11 +2508,11 @@ mod tests {
         assert!(more.is_empty(), "peer is fully caught up");
 
         // Replication above the snapshot boundary resumes normally: the
-        // prev term for entry 5 comes from the snapshot metadata on both ends.
-        let out = c.nodes[0].propose(Bytes::from_static(b"e5"), now).unwrap();
+        // prev term for entry 6 comes from the snapshot metadata on both ends.
+        let out = c.nodes[0].propose(Bytes::from_static(b"e6"), now).unwrap();
         c.deliver_all(batch(0, out), now);
-        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(5));
-        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(5));
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(6));
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(6));
     }
 
     #[test]
@@ -2544,14 +2736,14 @@ mod tests {
             assert!(!cfg.is_joint(), "n{i} settled on C_new");
             assert_eq!(cfg.voters.len(), 4, "n{i} sees the four-voter config");
         }
-        // Joint at index 1, C_new at index 2 — both committed.
-        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(2));
+        // No-op at 1, joint at 2, C_new at 3 — all committed.
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(3));
 
         // The grown cluster keeps serving: a write commits with 3-of-4.
         let outs = c.nodes[0].propose(Bytes::from_static(b"w"), now).unwrap();
         c.deliver_all(batch(0, outs), now);
-        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(3));
-        assert_eq!(c.nodes[3].last_log_index().unwrap(), LogIndex::new(3));
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(4));
+        assert_eq!(c.nodes[3].last_log_index().unwrap(), LogIndex::new(4));
     }
 
     #[test]
@@ -2606,8 +2798,8 @@ mod tests {
 
         assert_eq!(
             c.nodes[0].commit_index(),
-            LogIndex::ZERO,
-            "no dual-majority window: nothing commits while C_new lacks a majority"
+            LogIndex::new(1),
+            "no dual-majority window: only the pre-joint no-op is committed;              nothing commits under the joint config while C_new lacks a majority"
         );
         assert!(c.nodes[0].active_config().is_joint(), "stuck in joint");
 
@@ -2782,7 +2974,7 @@ mod tests {
         // The learner receives entries like any member…
         let outs = c.nodes[0].propose(Bytes::from_static(b"w"), now).unwrap();
         c.deliver_all(batch(0, outs), now);
-        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(2));
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(3));
         assert!(c.nodes[2].active_config().learners.contains(&nid("l")));
 
         // …but still never campaigns.
@@ -2848,7 +3040,7 @@ mod tests {
                     .unwrap();
             }
         }
-        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(6));
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(7));
 
         // Promoting an uncaught-up node is refused with a pointer to the
         // learner flow.
@@ -2864,7 +3056,7 @@ mod tests {
         // The learner path: add, let it catch up, then promotion passes.
         let outs = c.nodes[0].propose_add_learner(nid("l"), now).unwrap();
         c.deliver_all(batch(0, outs), now);
-        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(7));
+        assert_eq!(c.nodes[2].last_log_index().unwrap(), LogIndex::new(8));
 
         let outs = c.nodes[0]
             .propose_conf_change(voter_set(&["n0", "n1", "l"]), now)
@@ -2918,5 +3110,160 @@ mod tests {
         c.deliver_all(batch(0, outs), now);
         let err = c.nodes[0].propose_add_learner(nid("x"), now).unwrap_err();
         assert!(matches!(err, RaftError::ConfChange(_)));
+    }
+
+    // --- ReadIndex (I8b) ----------------------------------------------------
+
+    #[test]
+    fn read_index_confirms_only_with_post_registration_acks() {
+        let t0 = Instant::now();
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        let now = t0 + Duration::from_secs(1);
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+        let outs = c.nodes[0].propose(Bytes::from_static(b"x"), now).unwrap();
+        c.deliver_all(batch(0, outs), now);
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::new(2));
+
+        // Round A: heartbeat responses generated BEFORE the read registers.
+        let stale_outs = c.nodes[0].tick(now + Duration::from_millis(60)).unwrap();
+        let mut stale = Vec::new();
+        for out in stale_outs {
+            if let Outbound::AppendEntries { to, request } = out {
+                let ti = c.idx(&to);
+                let resp = c.nodes[ti].handle_append_entries(request, now).unwrap();
+                stale.push((to, resp));
+            }
+        }
+
+        // Register the read; nothing is resolved yet.
+        let (ticket, confirm_outs) = c.nodes[0].start_read(now).unwrap();
+        assert!(c.nodes[0].drain_read_results().is_empty());
+
+        // Delayed pre-registration replies must NOT confirm leadership for
+        // the read — their echoed seq predates registration.
+        for (from, resp) in stale {
+            c.nodes[0]
+                .handle_append_entries_response(from, resp, now)
+                .unwrap();
+        }
+        assert!(
+            c.nodes[0].drain_read_results().is_empty(),
+            "pre-registration acks cannot confirm a linearizable read"
+        );
+
+        // One reply to the post-registration round completes the quorum
+        // {n0, n1} and resolves the read at the registration-time commit.
+        let to_n1 = rv_or_ae_to(&confirm_outs, "n1");
+        if let Outbound::AppendEntries { request, .. } = to_n1 {
+            let resp = c.nodes[1].handle_append_entries(request, now).unwrap();
+            c.nodes[0]
+                .handle_append_entries_response(nid("n1"), resp, now)
+                .unwrap();
+        }
+        let results = c.nodes[0].drain_read_results();
+        assert_eq!(results.len(), 1);
+        let (got_ticket, got) = &results[0];
+        assert_eq!(*got_ticket, ticket);
+        assert_eq!(got.as_ref().unwrap(), &LogIndex::new(2));
+    }
+
+    #[test]
+    fn read_index_never_resolves_below_the_term_start_noop() {
+        let t0 = Instant::now();
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        let now = t0 + Duration::from_secs(1);
+        // Elect via votes only: the no-op is appended but NOT yet committed.
+        let outs = c.nodes[0].tick(now).unwrap();
+        for target in ["n1", "n2"] {
+            let Outbound::RequestVote { request, .. } = rv_to(&outs, target) else {
+                unreachable!()
+            };
+            let ti = c.idx(&nid(target));
+            let resp = c.nodes[ti].handle_request_vote(request, now).unwrap();
+            let _held_back = c.nodes[0]
+                .handle_request_vote_response(nid(target), resp, now)
+                .unwrap();
+        }
+        assert!(c.nodes[0].is_leader());
+        assert_eq!(c.nodes[0].commit_index(), LogIndex::ZERO);
+
+        // The read registers at max(commit, term_start) = the no-op's index:
+        // it can only be served once an entry of THIS term is committed.
+        let (ticket, confirm_outs) = c.nodes[0].start_read(now).unwrap();
+        let to_n1 = rv_or_ae_to(&confirm_outs, "n1");
+        if let Outbound::AppendEntries { request, .. } = to_n1 {
+            let resp = c.nodes[1].handle_append_entries(request, now).unwrap();
+            c.nodes[0]
+                .handle_append_entries_response(nid("n1"), resp, now)
+                .unwrap();
+        }
+        let results = c.nodes[0].drain_read_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, ticket);
+        assert_eq!(
+            results[0].1.as_ref().unwrap(),
+            &LogIndex::new(1),
+            "the read index is floored at the start-of-term no-op"
+        );
+    }
+
+    #[test]
+    fn read_index_fails_when_leadership_is_lost() {
+        let t0 = Instant::now();
+        let mut c = Cluster::new(&["n0", "n1", "n2"], &[1, 2, 3], t0);
+        let now = t0 + Duration::from_secs(1);
+        c.tick_and_deliver(0, now);
+        assert!(c.nodes[0].is_leader());
+
+        let (ticket, _outs) = c.nodes[0].start_read(now).unwrap();
+        // A higher-term response deposes the leader before confirmation.
+        c.nodes[0]
+            .handle_append_entries_response(
+                nid("n1"),
+                AppendEntriesResponse {
+                    term: Term::new(9),
+                    success: false,
+                    conflict_term: Term::ZERO,
+                    conflict_index: LogIndex::ZERO,
+                    match_index: LogIndex::ZERO,
+                    seq: 0,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(c.nodes[0].is_follower());
+        let results = c.nodes[0].drain_read_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, ticket);
+        assert!(
+            matches!(results[0].1, Err(RaftError::NotLeader { .. })),
+            "a deposed leader must fail its pending reads, never serve them"
+        );
+    }
+
+    #[test]
+    fn read_index_on_a_single_voter_confirms_immediately() {
+        let t0 = Instant::now();
+        let (_d, mut node) = make("solo", &[], 1, t0);
+        let now = t0 + Duration::from_secs(1);
+        node.tick(now).unwrap();
+        assert!(node.is_leader());
+        assert_eq!(node.commit_index(), LogIndex::new(1));
+
+        let (ticket, outs) = node.start_read(now).unwrap();
+        assert!(outs.is_empty(), "no confirmation round needed");
+        let results = node.drain_read_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, ticket);
+        assert_eq!(results[0].1.as_ref().unwrap(), &LogIndex::new(1));
+    }
+
+    #[test]
+    fn read_index_rejected_on_a_follower() {
+        let now = Instant::now();
+        let (_d, mut node) = make("f", &["a", "b"], 1, now);
+        let err = node.start_read(now).unwrap_err();
+        assert!(matches!(err, RaftError::NotLeader { .. }));
     }
 }

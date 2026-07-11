@@ -764,3 +764,76 @@ isolation of `list_entries`), and `RUSTDOCFLAGS=-Dwarnings cargo doc`.
   (apply committed entries / snapshot / restore — the hooks I6 left for
   "the shell") and **ReadIndex** in the core (leadership confirmation
   round, read served at the confirmed commit index once applied).
+
+## I8b — state-machine apply loop + ReadIndex (§17 task 6)
+
+- **Date:** 2026-07-10
+- **Affected:** `crates/brokkr-proto` (`raft.proto`: `seq` on
+  AppendEntries request/reply), `crates/brokkr-raft` (`node.rs` no-op +
+  ReadIndex, `driver.rs` `StateMachine` + apply loop + `read_index`,
+  `transport.rs`, `lib.rs`; every index-sensitive test updated).
+- **Outcome:** the shell finally *applies* what consensus commits, and the
+  leader serves linearizable reads. Both halves of the I8 read/write story
+  that `RaftKv` (I8c) plugs into are now in place.
+
+### Decisions / notes
+
+- **The start-of-term no-op is no longer deferred.** I4 postponed it as a
+  read-path optimization; the read path arrived. `become_leader` appends
+  `EntryPayload::Noop` (the variant I7a reserved), so a fresh leader
+  commits an entry of its own term without waiting for client traffic and
+  the Figure-8 rule sweeps inherited entries in immediately. The Figure-8
+  regression test was rewritten around it — election by votes only, no-op
+  replication held back, then released — and now demonstrates commitment
+  arriving *exclusively* through the new term's entry.
+- **ReadIndex confirmation is seq-proven.** Every `AppendEntries` carries a
+  monotonic per-leader `seq`, echoed in the reply. A read registers with
+  `confirm_seq = ae_seq + 1` and counts only acks whose echoed seq is at or
+  past it: a delayed reply to a pre-registration request can never confirm
+  current leadership (tested head-on). Quorum is `has_quorum` over the
+  active config — joint-consensus-correct for free. Any term-current
+  response counts, success or log-mismatch: both prove the peer accepted
+  our leadership when it answered.
+- **Reads floor at `term_start_index`.** The read index is
+  `max(commit_index, term_start_index)`: ReadIndex is unsafe until an entry
+  of the current term commits (paper §8), and flooring at the no-op makes
+  the wait implicit — the driver serves the read once applied catches up,
+  which cannot happen before the no-op commits.
+- **Leadership loss fails reads.** Pending reads live in `LeaderState`;
+  every step-down path drains them into `Err(NotLeader)` results. A deposed
+  leader never serves a read it could not confirm (driver-level test kills
+  a partitioned leader mid-read).
+- **The driver applies, snapshots, and restores.** `StateMachine`
+  (apply/snapshot/restore) is owned by the driver: committed entries apply
+  in order exactly once; `last_applied` floors at the snapshot (P9);
+  startup and leader-installed snapshots restore the machine; and
+  compaction is now automatic past `Config::snapshot_threshold`, using the
+  machine's own serialized state — the I6 "shell supplies the blob"
+  contract, fulfilled by the shell itself.
+- **Index churn was the honest cost:** every election now inserts a no-op,
+  so ~15 tests' exact indices shifted by one (or two after re-elections),
+  and the sim oracle compares history-to-history instead of
+  history-length-to-commit-index (no-ops produce no output). Failover
+  tests learned that a healed deposed leader can force a re-election —
+  asserts there are now relative where the absolute number was incidental.
+
+### Verified per-crate in WSL2
+
+`brokkr-proto` and `brokkr-raft` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, tests (**99 unit + 21 integration**;
+new: five node-level ReadIndex tests — post-registration-ack-only
+confirmation, term-start floor, step-down failure, single-voter immediate,
+follower rejection — and two driver-level tests: end-to-end linearizable
+read with apply catch-up, deposed-leader read failure), and
+`RUSTDOCFLAGS=-Dwarnings cargo doc`.
+
+### Next
+
+- **I8c:** `RaftKv` in `brokkr-control` — a `MetaKv` impl that proposes
+  prost-encoded commands through the driver, reads via
+  `read_index()` + the applied machine, returns
+  `MetaKvError::NotLeader { leader }` on followers (the exhaustive
+  `From` conversion in `metakv.rs` will force the redirect design, as
+  planned), runs the MetaKv contract suite, and lands the 3-node
+  kill-the-leader failover test plus the `--raft` flag (off ⇒ exactly
+  today's behavior).

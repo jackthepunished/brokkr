@@ -1137,6 +1137,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   campaigns deposed the leader of the cluster it had left; a stale minority
   leader still steps down via AppendEntries terms, so liveness holds.
   Driver: `RaftHandle::propose_conf_change` + `DriverStatus.config`.
+- `brokkr-raft` state-machine apply loop + ReadIndex linearizable reads
+  (milestone I8b, `docs/plan.md` §17 task 6): the driver now owns a
+  `StateMachine` (`apply` / `snapshot` / `restore`) and feeds it every
+  committed entry in order, tracking `last_applied` (P9: floored at the
+  snapshot); it restores from the snapshot at startup and when a leader
+  installs one, and **auto-compacts** past `Config::snapshot_threshold`
+  using the machine's own snapshot. Reads: `RaftHandle::read_index()`
+  implements the **ReadIndex protocol** — the leader registers the read at
+  `max(commit_index, term_start_index)`, proves it is still leader with a
+  fresh heartbeat round (every `AppendEntries` now carries a `seq` echoed
+  in its reply, so a delayed pre-registration ack can never confirm), and
+  resolves only once a quorum of the active configuration answers and the
+  machine has applied up to the read index; leadership loss fails pending
+  reads instead of serving stale state. This lands the **start-of-term
+  no-op** the I4/I7a decisions reserved: `become_leader` appends
+  `EntryPayload::Noop`, so a fresh leader commits an entry of its own term
+  without waiting for client traffic (the Figure-8 test was rewritten to
+  show commitment arriving exclusively through it) and ReadIndex is safe
+  from election onward. `DriverStatus` gains `last_applied`. Wire change:
+  `AppendEntriesRequest.seq = 7` / `AppendEntriesReply.seq = 6`
+  (proto3-default zero, wire-compatible with pre-I8b entries).
 - `brokkr-control` `MetaKv` metadata seam (milestone I8a, `docs/plan.md`
   §17 task 6): the I8 stop-and-ask resolved — **action-cache writes and
   cluster-level config replicate through Raft; CAS blob bytes and scheduler
