@@ -900,3 +900,63 @@ follower write/read refused with the leader hint), and
   kill-the-leader test measuring **time-to-new-leader < 2 s** (DoD 1),
   partition semantics via turmoil (DoD 2), and the **1M-op certification
   run** with seeds recorded in this journal (DoD 3).
+
+## I9a — HA control plane + DoD 1 (§17 task 7)
+
+- **Date:** 2026-07-11
+- **Affected:** `crates/brokkr-control` (`main.rs` flags + multi-node
+  wiring; `tests/raft_ha_cluster.rs` new),
+  `docs/operations/running-a-cluster.md`, `scripts/run-cluster.sh`.
+- **Outcome:** three real `brokkr-control` processes form a Raft cluster,
+  and **DoD 1 holds with a 7× margin**: kill the leader → a survivor
+  accepts writes in **291.9 ms / 288.2 ms** (two runs; budget 2 s), with
+  the pre-kill write read back linearizably from the new leader.
+
+### Decisions / notes
+
+- **The I5c keepalive lesson shipped where it mattered.** Peer channels in
+  `main.rs` set `http2_keep_alive_interval` + `keep_alive_timeout` +
+  `keep_alive_while_idle` — exactly what the I5c journal entry flagged for
+  I9. Connect/RPC timeouts (500 ms / 1 s) keep a dead peer from wedging
+  replication.
+- **Election seeds derive from the node id** (hashed): identical seeds
+  would synchronize randomized timeouts across nodes and produce repeated
+  split votes on a symmetric bring-up.
+- **Leader discovery is client-shaped.** The DoD test finds the leader by
+  attempting the write on every node and following `FAILED_PRECONDITION`
+  refusals — the I8c redirect surface, exercised as a client would.
+- **Peer links are plaintext this phase.** The worker/client planes keep
+  their mTLS/JWT posture; raft-plane mTLS is a follow-up, documented in
+  `--raft-listen`'s help and the ops doc.
+- **DoD 2 (partition semantics) is certified in the simulation layers**, as
+  the plan prescribes (real-process partitioning needs root/netns — not
+  attempted): the minority side cannot commit and heals consistently in
+  `simulation.rs::minority_partition_cannot_commit_and_heals_consistently`
+  and (over real gRPC) in
+  `turmoil_cluster.rs::grpc_cluster_survives_leader_partition_and_heals`.
+- **Not yet in I9a:** worker failover across control-plane leader changes
+  (workers pin one endpoint today) and the full `brokk run`-after-kill
+  end-to-end — that plus the **1M-op certification run (DoD 3)** are the
+  remaining I9 work.
+
+### DoD scoreboard
+
+1. **< 2 s failover: PROVEN** — 291.9 ms / 288.2 ms on real processes
+   (`raft_ha_cluster.rs`, WSL2, debug build).
+2. **Partition semantics: PROVEN** in deterministic simulation + turmoil
+   (citations above).
+3. **1M-op certification: pending** (I9b/I9c).
+
+### Verified per-crate in WSL2
+
+`brokkr-control` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, all test suites, `RUSTDOCFLAGS`
+docs, plus the `#[ignore]` real-process DoD run above.
+
+### Next
+
+- **I9b:** worker endpoint rotation on control-plane failover + the full
+  three-control + worker + `brokk run` kill-the-leader end-to-end; then
+  the **1M-op certification run** (release mode, full fault mix +
+  membership churn + tiny snapshot threshold), seeds and timings recorded
+  here (DoD 3).
