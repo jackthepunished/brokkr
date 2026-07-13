@@ -21,7 +21,7 @@ pub mod tiered;
 pub mod traits;
 pub mod tree;
 
-pub use action_cache::{ActionCache, RedbActionCache};
+pub use action_cache::{ActionCache, GcWindowGuard, RedbActionCache};
 pub use bloom::Bloom;
 pub use bloom_cas::BloomCas;
 pub use error::CasError;

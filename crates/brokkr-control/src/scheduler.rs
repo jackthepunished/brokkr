@@ -651,6 +651,21 @@ impl Scheduler {
                 .result
                 .ok_or_else(|| anyhow!("worker reported no ActionResult"))?;
             if result.exit_code == 0 {
+                // Hold the GC coordination barrier (issue #144)
+                // across the AC write so an in-process `gc::sweep`
+                // cannot delete the blobs this result references
+                // after we commit. The guard is dropped when this
+                // scope ends; coverage is sufficient because the
+                // worker uploaded the CAS blobs over its own
+                // gRPC stream before reporting success, and the
+                // barrier closes the in-process window between
+                // `cas.list_digests()` and `cas.delete_blob(d)`
+                // that previously raced with that report.
+                let _gc_guard = self
+                    .action_cache
+                    .gc_window()
+                    .await
+                    .map_err(|e| anyhow!("gc_window: {e}"))?;
                 self.action_cache
                     .update_action_result(&action_digest, result.clone())
                     .await

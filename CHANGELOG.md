@@ -169,6 +169,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ev_prctl_capbset_drop_blocked`, `ev_prctl_get_tsc_blocked`,
   `ev_ioctl_tiocsti_blocked`, `ev_ioctl_tiocgwinsz_blocked`,
   `ev_ioctl_tiocswinsz_blocked`, and `ev_ioctl_tiocptlck_blocked`.
+- `brokkr_cas::gc::sweep` no longer races with in-process worker
+  writes (issue #144). Previously, `plan` snapshotted the action
+  cache and the CAS at two different points in time, so a worker
+  that performed `(cas.batch_update_blobs, ac.update_action_result)`
+  for the same logical action between those snapshots could see
+  its freshly-uploaded blob GC'd, leaving a live `ActionResult`
+  pointing at `NotFound`. The fix introduces an in-process
+  coordination barrier: a per-`ActionCache` `tokio::sync::Mutex<()>`
+  exposed via the new `ActionCache::gc_window` trait method and
+  guard type `GcWindowGuard`. `gc::sweep` holds the guard for the
+  duration of `plan + sweep_with_plan`; workers and the two
+  control-plane `update_action_result` call sites (the REAPI
+  `UpdateActionResult` handler and the scheduler's exit_code==0
+  store) hold it across their `(CAS-write, AC-write)` pairs. The
+  default trait impl returns a no-op guard, so non-`Redb` backends
+  and tests stay trivial. **Scope:** this closes the
+  in-process-library race. The cross-process race (a worker
+  uploading via gRPC against an in-process control-plane sweep)
+  is structurally unfixable in the library alone; tracked in a
+  follow-up issue (M5b / Phase 4).
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
