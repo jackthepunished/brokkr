@@ -60,17 +60,26 @@ pub enum MetaKvError {
         /// The configured concurrency limit.
         limit: usize,
     },
+
+    /// The write was routed to a replica that is not the Raft leader (I8c).
+    /// Carries the leader's identity when known, so the caller can redirect.
+    #[error("not the metadata leader (leader hint: {leader:?})")]
+    NotLeader {
+        /// The current leader, if known.
+        leader: Option<String>,
+    },
 }
 
 impl From<MetaKvError> for CasError {
     fn from(e: MetaKvError) -> Self {
-        // Exhaustive on purpose: when I8c adds the `NotLeader` redirect
-        // variant for `RaftKv`, this conversion must fail to compile so the
-        // leader hint gets a real propagation path (FAILED_PRECONDITION +
-        // leader metadata) instead of being flattened into a storage string.
+        // Exhaustive on purpose (the I8a forcing function, now tripped by
+        // I8c exactly as designed): every variant gets a deliberate mapping,
+        // and NotLeader keeps its structured leader hint all the way to the
+        // service layer (FAILED_PRECONDITION + leader metadata).
         match e {
             MetaKvError::Storage(msg) => CasError::Redb(msg),
             MetaKvError::ThroughputLimit { limit } => CasError::ThroughputLimit { limit },
+            MetaKvError::NotLeader { leader } => CasError::NotLeader { leader },
         }
     }
 }
@@ -324,7 +333,7 @@ impl<K: MetaKv> ActionCache for MetaKvActionCache<K> {
     clippy::panic,
     clippy::disallowed_methods
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The [`MetaKv`] contract every implementation must satisfy. I8c runs
