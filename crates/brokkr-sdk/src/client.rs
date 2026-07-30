@@ -749,6 +749,17 @@ fn digest_of(bytes: &[u8]) -> rapi::Digest {
     }
 }
 
+/// Rebuild a `Status`, preserving code, message, and metadata.
+///
+/// `tonic::Status` is not `Clone`, and the leader hints live in its metadata —
+/// dropping them while reporting a redirect we could not follow would hide the
+/// one detail an operator needs.
+fn clone_status(status: &Status) -> Status {
+    let mut rebuilt = Status::new(status.code(), status.message());
+    *rebuilt.metadata_mut() = status.metadata().clone();
+    rebuilt
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -850,15 +861,4 @@ mod tests {
         // here, only check the header insertion.
         "header.payload.sig".to_string()
     }
-}
-
-/// Rebuild a `Status`, preserving code, message, and metadata.
-///
-/// `tonic::Status` is not `Clone`, and the leader hints live in its metadata —
-/// dropping them while reporting a redirect we could not follow would hide the
-/// one detail an operator needs.
-fn clone_status(status: &Status) -> Status {
-    let mut rebuilt = Status::new(status.code(), status.message());
-    *rebuilt.metadata_mut() = status.metadata().clone();
-    rebuilt
 }
