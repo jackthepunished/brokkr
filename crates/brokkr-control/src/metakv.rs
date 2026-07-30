@@ -63,10 +63,16 @@ pub enum MetaKvError {
 
     /// The write was routed to a replica that is not the Raft leader (I8c).
     /// Carries the leader's identity when known, so the caller can redirect.
-    #[error("not the metadata leader (leader hint: {leader:?})")]
+    #[error("not the metadata leader (leader hint: {leader:?} at {leader_addr:?})")]
     NotLeader {
         /// The current leader, if known.
         leader: Option<String>,
+
+        /// The leader's client-plane advertise address, once that leader's
+        /// `cfg/nodes/<id>` record has replicated here (I9b). `None` is normal
+        /// in the window between an election and that record committing — the
+        /// id alone is still a useful hint, so it is not withheld.
+        leader_addr: Option<String>,
     },
 }
 
@@ -79,7 +85,13 @@ impl From<MetaKvError> for CasError {
         match e {
             MetaKvError::Storage(msg) => CasError::Redb(msg),
             MetaKvError::ThroughputLimit { limit } => CasError::ThroughputLimit { limit },
-            MetaKvError::NotLeader { leader } => CasError::NotLeader { leader },
+            MetaKvError::NotLeader {
+                leader,
+                leader_addr,
+            } => CasError::NotLeader {
+                leader,
+                leader_addr,
+            },
         }
     }
 }

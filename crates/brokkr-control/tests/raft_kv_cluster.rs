@@ -240,13 +240,47 @@ async fn follower_write_is_refused_with_a_leader_hint() {
     let write = tokio::spawn(async move { kv.put(b"k", Bytes::from_static(b"v")).await });
     settle(Duration::from_millis(200)).await;
     let err = write.await.unwrap().unwrap_err();
-    let MetaKvError::NotLeader { leader: hint } = err else {
+    let MetaKvError::NotLeader {
+        leader: hint,
+        leader_addr,
+    } = err
+    else {
         panic!("expected NotLeader, got {err}");
     };
     assert_eq!(
         hint.as_deref(),
         Some(node_id(leader).as_str()),
         "the refusal carries the leader's identity for the redirect"
+    );
+    // Nothing has published a node record yet, so the address hint is absent
+    // — an id-without-address refusal, which the service layer must still
+    // emit (I9b). The populated case is asserted below.
+    assert_eq!(leader_addr, None);
+
+    // Once the leader publishes its address, a *follower* resolves it from its
+    // own applied map and the refusal becomes actionable: this is the whole
+    // point of routing cluster config through Raft (I9b / W1).
+    let leader_kv = c.kvs[leader].clone();
+    let leader_name = node_id(leader).as_str().to_string();
+    let publish = tokio::spawn(async move {
+        leader_kv
+            .publish_node_record(&leader_name, "10.0.0.9:7878")
+            .await
+    });
+    settle(Duration::from_secs(1)).await;
+    publish.await.unwrap().unwrap();
+
+    let kv = c.kvs[follower].clone();
+    let write = tokio::spawn(async move { kv.put(b"k", Bytes::from_static(b"v")).await });
+    settle(Duration::from_millis(200)).await;
+    let err = write.await.unwrap().unwrap_err();
+    let MetaKvError::NotLeader { leader_addr, .. } = err else {
+        panic!("expected NotLeader, got {err}");
+    };
+    assert_eq!(
+        leader_addr.as_deref(),
+        Some("10.0.0.9:7878"),
+        "the follower resolves the leader's published address for the redirect"
     );
 
     // Reads on a follower are refused too (reads are leader-served in I8c).

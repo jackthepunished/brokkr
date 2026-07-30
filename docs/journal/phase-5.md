@@ -960,3 +960,87 @@ docs, plus the `#[ignore]` real-process DoD run above.
   the **1M-op certification run** (release mode, full fault mix +
   membership churn + tiny snapshot threshold), seeds and timings recorded
   here (DoD 3).
+
+## I9b W1+W2 — the redirect becomes actionable (§17 task 7)
+
+- **Date:** 2026-07-30
+- **Affected:** `crates/brokkr-cas` (`error.rs`), `crates/brokkr-control`
+  (`metakv.rs`, `raftkv.rs`, `services/action_cache.rs`, `main.rs`;
+  `tests/raft_kv_cluster.rs`).
+- **Outcome:** a client refused by a follower now learns *where* the leader
+  is, not merely its name. I9b lands in three PRs (W1+W2 here, then
+  SDK/worker failover, then the real-process end-to-end); this is the first.
+
+### Decisions / notes
+
+- **I8c shipped a redirect nothing could follow.** `x-brokkr-leader` carried
+  a node id, and a node id is not a dial target — `--raft-peer id=host:port`
+  addresses are the *raft plane*, not the client listener. The I8c entry
+  deferred this to "I9's peer wiring"; I9a did the peer wiring and left the
+  hint alone, so the gap survived two milestones while looking closed. Worth
+  remembering that a structurally-correct error can still be operationally
+  useless.
+- **The plan's W1 was unimplementable as written, and the fix is smaller than
+  the plan.** §VII.3 W1 had *each* node propose its own `cfg/nodes/<id>`
+  record. A follower cannot propose, so on a fresh cluster no follower could
+  ever publish and the records would never exist. But the asymmetry is the
+  answer: the only address a redirect ever needs is the **leader's**, and the
+  leader is by definition able to propose it. So only the leader publishes,
+  and only its own record. `cfg/nodes/` stays a map of every node that has
+  ever *held leadership*, which is exactly the set worth redirecting to.
+- **Rejected: putting client addresses in `--raft-peer`.** It would work
+  today — all members already must agree on full membership — and needs no
+  proposal at all. Rejected because joint-consensus membership (I7) can add a
+  node at runtime, and flags cannot describe a node that did not exist at
+  launch. Consensus state belongs in consensus.
+- **The hint is read without ReadIndex, deliberately.** `published_addr`
+  reads the applied map directly. Demanding linearizability for a routing
+  hint would be pointless (leadership can change the instant after we answer)
+  and impossible anyway — the reader is a *follower*, which cannot serve a
+  linearizable read. A stale address costs the client one failed dial; a
+  consensus round trip would cost every redirect.
+- **Each hint is emitted independently.** There is a real window between an
+  election and the new leader's record committing, where the id is known and
+  the address is not; the redirect must still go out (the client falls back to
+  its configured endpoints). Two named tests pin it: an id with no address
+  emits only `x-brokkr-leader`, and an address that will not parse as a header
+  value does not suppress the id.
+- **A wildcard bind is refused, not published.** `0.0.0.0:7878` is a binding
+  instruction; advertising it hands every redirected client a guaranteed
+  failure. Under `--raft` with a wildcard `--listen`, startup fails naming
+  `--advertise-addr` — and only under `--raft`, so single-node operators are
+  not made to name themselves for a record nobody reads.
+- **The I8a forcing function fired twice more.** Adding a field to
+  `NotLeader` broke the exhaustive `From<MetaKvError> for CasError` *and* the
+  I8c follower test's destructuring pattern — both at compile time, both in
+  the right place. The dead free-standing `kv_err` fell out naturally once
+  every call site needed `&self` to resolve the address.
+
+### Verified per-crate in WSL2
+
+`brokkr-cas` + `brokkr-control` green on `fmt --check`,
+`clippy --all-targets -- -D warnings`, and tests (**103 control lib**, up from
+98; new: `node_record_keys_are_namespaced_and_disjoint_from_the_ac_prefix`,
+`the_leader_publishes_its_address_and_any_replica_resolves_it`,
+`a_corrupt_or_empty_node_record_yields_no_address_rather_than_panicking`,
+`a_known_leader_with_no_published_address_emits_only_the_id`,
+`an_unparseable_leader_address_still_yields_the_id_hint`,
+`advertise_addr_resolution_refuses_only_unusable_wildcards`; extended:
+`not_leader_maps_to_failed_precondition_with_a_leader_hint` and
+`raft_kv_cluster.rs::follower_write_is_refused_with_a_leader_hint`, which now
+asserts a follower resolves the leader's *published* address).
+
+**Host baseline, established this milestone:** a full
+`cargo test --workspace --no-fail-fast` runs 46 suites and exactly one fails —
+`brokkr-sandbox --test evil_seccomp_caps`, the 6 tests needing a real kernel
+for seccomp argument filters. That set is now the explicit gate: anything else
+failing is a regression, not the host.
+
+### Next
+
+- **I9b W3+W4+W5:** `BrokkrClient::connect_any` + redirect-following on
+  `x-brokkr-leader-addr` (bounded hops, last-known-leader cached), repeatable
+  `--control` on `brokk` and on `brokkr-worker` with endpoint rotation and
+  re-registration, and D1 — the best-effort post-execution action-cache write
+  (`warn` + `uncached_results_not_leader` counter + a not-cached marker in
+  execution metadata; every non-`NotLeader` error still fails the RPC).
