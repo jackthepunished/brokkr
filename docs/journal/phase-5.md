@@ -1468,6 +1468,29 @@ across PRs #120–#172 and ADR 0013.
   making compaction O(history) and the run O(n²). Fixing the *constant* rather
   than the *requirement* mattered: lowering the operation count to make a
   number look better would have made the certification worthless.
+- **CI caught a defective assertion inside DoD line 2's own proof — after the
+  phase was declared done.** The wrap-up PR, which changes no code, failed
+  `cargo test` on **aarch64 only**: *a minority-partitioned leader cannot
+  advance its commit index: left: 3, right: 2*. Two defects, both in the test.
+  The assertion tested a **proxy, not the property** — an index of 3 arises
+  equally from "committed its own doomed entry" (a real safety violation) and
+  from "stepped down and legitimately learned the new leader's entry" (correct
+  Raft), so it **failed on correct behaviour while being unable to prove the
+  incorrect one**. And the test was **nondeterministic despite turmoil**: its
+  registry was a `HashMap`, whose per-process randomized iteration order
+  changed the polling order and hence the interleaving — which is why x86_64
+  passed and aarch64 failed on byte-identical code.
+  Fixed by `BTreeMap` for deterministic iteration plus an assertion that splits
+  the cases (still leading ⇒ commit index frozen; stepped down ⇒ must have
+  adopted the higher term), leaving the unconditional post-heal assertions as
+  the real safety proof. Verified over 12 consecutive runs, since one green run
+  says nothing about a per-process nondeterminism. `build_with_rng` would also
+  pin turmoil's latency jitter but needs `rand`, which ADR 0013 deliberately
+  avoided — left as a follow-up rather than quietly added.
+  The lesson is not "tests flake". A test that usually passes can be **testing
+  the wrong thing**, and re-running until green would have buried that
+  permanently inside the evidence for a definition-of-done line.
+
 - **Pure policy functions paid for themselves repeatedly.** Extracting
   `rotation_plan`, `redirect::classify` and `resolve_raft_tls` and testing them
   exhaustively caught five bugs no happy-path integration test reaches: a
