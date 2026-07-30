@@ -1368,3 +1368,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `RunOutcome` gains `message` (from REAPI `ExecuteResponse.message`) and
     `brokk` prints it, so "ran but not cached" is visible at the terminal
     rather than only in server logs.
+- `brokkr-raft` **1,000,000-operation certification** (milestone I9c,
+  `docs/plan.md` §17 task 8 — **definition-of-done line 3, now proven**). New
+  `#[ignore]`d `certification_one_million_ops` in `tests/simulation.rs`
+  extends the existing campaign rather than adding a second simulator, and
+  runs **every fault axis simultaneously** — latency jitter, partitions,
+  heals, crashes, restarts, learner→voter membership churn, and continuous
+  compaction/`InstallSnapshot`. Earlier campaigns varied one axis while
+  holding the rest still; this is the first run of the combination.
+  Measured: **1,000,000 client operations, 32,216 rounds, final commit index
+  906,330, zero divergence**, 3,060.8 s wall (327 ops/s), 2.92 GiB peak RSS,
+  seed 20260730, snapshot threshold 512 (WSL2, `--release`). The gap between
+  1,000,000 accepted proposals and a 906,330 commit index is the fault
+  injection working: proposals accepted by a leader that then lost leadership
+  never commit, exactly as Raft requires. Tunable through `BROKKR_CERT_OPS`,
+  `BROKKR_CERT_ORACLE_EVERY`, `BROKKR_CERT_SEED` and
+  `BROKKR_CERT_SNAPSHOT_THRESHOLD` so a run can be sized before it is
+  committed to.
+  A first attempt at `snapshot_threshold = 16` decayed from 462 to 188 ops/s
+  by 400k operations and projected past two hours; the cause is that the test
+  harness stores the **entire applied history** inside every snapshot blob so
+  its oracle can compare histories, making `maybe_compact` O(history) per node
+  per firing — O(n²) overall. That is the oracle's design and not the Raft
+  implementation's (a real state machine snapshots bounded state, as
+  `KvMachine` does). The **constant** was fixed rather than the requirement:
+  threshold 512 still compacts ~1,770 times per node while cutting the
+  quadratic term 32×, the other campaigns keep threshold 16 at their smaller
+  scales, and the operation count — verbatim in the DoD — was left alone. A
+  hash-chain oracle (O(1) per entry) is recorded as the proper fix.
+- `docs/plan.md` §11.1 "Pulled-forward slices" — the section ADR 0012 has been
+  citing since it was accepted. Records the operator TUI as accepted and
+  **explicitly unstarted**, so the phase table stays an honest account of what
+  is built when.

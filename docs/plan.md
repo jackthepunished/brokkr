@@ -450,6 +450,20 @@ Each phase is a **shippable milestone**, not a time estimate. Move to the next o
 - Tracing spans cover the new code paths.
 - A short blog-style retrospective is written in `docs/journal/phase-N.md` describing what was learned, what surprised, and what was deferred.
 
+### 11.1 Pulled-forward slices
+
+Occasionally a later phase's work is pulled forward because it is additive and
+does not block the phase in progress. Such a slice needs an ADR recording the
+decision and the reason it does not disturb the sequence; it is listed here so
+the phase table above stays the honest picture of what is built when.
+
+| Slice | From | ADR | Status |
+|---|---|---|---|
+| Operator TUI + gRPC observability read-model (`brokkr-tui`, `brokkr.v1.ObservabilityService`, `brokkr-control::views`) | Phase 6 | [0012](architecture/0012-operator-tui.md) | Accepted 2026-06-30, **not implemented** — WS0–WS3 unstarted |
+
+Pulling a slice forward is not licence to start it: ADR 0012 is accepted and
+its work remains unscheduled behind Phase 5.
+
 ## 12. Phase 0 — Bootstrapping
 
 **Goal:** stand up the skeleton. No real functionality yet. By the end, `cargo build` and `cargo test` work across the workspace, CI is green, and a `brokk version` binary prints the version.
