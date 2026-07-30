@@ -152,6 +152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Apache-2.0), CHANGELOG, CODE_OF_CONDUCT, justfile.
 - `CLAUDE.md` operating manual at the repo root.
 - `docs/plan.md` — project source of truth.
+- `docs/brokkr-development-chronicle.md` — a narrative history of the build,
+  compiled from the planning docs, ADRs, phase journals, and this changelog.
+  Written at the close of Phase 4 and banner-dated as a snapshot; it gains its
+  Phase 5 chapter at that phase's wrap-up.
+- ADR 0012 — operator TUI + gRPC observability read-model: a read-only
+  `brokkr-tui` (`ratatui` over a hand-rolled Elm architecture) fed by a new
+  `brokkr.v1.ObservabilityService` over a shared `brokkr-control::views`
+  read-model, behind the ADR 0011 auth interceptor. An explicit opt-in
+  pull-forward of a Phase 6 observability slice, read-mostly and additive so it
+  does not block Phase 5. **Accepted, not yet implemented** — WS0–WS3 are
+  unstarted.
 - Vendored REAPI v2 + supporting googleapis protos in `brokkr-proto`,
   compiled via `tonic-build` with a vendored `protoc` (no system dependency).
 - `brokk version` and `brokk init` (stub) subcommands, with git SHA + rustc
@@ -169,6 +180,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ev_prctl_capbset_drop_blocked`, `ev_prctl_get_tsc_blocked`,
   `ev_ioctl_tiocsti_blocked`, `ev_ioctl_tiocgwinsz_blocked`,
   `ev_ioctl_tiocswinsz_blocked`, and `ev_ioctl_tiocptlck_blocked`.
+- `brokkr_cas::gc::sweep` no longer races with in-process worker
+  writes (issue #144). Previously, `plan` snapshotted the action
+  cache and the CAS at two different points in time, so a worker
+  that performed `(cas.batch_update_blobs, ac.update_action_result)`
+  for the same logical action between those snapshots could see
+  its freshly-uploaded blob GC'd, leaving a live `ActionResult`
+  pointing at `NotFound`. The fix introduces an in-process
+  coordination barrier: a per-`ActionCache` `tokio::sync::Mutex<()>`
+  exposed via the new `ActionCache::gc_window` trait method and
+  guard type `GcWindowGuard`. `gc::sweep` holds the guard for the
+  duration of `plan + sweep_with_plan`; workers and the two
+  control-plane `update_action_result` call sites (the REAPI
+  `UpdateActionResult` handler and the scheduler's exit_code==0
+  store) hold it across their `(CAS-write, AC-write)` pairs. The
+  default trait impl returns a no-op guard, so non-`Redb` backends
+  and tests stay trivial. **Scope:** this closes the
+  in-process-library race. The cross-process race (a worker
+  uploading via gRPC against an in-process control-plane sweep)
+  is structurally unfixable in the library alone; tracked in a
+  follow-up issue (M5b / Phase 4).
 
 ### Changed
 - MSRV bumped from 1.78 → 1.85 during bootstrap (transitive deps require
@@ -1241,3 +1272,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invisible after reopen, term-step clears the vote atomically, and a committed
   hard state survives a real process abort (`tests/crash_consistency.rs`
   re-execs the test binary as a child that commits then `abort()`s).
+- `docs/phase-5-plan.md` — the Phase 5 implementation plan, promoted to a
+  tracked doc beside `docs/phase-2-plan.md` / `docs/phase-3-plan.md`. Parts
+  I–VI are the original pre-implementation design contract (sans-IO core,
+  crate layout, storage/transport/timing model, the milestone table, the
+  **P1–P11 pitfall codex** that journal entries cite by number, and the test
+  strategy); Part VII is new and plans the phase to completion from I9a:
+  I9b (leader-aware clients and workers), I9c (the 1,000,000-operation
+  certification run — the one open definition-of-done line), I9d
+  (raft-plane mTLS) and I10 (wrap-up), with a seven-PR sequence and a risk
+  list. Records two owner decisions of 2026-07-30: the scheduler's
+  post-execution action-cache write is **best-effort on `NotLeader` only**
+  (a build routed to a follower is correct but uncached, surfaced by a
+  counter and a not-cached marker rather than silently), and raft-plane
+  mTLS is in scope for this phase rather than deferred.

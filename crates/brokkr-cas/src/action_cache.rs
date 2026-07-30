@@ -4,6 +4,7 @@
 //! protobuf bytes. Phase 1 storage is single-node `redb`; semantics match the
 //! REAPI `ActionCache` service (`GetActionResult`, `UpdateActionResult`).
 
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use brokkr_common::Digest;
 use brokkr_proto::reapi_v2::ActionResult;
 use prost::Message;
 use redb::{Database, ReadableTable, TableDefinition};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 
 use crate::error::CasError;
 
@@ -21,6 +22,36 @@ const ACTION_RESULTS: TableDefinition<'static, &str, &[u8]> =
 
 /// Default max concurrent `spawn_blocking` tasks for [`RedbActionCache`].
 const DEFAULT_ACTION_CACHE_CONCURRENCY: usize = 16;
+
+/// Opaque handle representing exclusive access to the GC critical section.
+///
+/// Returned from [`ActionCache::gc_window`]. Drop it to release the
+/// barrier. The guard is the in-process coordination mechanism that
+/// closes the mark/sweep race described in issue #144: as long as a
+/// worker holds a guard across `(cas.batch_update_blobs, ac.update_action_result)`
+/// and the GC holds a guard across `(plan, sweep_with_plan)`, no
+/// interleave can produce a live `ActionResult` whose digests point
+/// at blobs that have been deleted.
+///
+/// The default trait impl returns a guard whose `_permit` is `None`
+/// — i.e. a no-op. Production backends that can be observed by the
+/// GC (anything other than an ephemeral test double) MUST override
+/// [`ActionCache::gc_window`] and return a guard that releases on
+/// drop.
+#[must_use = "the GC barrier is held only while the guard is alive"]
+pub struct GcWindowGuard {
+    _permit: Option<OwnedMutexGuard<()>>,
+}
+
+impl fmt::Debug for GcWindowGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // OwnedMutexGuard doesn't implement Debug; we don't want to
+        // surface internal state to log lines. Opacity is the point.
+        f.debug_struct("GcWindowGuard")
+            .field("acquired", &self._permit.is_some())
+            .finish()
+    }
+}
 
 /// REAPI Action Cache backend.
 #[async_trait]
@@ -47,14 +78,56 @@ pub trait ActionCache: Send + Sync + 'static {
     async fn list_entries(&self) -> Result<Vec<(Digest, ActionResult)>, CasError> {
         Ok(Vec::new())
     }
+
+    /// Acquire the GC coordination barrier (issue #144).
+    ///
+    /// Workers performing the `(cas.batch_update_blobs,
+    /// ac.update_action_result)` pair for the same logical action
+    /// MUST hold the returned [`GcWindowGuard`] for the duration of
+    /// both calls. [`crate::gc::sweep`] holds the guard for the
+    /// entire `plan + sweep_with_plan` window. With the guard held
+    /// on both sides, no `(upload, AC-write)` pair can land in
+    /// between `cas.list_digests()` and `cas.delete_blob(d)` and
+    /// produce a cached `ActionResult` whose digests point at
+    /// deleted blobs.
+    ///
+    /// The default implementation returns a no-op guard (the inner
+    /// `OwnedMutexGuard<()>` is `None`). Backends that need GC
+    /// coordination MUST override this and return a guard that
+    /// releases on drop. Backends that override without holding a
+    /// guard across both writes regress the bug.
+    ///
+    /// **Scope:** this is an in-process barrier. A worker in a
+    /// separate process uploading via gRPC cannot hold this
+    /// barrier; that race is fixed separately (planned M5b/Phase 4).
+    async fn gc_window(&self) -> Result<GcWindowGuard, CasError> {
+        Ok(GcWindowGuard { _permit: None })
+    }
 }
 
 /// `redb`-backed [`ActionCache`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RedbActionCache {
     db: Arc<Database>,
     semaphore: Arc<Semaphore>,
     max_concurrent: usize,
+    // Coordination barrier for GC (issue #144). Acquired by
+    // `gc_window`; held across `(CAS write, AC write)` by workers and
+    // across `plan + sweep_with_plan` by `brokkr_cas::gc::sweep`.
+    // Shared (not per-cache-clone) because workers and the GC may
+    // observe *different* `Clone`s of the same logical cache.
+    gc_mutex: Arc<Mutex<()>>,
+}
+
+impl Clone for RedbActionCache {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            semaphore: self.semaphore.clone(),
+            max_concurrent: self.max_concurrent,
+            gc_mutex: self.gc_mutex.clone(),
+        }
+    }
 }
 
 impl RedbActionCache {
@@ -82,6 +155,7 @@ impl RedbActionCache {
             db: Arc::new(db),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             max_concurrent,
+            gc_mutex: Arc::new(Mutex::new(())),
         })
     }
 }
@@ -190,6 +264,20 @@ impl ActionCache for RedbActionCache {
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    async fn gc_window(&self) -> Result<GcWindowGuard, CasError> {
+        // `lock_owned` returns an `OwnedMutexGuard<()>` which is
+        // `Send + 'static` — required because the guard is held
+        // across `await` points while being passed by value
+        // through the public trait method. It is also cancel-safe:
+        // dropping the future (e.g. task abort) drops the guard
+        // and releases the mutex, so a worker that is cancelled
+        // mid-`(CAS-write, AC-write)` does not deadlock the GC.
+        let permit = self.gc_mutex.clone().lock_owned().await;
+        Ok(GcWindowGuard {
+            _permit: Some(permit),
+        })
     }
 }
 

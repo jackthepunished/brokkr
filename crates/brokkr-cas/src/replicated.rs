@@ -343,15 +343,21 @@ mod tests {
         assert!(result[0].status.is_ok());
 
         // Exactly 2 of the 3 backends should hold the blob (HRW
-        // picks 2 for R=2).
-        let holders = backends
-            .iter()
-            .filter(|c| {
-                futures::executor::block_on(c.find_missing_blobs(&[d.clone()]))
-                    .map(|m| m.is_empty())
-                    .unwrap_or(false)
-            })
-            .count();
+        // picks 2 for R=2). Fan out `find_missing_blobs` across
+        // all backends in async flow (avoids `block_on` inside a
+        // `#[tokio::test]`, which can deadlock on the
+        // current-thread runtime) and propagate the per-backend
+        // error instead of swallowing it via `unwrap_or(false)`.
+        let digest = d.clone();
+        let presence: Vec<bool> = join_all(backends.iter().map(|c| {
+            let d = digest.clone();
+            async move { c.find_missing_blobs(&[d]).await.map(|m| m.is_empty()) }
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+        let holders = presence.iter().filter(|x| **x).count();
         assert_eq!(holders, 2, "R=2 should have left exactly 2 holders");
     }
 
