@@ -945,7 +945,8 @@ follower write/read refused with the leader hint), and
    (`raft_ha_cluster.rs`, WSL2, debug build).
 2. **Partition semantics: PROVEN** in deterministic simulation + turmoil
    (citations above).
-3. **1M-op certification: pending** (I9b/I9c).
+3. **1M-op certification: pending** (I9b/I9c). *(Proven in I9c — see that
+   entry's scoreboard: 1,000,000 ops, zero divergence, seed 20260730.)*
 
 ### Verified per-crate in WSL2
 
@@ -1213,3 +1214,93 @@ the 6 known `evil_seccomp_caps` failures that need a real kernel.
   client operations rather than sim steps, run the full fault mix with
   membership churn and `snapshot_threshold = 16`, and record seeds, ops/sec,
   wall clock and peak RSS here.
+
+## I9c — the 1,000,000-operation certification (§17 task 8, DoD 3)
+
+- **Date:** 2026-07-30
+- **Affected:** `crates/brokkr-raft/tests/simulation.rs`
+  (`certification_one_million_ops`), `docs/plan.md` (§11.1).
+- **Outcome:** **DoD 3 is proven.** One million client operations under the
+  full fault mix with membership churn and continuous compaction, **zero
+  divergence**.
+
+### The run
+
+```text
+cargo test -p brokkr-raft --release --test simulation -- --ignored --nocapture certification
+[cert] DONE ops=1000000 rounds=32216 commit=906330 wall=3060.8s rate=327/s
+       seed=20260730 snapshot_threshold=512
+```
+
+| Metric | Value |
+|---|---|
+| Client operations | **1,000,000** |
+| Rounds | 32,216 |
+| Final commit index | 906,330 |
+| Wall clock | 3,060.8 s (51 min; 52:20 including compile) |
+| Mean rate | 327 ops/s |
+| Peak RSS | 3,058,272 kB (**2.92 GiB**) |
+| CPU | 870.7 s user + 403.6 s system |
+| Seed | 20260730 (`BROKKR_CERT_SEED`) |
+| Snapshot threshold | 512 (`BROKKR_CERT_SNAPSHOT_THRESHOLD`) |
+| Oracle interval | 100,000 ops |
+| Host | WSL2, `--release` |
+
+No seed has ever failed, so there is no new fixture to add. Had one failed it
+would have become a permanent **non-`#[ignore]`d** regression test.
+
+### Decisions / notes
+
+- **Every axis at once, which is the part that was never covered.** I5 varied
+  faults, I6 varied compaction, I7 varied membership — each holding the others
+  still. This run does all three simultaneously: latency jitter, partitions,
+  heals, crashes, restarts, learner→voter promotions, and compaction firing
+  roughly 1,770 times per node. The 906,330 final commit index against
+  1,000,000 accepted proposals is the fault injection visibly doing its job —
+  proposals accepted by a leader that then lost leadership never committed,
+  exactly as Raft requires.
+- **The harness's snapshot design is O(n²), and it is a test artifact.** The
+  first attempt ran at `snapshot_threshold = 16` and decayed from 462 to
+  188 ops/s by 400k ops, projecting past two hours. Cause: `Sim::maybe_compact`
+  calls `committed(i)` (decodes the whole snapshot, walks the log) and then
+  `encode_history` (re-encodes all of it), **per node, every time
+  `needs_snapshot()` fires** — at threshold 16 that is a full O(history) pass
+  every 16 committed entries, ≈437k passes over the run.
+  This is the *oracle's* design, not Raft's: the harness stores the entire
+  applied history inside each snapshot blob so histories can be compared
+  directly. A real state machine snapshots bounded **state** — `KvMachine`
+  snapshots a map.
+- **So the constant was fixed, not the requirement.** Threshold 512 keeps
+  compaction and `InstallSnapshot` running continuously (~1,770 compactions per
+  node) while cutting the quadratic term 32×. The other campaigns keep
+  threshold 16 at their smaller scales, so the aggressive-compaction path stays
+  covered. **The operation count was never touched** — it is verbatim in the
+  plan's definition of done, and lowering it to make a number look better would
+  have made the certification worthless.
+- **The rate curve is the evidence the diagnosis was right.** After the fix:
+  496 → 396 → 373 → 366 → 363 → 359 → 355 → 347 → 334 ops/s — a decline that
+  *flattens*, consistent with a much smaller quadratic term plus the O(history)
+  oracle firing ten times. Before the fix it fell steeply and kept falling.
+- **2.92 GiB peak RSS is the same artifact seen from the memory side:** seven
+  nodes each holding a snapshot blob containing the entire million-command
+  history. Real deployments do not do this; the certification harness does.
+- **Deferred, and now specific:** replace the history-blob oracle with a
+  **hash-chain** oracle (chain(k) = H(chain(k-1) ‖ cmd_k)) — O(1) per entry
+  instead of O(history), which would make both the time and the memory linear.
+  Deliberately not done during the certification: rewriting the oracle to
+  certify against it would mean certifying against an unproven oracle.
+
+### DoD scoreboard — all three lines proven
+
+1. **< 2 s failover: PROVEN** — 291.9 ms / 288.2 ms on real processes
+   (`raft_ha_cluster.rs`); and 133.4 ms kill→completed `brokk run` end to end
+   (`raft_ha_e2e.rs`).
+2. **Partition semantics: PROVEN** — minority cannot commit and heals
+   consistently, in deterministic simulation and over real gRPC via turmoil.
+3. **1,000,000 operations under fault injection with zero divergence:
+   PROVEN** — the run above.
+
+### Next
+
+- **I9d:** raft-plane mTLS (ADR 0011 is already amended with the design).
+- **I10:** the Phase 5 wrap-up and §11 exit-criteria review.

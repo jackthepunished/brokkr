@@ -916,3 +916,197 @@ fn soak_random_faults_with_membership_churn() {
         "compaction was exercised during churn"
     );
 }
+
+/// **DoD 3** (`docs/plan.md` §17): *run 1,000,000 operations under fault
+/// injection with zero divergence.*
+///
+/// This is the I5/I6/I7 campaigns combined and driven to scale — the full
+/// fault mix (latency jitter, partitions, heals, crashes, restarts)
+/// **plus** membership churn **plus** constant compaction, all at once. That
+/// combination is the part no earlier soak exercised: each previous campaign
+/// varied one axis while holding the others still.
+///
+/// Tunables, so the run can be sized before it is committed to:
+///
+/// * `BROKKR_CERT_OPS` — target client operations (default 1,000,000)
+/// * `BROKKR_CERT_ORACLE_EVERY` — ops between full divergence checks
+///   (default 25,000)
+///
+/// `#[ignore]` and release-mode: this is a certification, not a CI test.
+///
+/// ```text
+/// cargo test -p brokkr-raft --release --test simulation -- --ignored --nocapture certification
+/// ```
+#[test]
+#[ignore = "certification run (DoD 3): release mode, minutes; run on demand"]
+fn certification_one_million_ops() {
+    fn env_u64(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    let target = env_u64("BROKKR_CERT_OPS", 1_000_000);
+    let oracle_every = env_u64("BROKKR_CERT_ORACLE_EVERY", 25_000);
+
+    // 5 voters + 2 spares so membership can churn.
+    //
+    // **Why the snapshot threshold is 512 here and 16 elsewhere.** This
+    // harness stores the *entire applied history* inside each snapshot blob so
+    // `assert_no_divergence` can compare histories — which means `maybe_compact`
+    // costs O(history) every time it fires, for every node. At threshold 16
+    // that is a full re-encode every 16 committed entries, i.e. **O(n²)** over
+    // the run: a measured 1M-op attempt decayed from 462 to 188 ops/s by 400k
+    // and projected past two hours. That cost is an artifact of the test
+    // oracle, not of the Raft implementation — a real state machine snapshots
+    // *state* (`KvMachine` snapshots a bounded map), not history.
+    //
+    // 512 still compacts ~2,000 times per node across a 1M-op run — continuous
+    // by any reasonable reading — while cutting the quadratic constant 32×.
+    // The existing campaigns keep threshold 16 at their smaller scales, so the
+    // aggressive-compaction path stays covered. The proper fix is a hash-chain
+    // oracle (O(1) per entry instead of O(history)); recorded as a follow-up
+    // rather than done here, because rewriting the oracle mid-certification
+    // would mean certifying an unproven oracle.
+    let base_seed = env_u64("BROKKR_CERT_SEED", 20260730);
+    let snapshot_threshold = env_u64("BROKKR_CERT_SNAPSHOT_THRESHOLD", 512);
+    let mut sim = Sim::new_with_spares(5, 2, base_seed, snapshot_threshold);
+    let mut fault_rng = Rng::seed_from_u64(base_seed ^ 0x5eed);
+    let started = Instant::now();
+
+    let mut ops: u64 = 0;
+    let mut round: u64 = 0;
+    let mut churn_step = 0usize;
+    let mut last_oracle = 0u64;
+
+    while ops < target {
+        round += 1;
+
+        // ---- fault injection -------------------------------------------
+        match fault_rng.gen_range_u64(10) {
+            0 => {
+                let cut = (fault_rng.gen_range_u64(5)) as usize;
+                let a: Vec<usize> = (0..7).filter(|&i| i != cut && i % 2 == 0).collect();
+                let b: Vec<usize> = (0..7).filter(|&i| !a.contains(&i)).collect();
+                if !a.is_empty() && !b.is_empty() {
+                    sim.partition(&[&a, &b]);
+                }
+            }
+            1 => sim.heal(),
+            2 => {
+                if sim.leaders().len() == 1 {
+                    let l = sim.leaders()[0];
+                    sim.crash(l);
+                }
+            }
+            3 => {
+                if let Some(i) = (0..7).find(|&i| sim.nodes[i].is_none()) {
+                    sim.restart(i);
+                }
+            }
+            4 => {
+                // Membership churn: learner -> voter -> retire, in order,
+                // retried until each step takes (proposals can be refused by
+                // the one-in-flight rule or the catch-up gate).
+                if let Some(&l) = sim.leaders().first() {
+                    let voters = sim.leader_voters(l);
+                    match churn_step % 4 {
+                        0 => {
+                            if sim.try_add_learner(l, 5) {
+                                churn_step += 1;
+                            }
+                        }
+                        1 => {
+                            let mut next = voters.clone();
+                            next.insert(NodeId::new("n5".to_string()).unwrap());
+                            if sim.try_conf_change(l, next) {
+                                churn_step += 1;
+                            }
+                        }
+                        2 => {
+                            if sim.try_add_learner(l, 6) {
+                                churn_step += 1;
+                            }
+                        }
+                        _ => {
+                            let mut next = voters.clone();
+                            next.insert(NodeId::new("n6".to_string()).unwrap());
+                            if sim.try_conf_change(l, next) {
+                                churn_step += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // ---- client operations -----------------------------------------
+        // A batch per round: the DoD counts *client operations*, and one
+        // proposal per fault round would spend the whole run in the
+        // simulator's timekeeping rather than in consensus.
+        sim.advance(Duration::from_millis(20));
+        if let Some(&l) = sim.leaders().first() {
+            for i in 0..64u64 {
+                if sim.propose(l, format!("c{round}-{i}").as_bytes()) {
+                    ops += 1;
+                } else {
+                    break; // leadership lost mid-batch; the next round retries
+                }
+            }
+        }
+        sim.advance(Duration::from_millis(40));
+
+        // ---- invariants --------------------------------------------------
+        // The log must stay bounded: compaction running continuously is the
+        // point of snapshot_threshold = 16, and an unbounded log would be a
+        // bug in its own right (and would exhaust memory long before 1M ops).
+        for i in 0..7 {
+            if let Some(node) = sim.nodes[i].as_ref() {
+                let first = node
+                    .snapshot_meta()
+                    .map(|m| m.last_included_index.get())
+                    .unwrap_or(0);
+                let last = node.last_log_index().map(|i| i.get()).unwrap_or(0);
+                assert!(
+                    last.saturating_sub(first) < 100_000,
+                    "n{i} log grew unbounded: {first}..={last} (compaction stalled?)"
+                );
+            }
+        }
+
+        if ops - last_oracle >= oracle_every {
+            sim.assert_no_divergence();
+            last_oracle = ops;
+            let elapsed = started.elapsed();
+            let rate = ops as f64 / elapsed.as_secs_f64().max(0.001);
+            eprintln!(
+                "[cert] ops={ops}/{target} round={round} commit={} elapsed={:.1}s rate={rate:.0}/s",
+                sim.max_commit(),
+                elapsed.as_secs_f64(),
+            );
+        }
+    }
+
+    // Heal everything, let it converge, and assert safety one last time on a
+    // quiescent cluster — the state every earlier campaign ends in.
+    sim.heal();
+    for _ in 0..8 {
+        if let Some(i) = (0..7).find(|&i| sim.nodes[i].is_none()) {
+            sim.restart(i);
+        }
+        sim.advance(Duration::from_secs(1));
+    }
+    sim.advance(Duration::from_secs(3));
+    sim.assert_no_divergence();
+
+    let elapsed = started.elapsed();
+    eprintln!(
+        "[cert] DONE ops={ops} rounds={round} commit={} wall={:.1}s rate={:.0}/s \
+         seed={base_seed} snapshot_threshold={snapshot_threshold}",
+        sim.max_commit(),
+        elapsed.as_secs_f64(),
+        ops as f64 / elapsed.as_secs_f64().max(0.001),
+    );
+    assert!(ops >= target, "did not reach the operation target");
+}
