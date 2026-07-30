@@ -552,6 +552,15 @@ pub struct RunOutcome {
     pub stderr: Bytes,
     /// True if the action was served from the action cache without re-running.
     pub cache_hit: bool,
+    /// The server's human-readable note about this execution, empty when there
+    /// is nothing to say (REAPI `ExecuteResponse.message`).
+    ///
+    /// Carries the one thing a caller cannot otherwise observe: under decision
+    /// D1 a build routed to a **follower** succeeds but is *not cached*, so an
+    /// identical action will re-execute. Dropping this field would leave that
+    /// discoverable only in server logs — which is precisely the silent
+    /// degradation D1's design set out to avoid.
+    pub message: String,
 }
 
 /// Check server-reported status before accessing result.
@@ -729,6 +738,7 @@ pub async fn run_command(
                     stdout: Bytes::from(result.stdout_raw),
                     stderr: Bytes::from(result.stderr_raw),
                     cache_hit: resp.cached_result,
+                    message: resp.message,
                 });
             }
             Some(brokkr_proto::longrunning::operation::Result::Error(s)) => {

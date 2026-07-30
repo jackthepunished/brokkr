@@ -1344,3 +1344,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `BrokkrClient::connect_any` and a repeatable `brokk run --control` use the
     first node that answers, reporting the last transport error rather than a
     synthetic aggregate.
+- `brokkr-control` real-process HA end-to-end + two fixes it found (milestone
+  I9b W6, `docs/plan.md` §17 task 7, completing I9b). New
+  `tests/raft_ha_e2e.rs` (`#[ignore]`) spawns **three control nodes, three
+  workers and `brokk run`**, kills the leader with SIGKILL, and asserts a
+  following build succeeds and that a pre-kill *leader-routed* write is still a
+  cache hit afterwards. Measured: **133.4 ms** from kill to a completed build
+  (budget 5 s — this covers election *plus* worker rotation, re-registration,
+  dispatch and a real process execution, unlike DoD 1's election-only 2 s
+  bound).
+  - **Fixed: a follower's action-cache *lookup* failed the build.** Decision D1
+    made the post-execution write best-effort but left the pre-execution
+    lookup failing hard; reads are leader-served (I8c ReadIndex), so a
+    follower-routed build died with `action cache get: not the metadata leader`
+    **before the action ever ran**. A lookup that cannot be served is now a
+    cache **miss**; every other error still fails the RPC.
+  - **Documented: an HA control plane requires a worker on every node.** The
+    worker registry is per-node and deliberately not replicated through Raft
+    (ADRs 0008–0010), so a control node with no worker attached cannot execute
+    anything — a build routed there fails `no eligible worker` however healthy
+    the Raft cluster is. `docs/operations/running-a-cluster.md` now states this
+    as a requirement, alongside what a follower-routed build costs under D1.
+  - `RunOutcome` gains `message` (from REAPI `ExecuteResponse.message`) and
+    `brokk` prints it, so "ran but not cached" is visible at the terminal
+    rather than only in server logs.

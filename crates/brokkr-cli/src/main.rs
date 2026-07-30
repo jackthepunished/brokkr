@@ -289,6 +289,13 @@ fn run_subcmd(opts: RunOptions) -> Result<()> {
             "[brokk] exit={} cache_hit={}",
             outcome.exit_code, outcome.cache_hit
         );
+        // The server only sets this when there is something the caller cannot
+        // otherwise see — today, that the result was not cached because this
+        // node is not the metadata leader (decision D1). Printing it is what
+        // keeps that degradation out of the "silent" category.
+        if !outcome.message.is_empty() {
+            eprintln!("[brokk] {}", outcome.message);
+        }
         std::process::exit(outcome.exit_code);
     })
 }
