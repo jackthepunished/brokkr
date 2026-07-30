@@ -198,8 +198,44 @@ Writes are accepted by the **leader**; a follower answers
 `FAILED_PRECONDITION` with the leader's id in `x-brokkr-leader` **and its
 address in `x-brokkr-leader-addr`** (I9b) — clients built on `brokkr-sdk`
 follow that automatically. Reads through the leader are linearizable
-(ReadIndex). Raft peer links are **plaintext** in this phase: run them on a
-trusted network (mTLS for the peer plane is a noted follow-up).
+(ReadIndex).
+
+### Secure the Raft peer plane (mTLS)
+
+Brokkr has **three** authentication planes, and they authenticate different
+things (ADR 0011):
+
+| Plane | Who talks | Authentication |
+|---|---|---|
+| Client | `brokk`, Bazel, SDK | JWT bearer (+ server TLS) |
+| Worker | `brokkr-worker` → control | mTLS, client cert required |
+| **Raft peer** | control ↔ control | **mTLS, mutual only — no JWT** |
+
+The peer plane matters most of the three: `AppendEntries` on it **appends to
+the replicated log**, so an unauthenticated peer port is a write path into
+consensus itself. A peer is not a tenant and has no user identity to carry,
+which is why it is mutual-only rather than JWT-gated.
+
+```sh
+brokkr-control --listen 127.0.0.1:7878 --data-dir ./node0 \
+  --raft --node-id control-0 --advertise-addr 127.0.0.1:7878 \
+  --raft-listen 127.0.0.1:7978 \
+  --raft-peer control-1=127.0.0.1:7979 --raft-peer control-2=127.0.0.1:7980 \
+  --raft-tls-ca ./certs/raft-ca.pem \
+  --raft-tls-cert ./certs/control-0.pem --raft-tls-key ./certs/control-0-key.pem
+```
+
+Every node needs a certificate the others' `--raft-tls-ca` verifies; the same
+flags configure **both** the `--raft-listen` server and the outbound peer
+channels, because a one-sided configuration fails at handshake time rather
+than at startup. `brokkr-control` **refuses to start** on a half-configured
+raft plane (cert without key, TLS on one side only, or a CA that does not
+verify the configured cert) — the same posture issue #139 established for the
+other two planes.
+
+Plaintext peer links remain available for local development
+(`scripts/run-cluster.sh --ha`) and are **dev-only**: on a shared network they
+expose the replicated log to anyone who can reach the port.
 
 ### Run a worker on every control node
 
