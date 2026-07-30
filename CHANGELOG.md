@@ -1423,3 +1423,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS cluster elects, replicates and reads back; and a cluster whose nodes
   present a certificate signed by an untrusted CA **commits nothing**, which
   is what distinguishes an enforcing plane from a merely configured one.
+- **Phase 5 complete** (milestone I10, `docs/plan.md` §11 exit-criteria review).
+  The control plane's metadata store is a from-scratch Raft — no external Raft
+  crate, per CLAUDE.md rule 10 — and the control plane survives losing a node.
+  All three definition-of-done lines are proven: leader kill → a survivor
+  accepts writes in **291.9 ms / 288.2 ms**, and a full `brokk run` completes
+  **133.4 ms** after the kill with the cache intact; a partitioned minority
+  cannot commit and heals consistently (deterministic simulation and real gRPC
+  via turmoil); and **1,000,000 operations** under partitions, crashes,
+  restarts, membership churn and continuous compaction ran with **zero
+  divergence**. `docs/journal/phase-5.md` carries the exit-criteria review, the
+  retrospective, and a deferred list where each entry states why deferring is
+  safe. README, `docs/plan.md` §11 and the development chronicle are updated;
+  the chronicle gains its Phase 5 chapter and ADR 0013.
