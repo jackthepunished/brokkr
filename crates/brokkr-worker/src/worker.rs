@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 use tracing::Instrument;
 
+use crate::endpoint::{rotation_plan, ControlPlane};
 use crate::runner::{proto_digest, run_command, RunOutcome, Runner};
 
 /// TLS configuration for connecting to the control plane.
@@ -35,18 +36,14 @@ pub struct TlsConfig {
 /// Worker daemon configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// Endpoint of the brokkr-control gRPC server (the **client** port —
-    /// CAS / ActionCache / Capabilities / Execution). The worker uses
-    /// this to call `ContentAddressableStorage::BatchUpdateBlobs` for
-    /// stdout/stderr uploads.
-    pub control_endpoint: String,
-    /// Endpoint of the brokkr-control gRPC **worker** port
-    /// (`WorkerService`). When unset, the worker falls back to
-    /// [`Self::control_endpoint`] (single-port mode). In split-port mode
-    /// the operator must point this at the worker port and configure
-    /// mTLS on both sides; the worker port requires a client TLS
-    /// certificate (ADR 0011, issue #139).
-    pub worker_endpoint: Option<String>,
+    /// Every control-plane node this worker may attach to, in preference
+    /// order (Phase 5 I9b W4). With more than one entry the worker survives
+    /// the loss of whichever node it was attached to: it rotates to the next
+    /// and **re-registers**, instead of dying with that node.
+    ///
+    /// One entry reproduces the pre-I9b behaviour exactly, other than
+    /// reconnecting rather than exiting when the stream closes.
+    pub control_planes: Vec<ControlPlane>,
     /// Hostname to advertise (informational).
     pub hostname: String,
     /// How to actually execute each action. Defaults to
@@ -62,8 +59,7 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            control_endpoint: "http://127.0.0.1:7878".to_string(),
-            worker_endpoint: None,
+            control_planes: vec![ControlPlane::single_port("http://127.0.0.1:7878")],
             hostname: "worker".to_string(),
             runner: Runner::Plain,
             tls: None,
@@ -135,33 +131,101 @@ fn default_capability_labels() -> std::collections::HashMap<String, String> {
     labels
 }
 
-/// Run the worker. Returns when the control plane closes the stream or an
-/// unrecoverable error occurs.
+/// How a worker session ended, so [`run_worker`] can tell "we never got in"
+/// from "we were attached and lost it" — the difference decides whether the
+/// reconnect backoff resets.
+struct SessionEnd {
+    /// Whether this session got as far as a successful `Register`.
+    registered: bool,
+    /// The failure that ended it, or `None` if the stream closed cleanly.
+    error: Option<anyhow::Error>,
+}
+
+/// Run the worker: attach to a control-plane node and keep re-attaching.
+///
+/// Returns only on a configuration error. When the attached node dies or
+/// closes the stream, the worker rotates to the next configured node
+/// ([`rotation_plan`]) and re-registers — an HA control plane is pointless if
+/// its workers die with one node (`docs/phase-5-plan.md` §VII.1 gap 3).
 #[tracing::instrument(name = "worker::run", skip(cfg))]
 pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
-    // Resolve the worker port. When `worker_endpoint` is unset, fall back
-    // to `control_endpoint` (single-port mode — the worker port and the
-    // client port are the same listener).
-    let worker_url = cfg
-        .worker_endpoint
-        .clone()
-        .unwrap_or_else(|| cfg.control_endpoint.clone());
+    if cfg.control_planes.is_empty() {
+        anyhow::bail!("no control-plane endpoints configured");
+    }
 
-    // Fail fast: the server's worker port requires a client TLS cert
-    // (ADR 0011, issue #139). If the operator pointed the worker at an
-    // https endpoint but did not configure --client-cert, every
-    // Register/Heartbeat/Stream call would fail at the TLS handshake.
+    // Fail fast on every endpoint, before attaching to any: the server's
+    // worker port requires a client TLS cert (ADR 0011, issue #139). Checking
+    // the whole set up front means a typo in the third endpoint surfaces at
+    // startup rather than hours later when a rotation first reaches it.
     let has_client_cert = cfg
         .tls
         .as_ref()
         .and_then(|t| t.client_cert.as_ref())
         .is_some();
-    if worker_url.starts_with("https://") && !has_client_cert {
-        anyhow::bail!(
-            "control plane worker endpoint is https but no --client-cert/--client-key configured; \
-             refusing to start (would fail every Register/Heartbeat/Stream with TLS handshake error — issue #139)"
-        );
+    for plane in &cfg.control_planes {
+        if plane.worker_url().starts_with("https://") && !has_client_cert {
+            anyhow::bail!(
+                "control plane worker endpoint {} is https but no --client-cert/--client-key \
+                 configured; refusing to start (would fail every Register/Heartbeat/Stream \
+                 with TLS handshake error — issue #139)",
+                plane.worker_url()
+            );
+        }
     }
+
+    let mut attempt = 0usize;
+    loop {
+        let (index, wait) = rotation_plan(cfg.control_planes.len(), attempt);
+        if !wait.is_zero() {
+            tracing::debug!(
+                wait_ms = wait.as_millis(),
+                attempt,
+                "waiting before reconnect"
+            );
+            tokio::time::sleep(wait).await;
+        }
+        let plane = &cfg.control_planes[index];
+        let end = run_session(&cfg, plane).await;
+        match end.error {
+            None => tracing::warn!(
+                endpoint = %plane.worker_url(),
+                "control-plane stream closed; re-attaching"
+            ),
+            Some(e) => tracing::warn!(
+                endpoint = %plane.worker_url(),
+                error = %e,
+                "control-plane session failed; rotating to the next endpoint"
+            ),
+        }
+        // A session that registered proves the cluster is reachable, so the
+        // next outage starts its search fresh with no delay. Without this
+        // reset a long-lived worker would inherit the backoff from an outage
+        // hours earlier and crawl through a failover it should sail through.
+        attempt = if end.registered {
+            0
+        } else {
+            attempt.saturating_add(1)
+        };
+    }
+}
+
+/// One attachment to one control-plane node: connect, register, heartbeat, and
+/// serve jobs until the stream ends or something fails.
+async fn run_session(cfg: &WorkerConfig, plane: &ControlPlane) -> SessionEnd {
+    let mut registered = false;
+    let result = run_session_inner(cfg, plane, &mut registered).await;
+    SessionEnd {
+        registered,
+        error: result.err(),
+    }
+}
+
+async fn run_session_inner(
+    cfg: &WorkerConfig,
+    plane: &ControlPlane,
+    registered: &mut bool,
+) -> Result<()> {
+    let worker_url = plane.worker_url().to_string();
 
     // Worker channel → WorkerServiceClient (worker port, mTLS required in
     // production).
@@ -177,13 +241,10 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
     // port and the client port are the same listener, so `worker_endpoint`
     // and `control_endpoint` are equal and either URL works.
     //
-    // `cfg.worker_endpoint.is_some()` means the operator set
+    // `ControlPlane::worker` being set means the operator configured
     // `--worker-control` (which `derive_default_worker_endpoint` only does
     // when `--ca` is set), i.e. split-port mode is in effect.
-    let cas_url = cfg
-        .worker_endpoint
-        .clone()
-        .unwrap_or_else(|| cfg.control_endpoint.clone());
+    let cas_url = plane.worker_url().to_string();
     let cas_ch = build_channel(cas_url, cfg.tls.as_ref()).await?;
     let cas = ContentAddressableStorageClient::new(cas_ch);
 
@@ -199,7 +260,16 @@ pub async fn run_worker(cfg: WorkerConfig) -> Result<()> {
         .ok_or_else(|| anyhow!("control plane returned no worker_id"))?;
     let worker_id = WorkerId::new(proto_worker_id.id.clone())
         .map_err(|e| anyhow!("invalid worker id from control plane: {e}"))?;
-    tracing::info!(worker_id = %worker_id, "worker registered");
+    // Registration is per-attachment: after a rotation this worker registers
+    // again with the node it lands on, because the registry is per-node and
+    // ephemeral by design (ADRs 0008-0010 — it is deliberately *not*
+    // replicated through Raft, so a new node has never heard of us).
+    *registered = true;
+    tracing::info!(
+        worker_id = %worker_id,
+        endpoint = %plane.worker_url(),
+        "worker registered"
+    );
 
     // Background heartbeat: prove liveness on the cadence the control plane
     // advertised so the registry doesn't evict us. On `known=false` the

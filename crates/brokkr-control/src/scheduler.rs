@@ -8,6 +8,7 @@
 //! scheduling are Phase 4 task 4.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,19 @@ pub struct ExecutionOutcome {
     pub result: rapi::ActionResult,
     /// True if the action cache was hit and execution skipped.
     pub cache_hit: bool,
+    /// Whether this result is now *in* the action cache.
+    ///
+    /// `false` after a successful execution means the entry could not be
+    /// stored because this node is not the metadata leader (I9b / D1): the
+    /// build is correct and complete, but an identical action will re-execute
+    /// instead of hitting the cache. The service layer passes this to the
+    /// client so "ran and cached" and "ran, not cached" are distinguishable —
+    /// best-effort must not mean unobservable.
+    ///
+    /// Always `true` for a cache hit (it is in the cache by definition) and
+    /// for a non-zero exit code (failures are deliberately not cached, which
+    /// is not a degradation).
+    pub result_cached: bool,
 }
 
 /// A job waiting in (or re-dispatchable from) the scheduler's pending queue.
@@ -174,6 +188,15 @@ pub struct Scheduler {
     /// the action's platform; when `None` (e.g. fixtures that don't exercise
     /// matching), any connected worker is a candidate.
     worker_registry: Option<SharedWorkerRegistry>,
+    /// How many completed actions were returned **uncached** because this node
+    /// was not the metadata leader (I9b / decision D1).
+    ///
+    /// The best-effort write is deliberately invisible to the client, which
+    /// makes it invisible to the operator too — a cluster whose clients all
+    /// land on followers keeps working and simply stops caching. This counter
+    /// is how that shows up as a number instead of a mystery, so it is part of
+    /// the feature rather than instrumentation bolted on after.
+    uncached_results_not_leader: AtomicU64,
 }
 
 impl Scheduler {
@@ -304,7 +327,18 @@ impl Scheduler {
             default_execution_timeout,
             lease_duration: DEFAULT_LEASE_DURATION,
             worker_registry,
+            uncached_results_not_leader: AtomicU64::new(0),
         })
+    }
+
+    /// How many completed actions this scheduler returned **uncached** because
+    /// the node is not the metadata leader (I9b / D1).
+    ///
+    /// A steadily climbing value means clients are being served by a follower
+    /// and every build is paying full execution cost with no cache benefit —
+    /// the symptom of a routing problem, not a storage one.
+    pub fn uncached_results_not_leader(&self) -> u64 {
+        self.uncached_results_not_leader.load(Ordering::Relaxed)
     }
 
     /// Register a connected worker's job channel (called by
@@ -502,6 +536,7 @@ impl Scheduler {
                 return Ok(ExecutionOutcome {
                     result: cached,
                     cache_hit: true,
+                    result_cached: true,
                 });
             }
         }
@@ -650,6 +685,7 @@ impl Scheduler {
             let result = report
                 .result
                 .ok_or_else(|| anyhow!("worker reported no ActionResult"))?;
+            let mut result_cached = true;
             if result.exit_code == 0 {
                 // Hold the GC coordination barrier (issue #144)
                 // across the AC write so an in-process `gc::sweep`
@@ -666,10 +702,49 @@ impl Scheduler {
                     .gc_window()
                     .await
                     .map_err(|e| anyhow!("gc_window: {e}"))?;
-                self.action_cache
+                match self
+                    .action_cache
                     .update_action_result(&action_digest, result.clone())
                     .await
-                    .map_err(|e| anyhow!("action cache update: {e}"))?;
+                {
+                    Ok(()) => {}
+                    // Decision D1 (owner, 2026-07-30): the write is
+                    // best-effort **on `NotLeader` only**. The action
+                    // already ran and the result is correct; failing the
+                    // RPC now would throw away completed work and charge
+                    // the client for a routing accident. So the build
+                    // succeeds uncached.
+                    //
+                    // No retry: this node is not the leader, and the only
+                    // store reachable from here is the same one that just
+                    // refused. Forwarding to the leader is a different
+                    // design (§VII.2 option (b)), not a retry.
+                    Err(brokkr_cas::CasError::NotLeader {
+                        leader,
+                        leader_addr,
+                    }) => {
+                        result_cached = false;
+                        self.uncached_results_not_leader
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            action_digest = %action_digest,
+                            leader = ?leader,
+                            leader_addr = ?leader_addr,
+                            uncached_total = self
+                                .uncached_results_not_leader
+                                .load(Ordering::Relaxed),
+                            "action ran successfully but was NOT cached: this node is \
+                             not the metadata leader; an identical action will \
+                             re-execute. Route builds at the leader to restore cache \
+                             hits."
+                        );
+                    }
+                    // Everything else still fails the RPC. A storage error
+                    // or a throughput limit is a real fault, and letting
+                    // the best-effort path swallow it would turn data loss
+                    // into a silent cache-miss regression.
+                    Err(e) => return Err(anyhow!("action cache update: {e}").into()),
+                }
             }
             tracing::Span::current()
                 .record("cache_hit", false)
@@ -677,6 +752,7 @@ impl Scheduler {
             Ok(ExecutionOutcome {
                 result,
                 cache_hit: false,
+                result_cached,
             })
         }
         .await;
@@ -837,6 +913,31 @@ mod tests {
             _result: ActionResult,
         ) -> Result<(), CasError> {
             Ok(())
+        }
+    }
+
+    /// `ActionCache` whose *write* fails with a configurable error, so the D1
+    /// best-effort path (I9b) can be exercised without a Raft cluster: reads
+    /// miss, writes fail the way a follower's would.
+    struct WriteFailsActionCache {
+        error: fn() -> CasError,
+    }
+
+    #[async_trait]
+    impl ActionCache for WriteFailsActionCache {
+        async fn get_action_result(
+            &self,
+            _action_digest: &Digest,
+        ) -> Result<Option<ActionResult>, CasError> {
+            Ok(None)
+        }
+
+        async fn update_action_result(
+            &self,
+            _action_digest: &Digest,
+            _result: ActionResult,
+        ) -> Result<(), CasError> {
+            Err((self.error)())
         }
     }
 
@@ -1209,6 +1310,126 @@ mod tests {
 
     /// §16 DoD: a worker that dies mid-job → the job is reassigned to another
     /// worker and completes. Submit a job onto worker A, disconnect A
+    /// Decision D1 (I9b): on a `--raft` follower the post-execution
+    /// action-cache write is refused with `NotLeader`. The action already ran,
+    /// so the build must **succeed** with the real result, flagged uncached and
+    /// counted — never fail after paying for a sandbox run.
+    #[tokio::test]
+    async fn not_leader_returns_the_result_uncached_and_counts_it() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(WriteFailsActionCache {
+            error: || CasError::NotLeader {
+                leader: Some("control-1".to_string()),
+                leader_addr: Some("10.0.0.1:7878".to_string()),
+            },
+        });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        assert_eq!(scheduler.uncached_results_not_leader(), 0);
+
+        let exec = {
+            let s = scheduler.clone();
+            tokio::spawn(async move { s.execute(action_digest, true, TenantId::default()).await })
+        };
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    stdout_raw: b"hello".to_vec(),
+                    ..Default::default()
+                }),
+                cache_hit: false,
+                error_message: String::new(),
+            })
+            .await
+            .unwrap();
+
+        // A NotLeader cache write must not fail the execution.
+        let outcome = exec.await.unwrap().unwrap();
+        assert_eq!(outcome.result.exit_code, 0);
+        assert_eq!(
+            outcome.result.stdout_raw, b"hello",
+            "the real result reaches the caller"
+        );
+        assert!(!outcome.cache_hit);
+        assert!(
+            !outcome.result_cached,
+            "the caller must be able to tell this was not cached"
+        );
+        assert_eq!(
+            scheduler.uncached_results_not_leader(),
+            1,
+            "the degradation is counted, not silent"
+        );
+    }
+
+    /// The other half of D1, and the part that keeps best-effort from becoming
+    /// best-ignored: a cache write failing for any reason *other* than
+    /// `NotLeader` is a real fault and must still fail the RPC.
+    #[tokio::test]
+    async fn a_non_not_leader_cache_write_failure_still_fails_the_execution() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(WriteFailsActionCache {
+            error: || CasError::Redb("disk on fire".to_string()),
+        });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        let exec = {
+            let s = scheduler.clone();
+            tokio::spawn(async move { s.execute(action_digest, true, TenantId::default()).await })
+        };
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                cache_hit: false,
+                error_message: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let err = exec.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("action cache update"),
+            "a storage failure must not be swallowed by the D1 path, got: {err}"
+        );
+        assert_eq!(
+            scheduler.uncached_results_not_leader(),
+            0,
+            "only NotLeader increments the D1 counter"
+        );
+    }
+
     /// (simulated crash), confirm the job is re-dispatched to B, then have B
     /// report success — `execute` returns `Ok`.
     #[tokio::test]

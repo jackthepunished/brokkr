@@ -36,8 +36,13 @@ enum Command {
     /// Run a shell command on the cluster.
     Run {
         /// Control plane endpoint (e.g. `http://127.0.0.1:7878`).
+        ///
+        /// **Repeatable** (Phase 5 I9b): name every control-plane node of an HA
+        /// cluster and `brokk` uses the first one that answers. Any node is a
+        /// valid entry point — a follower serves reads and CAS, and redirects
+        /// metadata writes to the leader.
         #[arg(long, default_value = "http://127.0.0.1:7878")]
-        control: String,
+        control: Vec<String>,
 
         /// Skip the action cache lookup and force re-execution.
         #[arg(long)]
@@ -220,7 +225,7 @@ struct BearerOptions {
 /// Everything `run_subcmd` needs from the CLI layer. Bundled for the
 /// same reason as [`TlsOptions`] and [`BearerOptions`].
 struct RunOptions {
-    control: String,
+    control: Vec<String>,
     no_cache: bool,
     tls: TlsOptions,
     bearer: BearerOptions,
@@ -274,14 +279,7 @@ fn run_subcmd(opts: RunOptions) -> Result<()> {
         // combination that would silently mis-configure auth (issue
         // #139), so a wrong client-side combo just surfaces as a
         // runtime `UNAUTHENTICATED` here.
-        let mut client = match (tls, bearer) {
-            (Some(tls_cfg), Some(token)) => {
-                BrokkrClient::connect_with_tls_and_bearer(control, tls_cfg, token).await?
-            }
-            (Some(tls_cfg), None) => BrokkrClient::connect_with_tls(control, tls_cfg).await?,
-            (None, Some(token)) => BrokkrClient::connect_with_bearer(control, token).await?,
-            (None, None) => BrokkrClient::connect(control).await?,
-        };
+        let mut client = connect_first(&control, tls, bearer).await?;
         let outcome = run_command(&mut client, &argv, no_cache).await?;
         // Forward stdout/stderr verbatim to the user's terminal.
         use std::io::Write as _;
@@ -293,4 +291,54 @@ fn run_subcmd(opts: RunOptions) -> Result<()> {
         );
         std::process::exit(outcome.exit_code);
     })
+}
+
+/// Connect to the first control-plane endpoint that answers (Phase 5 I9b W3).
+///
+/// Endpoints are tried in order with whichever auth combination was
+/// configured. Any node of an HA cluster is a valid entry point, so this only
+/// needs *a* live node rather than the leader — the leader-redirect metadata
+/// (`x-brokkr-leader-addr`, see `brokkr_sdk::redirect`) handles the cases that
+/// must reach the leader specifically.
+///
+/// The last transport error is returned when nothing answers, because "all
+/// three refused the connection" and "the third one's certificate is wrong"
+/// need different fixes and a synthetic aggregate error hides which it was.
+async fn connect_first(
+    endpoints: &[String],
+    tls: Option<TlsConfig>,
+    bearer: Option<String>,
+) -> Result<BrokkrClient> {
+    if endpoints.is_empty() {
+        anyhow::bail!("--control must be given at least once");
+    }
+    let mut last_error = None;
+    for endpoint in endpoints {
+        // The `(tls, bearer)` matrix is exhaustive: 0..=1 of each may be set.
+        // The control plane refuses to start in any combination that would
+        // silently mis-configure auth (issue #139), so a wrong client-side
+        // combo surfaces as a runtime `UNAUTHENTICATED` rather than silence.
+        let attempt = match (tls.clone(), bearer.clone()) {
+            (Some(tls_cfg), Some(token)) => {
+                BrokkrClient::connect_with_tls_and_bearer(endpoint.clone(), tls_cfg, token).await
+            }
+            (Some(tls_cfg), None) => {
+                BrokkrClient::connect_with_tls(endpoint.clone(), tls_cfg).await
+            }
+            (None, Some(token)) => BrokkrClient::connect_with_bearer(endpoint.clone(), token).await,
+            (None, None) => BrokkrClient::connect(endpoint.clone()).await,
+        };
+        match attempt {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                if endpoints.len() > 1 {
+                    eprintln!("[brokk] {endpoint} unreachable ({e}); trying the next endpoint");
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("no control-plane endpoints configured")))
 }

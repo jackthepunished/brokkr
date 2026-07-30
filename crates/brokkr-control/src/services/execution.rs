@@ -86,10 +86,25 @@ impl ExecSvc for ExecutionService {
                     .await;
                 let op = match outcome {
                     Ok(o) => {
+                        // D1 (I9b): a successful action whose cache write was
+                        // refused because this node is not the metadata leader
+                        // still returns its real result. Say so in the REAPI
+                        // `message` field — the client asked for a build and
+                        // got one, but it paid full price and the next
+                        // identical build will too, and that should not be
+                        // discoverable only by reading server logs.
+                        let message = if o.result_cached {
+                            String::new()
+                        } else {
+                            "result not cached: this control-plane node is not the \
+                             metadata leader; an identical action will re-execute"
+                                .to_string()
+                        };
                         let resp = rapi::ExecuteResponse {
                             result: Some(o.result),
                             cached_result: o.cache_hit,
                             status: Some(brokkr_proto::rpc::Status::default()),
+                            message,
                             ..Default::default()
                         };
                         brokkr_proto::longrunning::Operation {

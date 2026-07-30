@@ -7,9 +7,11 @@
 
 #![deny(missing_docs)]
 
+pub mod endpoint;
 pub mod fuse;
 pub mod runner;
 pub mod worker;
 
+pub use endpoint::{rotation_plan, ControlPlane};
 pub use runner::{default_rootfs, Runner, SandboxRunner, SandboxTemplate};
 pub use worker::{run_worker, TlsConfig, WorkerConfig};

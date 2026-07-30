@@ -1044,3 +1044,91 @@ failing is a regression, not the host.
   re-registration, and D1 — the best-effort post-execution action-cache write
   (`warn` + `uncached_results_not_leader` counter + a not-cached marker in
   execution metadata; every non-`NotLeader` error still fails the RPC).
+
+## I9b W3–W5 — client & worker failover (§17 task 7, completes I9b)
+
+- **Date:** 2026-07-30
+- **Affected:** `crates/brokkr-control` (`scheduler.rs`,
+  `services/execution.rs`; `tests/leader_redirect.rs` new),
+  `crates/brokkr-worker` (`endpoint.rs` new, `worker.rs`, `main.rs`),
+  `crates/brokkr-sdk` (`redirect.rs` new, `client.rs`),
+  `crates/brokkr-cli` (`main.rs`).
+- **Outcome:** an HA control plane is now usable from the outside. A client
+  pointed at any node reaches the leader; a worker outlives the node it
+  attached to; and a completed action is never discarded because the write
+  landed on a follower.
+
+### Decisions / notes
+
+- **D1 shipped as the owner chose, with the objection built in as work.** The
+  recorded worry about best-effort was that it hides a routing problem as a
+  cache-hit-rate problem. So the degradation is observable in three places —
+  a counter (`uncached_results_not_leader`), a `warn` carrying digest and
+  leader, and `ExecuteResponse.message` so the *client* can tell "ran and
+  cached" from "ran, not cached". And it is narrow: **only `NotLeader`
+  degrades**; a `Redb` or throughput error still fails the RPC, with a named
+  test for exactly that. Best-effort must not become best-ignored.
+- **No retry on the internal write, deliberately.** This node is not the
+  leader and the only store reachable from it is the one that just refused.
+  Forwarding to the leader is §VII.2 option (b) — a different design, now on
+  the deferred list — not a retry.
+- **The pure-policy discipline paid for itself twice.** Extracting
+  `rotation_plan(len, attempt)` and `redirect::classify(status, hops)` as pure
+  functions, tested exhaustively, surfaced three bugs that would otherwise
+  have shipped: a `1 << n` overflow panic after ~64 reconnect cycles, a
+  modulo-by-zero taking the worker down on an empty endpoint set, and a
+  redirect silently downgrading `https` to `http` when the hint carried a bare
+  `host:port`. None of those are reachable from a happy-path integration test.
+- **A redirect is identified by metadata, not by the status code.** The
+  scheduler already returns `FAILED_PRECONDITION` for "no eligible worker", so
+  matching on the code alone would have retried an unrelated failure as a
+  redirect — against a *different* node, which is worse than failing.
+- **The first reconnect cycle has zero delay.** A leader kill should cost a
+  worker milliseconds: the survivors are up *now*. Backoff belongs to the case
+  where a whole cycle has failed and nothing is listening. A session that
+  registered resets the counter, or a worker running for hours would inherit an
+  old outage's backoff and crawl through a failover it should sail through.
+- **What D1 cost the redirect path, stated plainly.** Because `Execute` no
+  longer fails on `NotLeader`, and the CLI never calls the ActionCache
+  directly (the scheduler does cache lookups server-side), **no in-tree client
+  RPC returns a leader redirect through `brokk run`.** The redirect surface
+  that matters is the REAPI one an external client (Bazel) drives, so this
+  increment adds `BrokkrClient::{get_action_result, update_action_result}`
+  with redirect-following and tests them against real servers — rather than
+  leaving a tested policy with no consumer and calling that "clients follow
+  redirects".
+- **`tonic::Status` is not `Clone`,** and the leader hints live in its
+  metadata. Reporting a redirect we could not follow therefore rebuilds the
+  status preserving code, message **and** metadata; dropping the metadata
+  would discard the one detail an operator needs.
+
+### Verified per-crate in WSL2
+
+`brokkr-cas`, `brokkr-control`, `brokkr-worker`, `brokkr-sdk`, `brokkr-cli`
+green on `fmt --check`, `clippy --workspace --all-targets -- -D warnings`,
+`RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps`, and
+`cargo test --workspace --no-fail-fast` (**48 suites**; the only failures are
+the 6 `evil_seccomp_caps` tests that need a real kernel for seccomp argument
+filters — the recorded host gate).
+
+New tests: 2 scheduler tests for D1 (result returned uncached and counted; a
+non-`NotLeader` failure still fails the RPC), 6 for `rotation_plan` (first-cycle
+immediacy, capped monotonic backoff, overflow, single endpoint, empty set,
+jitter), 2 for endpoint pairing (`--worker-control` paired positionally; a
+partial list rejected), 6 for `redirect::classify`/`hint_to_url` (hinted
+refusal, unroutable hint, unrelated failures, hop-budget termination, empty
+metadata, scheme preservation), and 3 integration tests in
+`leader_redirect.rs` driving real `ActionCacheService` servers (a client on a
+follower reaches the leader for both read and write; an unroutable hint
+surfaces the original refusal with its metadata intact; a self-referential
+hint terminates on the hop budget instead of looping).
+
+### Next
+
+- **P3 / W6:** the real-process end-to-end — three control nodes + a worker +
+  `brokk run`, kill the leader, assert the next run succeeds within budget and
+  that the pre-kill *leader-routed* write is a cache hit afterwards (under D1
+  a follower-routed build caches nothing, so that write must go through the
+  leader for the assertion to mean anything).
+- Then **I9c** — the 1,000,000-operation certification, the last open
+  definition-of-done line.

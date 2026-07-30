@@ -11,12 +11,17 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "brokkr-worker", version, about = "Brokkr worker daemon")]
 struct Args {
-    /// gRPC endpoint of the brokkr-control **client** port (e.g.
+    /// gRPC endpoint of a brokkr-control **client** port (e.g.
     /// `http://127.0.0.1:7878`). The worker uses this for
     /// `ContentAddressableStorage` calls (stdout/stderr uploads). In
     /// single-port mode this is also where `WorkerService` lives.
+    ///
+    /// **Repeatable** (Phase 5 I9b): name every control-plane node and the
+    /// worker survives losing whichever one it is attached to — it rotates to
+    /// the next and re-registers. With one endpoint the behaviour is as
+    /// before, except that a closed stream reconnects instead of exiting.
     #[arg(long, default_value = "http://127.0.0.1:7878")]
-    control: String,
+    control: Vec<String>,
 
     /// gRPC endpoint of the brokkr-control **worker** port (where
     /// `WorkerService` is served). Defaults to the same scheme and host
@@ -26,8 +31,13 @@ struct Args {
     /// `--tls-client-ca` is configured; in open / single-port mode
     /// this is ignored. With mTLS, this endpoint MUST be `https://` and
     /// the worker MUST be started with `--client-cert`/`--client-key`.
+    ///
+    /// **Repeatable**, paired positionally with `--control`. Pass either none
+    /// (each node's worker port is derived) or exactly as many as `--control`;
+    /// a partial list is rejected rather than silently deriving the rest,
+    /// because a worker pointed at the wrong port fails every RPC (issue #139).
     #[arg(long)]
-    worker_control: Option<String>,
+    worker_control: Vec<String>,
 
     /// Run the Phase 2 host-compatibility check and exit. Prints a per-probe
     /// checklist and exits 0 iff the sandbox can run on this host (warnings
@@ -122,25 +132,64 @@ async fn run_daemon(args: Args) -> Result<()> {
         }),
         _ => None,
     };
-    // Default the worker port to "{scheme}://{host}:{port+1}" derived
-    // from --control. The bumped port is only meaningful when the
-    // control plane is in split-port mode — i.e. when mTLS is
-    // configured (--ca). In open / single-port mode the worker port
-    // doesn't exist on the server, so we pass `None` and `run_worker`
-    // falls back to `control_endpoint` for `WorkerService` too.
-    let worker_endpoint = match args.worker_control {
-        Some(s) => Some(s),
-        None if args.ca.is_some() => derive_default_worker_endpoint(&args.control),
-        None => None,
-    };
+    let control_planes =
+        build_control_planes(&args.control, &args.worker_control, args.ca.is_some())?;
+    tracing::info!(
+        endpoints = control_planes.len(),
+        "control-plane endpoints configured"
+    );
     let cfg = WorkerConfig {
-        control_endpoint: args.control,
-        worker_endpoint,
+        control_planes,
         hostname: hostname_or("worker".to_string()),
         runner,
         tls,
     };
     run_worker(cfg).await
+}
+
+/// Pair `--control` with `--worker-control` into the endpoint set the worker
+/// rotates over (Phase 5 I9b W4).
+///
+/// The worker port defaults to `{scheme}://{host}:{port+1}` derived from each
+/// `--control`. That bump is only meaningful when the control plane is in
+/// split-port mode — i.e. when mTLS is configured (`--ca`); in open /
+/// single-port mode the worker port does not exist on the server, so the entry
+/// carries `None` and `WorkerService` is reached on the client port too.
+///
+/// A partial `--worker-control` list is an error rather than a
+/// derive-the-rest convenience: mixing explicit and derived worker ports is
+/// exactly how a worker ends up pointed at a port nobody serves, and issue #139
+/// established that failure is silent until every RPC fails.
+fn build_control_planes(
+    control: &[String],
+    worker_control: &[String],
+    mtls: bool,
+) -> Result<Vec<brokkr_worker::ControlPlane>> {
+    if control.is_empty() {
+        anyhow::bail!("--control must be given at least once");
+    }
+    if !worker_control.is_empty() && worker_control.len() != control.len() {
+        anyhow::bail!(
+            "--worker-control was given {} time(s) but --control {} time(s); pass either none \
+             (worker ports are derived) or exactly one per --control, in the same order",
+            worker_control.len(),
+            control.len()
+        );
+    }
+    Ok(control
+        .iter()
+        .enumerate()
+        .map(|(i, client)| brokkr_worker::ControlPlane {
+            client: client.clone(),
+            worker: worker_control.get(i).cloned().or_else(|| {
+                if mtls {
+                    derive_default_worker_endpoint(client)
+                } else {
+                    None
+                }
+            }),
+        })
+        .collect())
 }
 
 /// Bump the port of an `http://host:port` / `https://host:port` URL by
@@ -220,8 +269,9 @@ fn hostname_or(fallback: String) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::disallowed_methods)]
 mod tests {
-    use super::derive_default_worker_endpoint;
+    use super::{build_control_planes, derive_default_worker_endpoint};
 
     #[test]
     fn bumps_port_for_http_url() {
@@ -250,5 +300,58 @@ mod tests {
     #[test]
     fn returns_none_for_unparseable() {
         assert_eq!(derive_default_worker_endpoint("not-a-url"), None);
+    }
+
+    /// I9b W4: `--control` is repeatable, and worker ports are derived per
+    /// node only in mTLS (split-port) mode.
+    #[test]
+    fn control_planes_pair_positionally_and_derive_only_under_mtls() {
+        let three = [
+            "http://a:7878".to_string(),
+            "http://b:7878".to_string(),
+            "http://c:7878".to_string(),
+        ];
+
+        // Open / single-port mode: no worker ports exist on the server, so
+        // every entry reaches WorkerService on the client port.
+        let planes = build_control_planes(&three, &[], false).unwrap();
+        assert_eq!(planes.len(), 3);
+        assert!(planes.iter().all(|p| p.worker.is_none()));
+        assert_eq!(planes[1].worker_url(), "http://b:7878");
+
+        // mTLS: each node's worker port is derived by bumping its own port,
+        // per node rather than from the first one.
+        let planes = build_control_planes(&three, &[], true).unwrap();
+        assert_eq!(planes[0].worker.as_deref(), Some("http://a:7879"));
+        assert_eq!(planes[2].worker.as_deref(), Some("http://c:7879"));
+        assert_eq!(planes[2].worker_url(), "http://c:7879");
+
+        // Explicit worker ports win, paired by position.
+        let explicit = [
+            "https://a:9001".to_string(),
+            "https://b:9002".to_string(),
+            "https://c:9003".to_string(),
+        ];
+        let planes = build_control_planes(&three, &explicit, true).unwrap();
+        assert_eq!(planes[1].worker.as_deref(), Some("https://b:9002"));
+    }
+
+    /// A partial `--worker-control` list must be refused: half-explicit,
+    /// half-derived is how a worker silently ends up on a port nobody serves
+    /// (issue #139).
+    #[test]
+    fn a_partial_worker_control_list_is_rejected() {
+        let two = ["http://a:7878".to_string(), "http://b:7878".to_string()];
+        let one = ["http://a:7879".to_string()];
+        let err = build_control_planes(&two, &one, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--worker-control") && err.contains("--control"),
+            "the error must name both flags, got: {err}"
+        );
+
+        // And an empty endpoint set is a config error, not a runtime surprise.
+        assert!(build_control_planes(&[], &[], false).is_err());
     }
 }
