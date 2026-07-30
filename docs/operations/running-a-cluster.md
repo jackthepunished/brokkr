@@ -175,6 +175,39 @@ on the worker port + JWT bearer on the client port), the three refuse-to-start
 combinations, and the happy-path `Execute` that round-trips worker stdout/stderr
 through the shared CAS.
 
+## HA control plane (Phase 5 I9, experimental)
+
+Three control planes replicating metadata (the action cache; cluster config
+to follow) through the from-scratch Raft. Each node needs a distinct
+`--node-id`, a `--raft-listen` address for peer traffic, and a `--raft-peer
+id=host:port` for every *other* member:
+
+```sh
+# Node 0
+brokkr-control --listen 127.0.0.1:7878 --data-dir ./node0   --raft --node-id control-0 --raft-listen 127.0.0.1:7978   --raft-peer control-1=127.0.0.1:7979 --raft-peer control-2=127.0.0.1:7980
+# Node 1 / node 2: same shape, own ports + ids, peers = the other two.
+```
+
+Or, all three at once:
+
+```sh
+./scripts/run-cluster.sh --ha
+```
+
+Writes are accepted by the **leader**; a follower answers
+`FAILED_PRECONDITION` with the leader's id in `x-brokkr-leader` metadata —
+retry against the hinted node. Reads through the leader are linearizable
+(ReadIndex). Raft peer links are **plaintext** in this phase: run them on a
+trusted network (mTLS for the peer plane is a noted follow-up).
+
+The real-process failover test (DoD 1 — kill the leader, elect a new one in
+under two seconds):
+
+```sh
+cargo build --workspace
+cargo test -p brokkr-control --test raft_ha_cluster -- --ignored --nocapture
+```
+
 ## Known gap
 
 A multi-*node* (multi-host) deployment and the REAPI Bazel-compatibility test

@@ -104,10 +104,34 @@ struct Args {
     /// from-scratch Raft instead of plain redb. Runs a single-voter Raft on
     /// this node — writes are committed-and-applied log entries, reads are
     /// ReadIndex-linearizable, and the log + snapshots live in
-    /// `data_dir/raft.redb`. Multi-node HA (peers, failover) arrives with
-    /// I9. Off by default: exactly the single-node redb behavior.
+    /// `data_dir/raft.redb`. With `--raft-peer`s configured this node joins
+    /// a multi-node HA cluster (I9). Off by default: exactly the
+    /// single-node redb behavior.
     #[arg(long, default_value_t = false)]
     raft: bool,
+
+    /// Stable Raft identity of THIS control plane (I9). Every node in a
+    /// cluster needs a distinct id, consistent across restarts.
+    #[arg(long, default_value = "control-0")]
+    node_id: String,
+
+    /// A Raft peer as `id=host:port` (repeatable), naming every OTHER
+    /// member of the control-plane cluster. Requires `--raft` and
+    /// `--raft-listen`. All members must agree on the full membership.
+    #[arg(long = "raft-peer")]
+    raft_peers: Vec<String>,
+
+    /// Address to serve `brokkr.v1.RaftService` on for peer traffic (I9).
+    /// Plaintext in this phase — run peer links on a trusted network;
+    /// mTLS for the raft plane is a noted follow-up.
+    #[arg(long)]
+    raft_listen: Option<SocketAddr>,
+}
+
+/// One parsed `--raft-peer id=host:port`.
+struct RaftPeer {
+    id: String,
+    addr: String,
 }
 
 impl Args {
@@ -216,6 +240,40 @@ impl Args {
             None => Authenticator::Disabled,
         };
         Ok(auth)
+    }
+
+    /// Parses and validates the I9 Raft cluster flags: every peer is
+    /// `id=host:port`, ids are unique and distinct from `--node-id`, and
+    /// peers require both `--raft` and `--raft-listen`.
+    fn raft_peers(&self) -> Result<Vec<RaftPeer>> {
+        let mut peers = Vec::new();
+        for spec in &self.raft_peers {
+            let Some((id, addr)) = spec.split_once('=') else {
+                anyhow::bail!("--raft-peer must be id=host:port, got {spec:?}");
+            };
+            if id.is_empty() || addr.is_empty() {
+                anyhow::bail!("--raft-peer must be id=host:port, got {spec:?}");
+            }
+            if id == self.node_id {
+                anyhow::bail!("--raft-peer {id} collides with our own --node-id");
+            }
+            if peers.iter().any(|p: &RaftPeer| p.id == id) {
+                anyhow::bail!("duplicate --raft-peer id {id}");
+            }
+            peers.push(RaftPeer {
+                id: id.to_string(),
+                addr: addr.to_string(),
+            });
+        }
+        if !peers.is_empty() {
+            if !self.raft {
+                anyhow::bail!("--raft-peer requires --raft");
+            }
+            if self.raft_listen.is_none() {
+                anyhow::bail!("--raft-peer requires --raft-listen so peers can reach this node");
+            }
+        }
+        Ok(peers)
     }
 
     /// Reject flag combinations that would silently mis-configure auth
@@ -327,20 +385,51 @@ async fn main() -> Result<()> {
     // action cache lives in `meta.redb` under the `ac/` namespace. Swapping
     // `RedbMetaKv` for `RaftKv` (I8c) is what makes this state survive a
     // leader kill; nothing downstream of the trait changes.
+    let raft_peers = args.raft_peers()?;
     let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
-        // I8c: a single-voter Raft replicates the metadata locally. The
-        // materialized map is rebuilt from the redb-backed log + snapshots
-        // on restart (restore + tail replay); leadership is immediate after
-        // one election timeout.
+        // I8c/I9: Raft-replicated metadata. With no peers this is a
+        // single-voter cluster; with `--raft-peer`s it is a real HA cluster
+        // — the log + snapshots are rebuilt on restart (restore + tail
+        // replay), and peers reach us via `--raft-listen`.
         let raft_log = brokkr_raft::RaftLog::open(args.data_dir.join("raft.redb"))
             .map_err(|e| anyhow::anyhow!("opening raft log: {e}"))?;
-        let node_id = brokkr_raft::NodeId::new("control-0")
+        let node_id = brokkr_raft::NodeId::new(&args.node_id)
             .map_err(|e| anyhow::anyhow!("raft node id: {e}"))?;
+
+        let mut transport = brokkr_raft::TonicTransport::new();
+        let mut peer_ids = Vec::new();
+        for peer in &raft_peers {
+            let peer_id = brokkr_raft::NodeId::new(&peer.id)
+                .map_err(|e| anyhow::anyhow!("raft peer id {}: {e}", peer.id))?;
+            // Keepalive is load-bearing, not decoration (the I5c lesson): a
+            // partition that drops packets silently leaves the h2 connection
+            // "alive" forever, and without keepalive the healed cluster can
+            // never re-integrate this peer.
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", peer.addr))
+                .with_context(|| format!("raft peer endpoint {}", peer.addr))?
+                .connect_timeout(Duration::from_millis(500))
+                .timeout(Duration::from_secs(1))
+                .http2_keep_alive_interval(Duration::from_millis(500))
+                .keep_alive_timeout(Duration::from_millis(500))
+                .keep_alive_while_idle(true)
+                .connect_lazy();
+            transport.insert_peer(peer_id.clone(), channel);
+            peer_ids.push(peer_id);
+        }
+
+        // Distinct per-node seeds keep election timeouts de-synchronized;
+        // identical seeds would make every node campaign in lockstep.
+        let seed = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            args.node_id.hash(&mut hasher);
+            hasher.finish()
+        };
         let node = brokkr_raft::RaftNode::new(
             node_id,
-            Vec::new(),
+            peer_ids,
             raft_log,
-            brokkr_raft::Rng::seed_from_u64(0),
+            brokkr_raft::Rng::seed_from_u64(seed),
             brokkr_raft::Config::default(),
             std::time::Instant::now(),
         )
@@ -350,7 +439,7 @@ async fn main() -> Result<()> {
         let (driver, handle) = brokkr_raft::RaftDriver::new(
             node,
             Box::new(machine),
-            Arc::new(brokkr_raft::TonicTransport::new()),
+            Arc::new(transport),
             Duration::from_millis(50),
         );
         tokio::spawn(async move {
@@ -358,7 +447,30 @@ async fn main() -> Result<()> {
                 tracing::error!(error = %e, "raft driver exited");
             }
         });
-        tracing::warn!("METADATA VIA RAFT (single-voter, I8c) — experimental");
+
+        // Serve RaftService for peers (I9). Plaintext: trusted network only.
+        if let Some(raft_addr) = args.raft_listen {
+            let adapter = brokkr_raft::RaftServiceAdapter::new(Arc::new(handle.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = Server::builder()
+                    .add_service(adapter.into_server())
+                    .serve(raft_addr)
+                    .await
+                {
+                    tracing::error!(error = %e, "raft peer listener exited");
+                }
+            });
+            tracing::info!(raft_addr = %raft_addr, node_id = %args.node_id,
+                peers = raft_peers.len(), "raft peer plane listening");
+        }
+        if raft_peers.is_empty() {
+            tracing::warn!("METADATA VIA RAFT (single-voter) — experimental");
+        } else {
+            tracing::warn!(
+                peers = raft_peers.len(),
+                "METADATA VIA RAFT (HA cluster, I9) — experimental"
+            );
+        }
         Arc::new(MetaKvActionCache::new(Arc::new(
             brokkr_control::RaftKv::new(handle, shared),
         )))

@@ -1168,6 +1168,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   campaigns deposed the leader of the cluster it had left; a stale minority
   leader still steps down via AppendEntries terms, so liveness holds.
   Driver: `RaftHandle::propose_conf_change` + `DriverStatus.config`.
+- `brokkr-control` HA control plane (milestone I9a, `docs/plan.md` §17
+  task 7): `--node-id`, repeatable `--raft-peer id=host:port`, and
+  `--raft-listen` turn the I8c single-voter Raft into a real multi-node
+  cluster — the node serves `brokkr.v1.RaftService` for peers and dials
+  them over lazy tonic channels **with HTTP/2 keepalive** (the I5c lesson,
+  applied in production wiring as the journal demanded: without it a healed
+  partition can never re-integrate a peer). Per-node election seeds derive
+  from the node id so timeouts stay de-synchronized. Peer links are
+  plaintext this phase (trusted network; raft-plane mTLS is a noted
+  follow-up). `scripts/run-cluster.sh --ha` starts a local 3-node cluster;
+  `docs/operations/running-a-cluster.md` documents the bring-up. **DoD 1 is
+  demonstrated on real processes** (`tests/raft_ha_cluster.rs`,
+  `#[ignore]`): three spawned `brokkr-control` binaries, leader discovered
+  through the public ActionCache surface, SIGKILLed, and a survivor accepts
+  writes again in **~290 ms** (measured 291.9 ms / 288.2 ms; budget 2 s),
+  with the pre-kill write read back linearizably from the new leader.
 - `brokkr-control` `RaftKv` — the Raft-replicated metadata store
   (milestone I8c, `docs/plan.md` §17 task 6, completes I8): the second
   `MetaKv` implementation behind the I8a seam. Writes are prost-encoded
