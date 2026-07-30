@@ -1304,3 +1304,73 @@ would have become a permanent **non-`#[ignore]`d** regression test.
 
 - **I9d:** raft-plane mTLS (ADR 0011 is already amended with the design).
 - **I10:** the Phase 5 wrap-up and §11 exit-criteria review.
+
+## I9d — raft-plane mTLS (§17 task 7, ADR 0011 amendment)
+
+- **Date:** 2026-07-30
+- **Affected:** `crates/brokkr-control` (`main.rs`;
+  `tests/raft_mtls_cluster.rs` new), `docs/architecture/0011-auth.md`,
+  `docs/operations/running-a-cluster.md`.
+- **Outcome:** the Raft peer plane is mutual-TLS. Three nodes over mTLS still
+  elect and replicate, and a node whose certificate is signed by an untrusted
+  CA **cannot join or commit anything**.
+
+### Decisions / notes
+
+- **Why this was not left as a follow-up.** I9a shipped the peer plane in
+  plaintext on the reasoning that it runs on a trusted network. That is a
+  *deployment assumption*, not a security property — and the asymmetry with
+  the other two planes is what settles it: on the client and worker planes the
+  worst case is unauthorized access to *cache* data, but `AppendEntries` on
+  the peer plane **appends to the replicated log**. An unauthenticated peer
+  port is a write path into consensus itself. Shipping "HA control plane" with
+  that open, mentioned only in a flag's help text, was not defensible.
+- **Three planes, and the peer plane is deliberately the odd one.** Client =
+  JWT bearer (a tenant identity), worker = mTLS (a machine identity), peer =
+  **mTLS mutual-only, no JWT**. A peer is not a tenant and has no user
+  identity to carry; adding a bearer token there would be one more thing to
+  misconfigure while authenticating nothing extra. Written up in the ADR 0011
+  amendment rather than left implicit.
+- **`resolve_raft_tls` is a pure function, and that is the point.** The
+  failure this guards against is *silent until a peer first tries to
+  replicate* — a half-configured plane starts happily and dies at handshake
+  time. Making the decision pure means all six partial combinations are tested
+  without binding a socket, and each test asserts the error **names the
+  missing flag** rather than saying "invalid configuration". Fully configured
+  with `--raft` off is also refused: those flags would otherwise silently do
+  nothing.
+- **Both directions, one code path.** The `--raft-listen` server gets
+  `client_ca_root` (which makes the client certificate mandatory in tonic
+  0.12), and the outbound peer channels get a `ClientTlsConfig` carrying both
+  the CA and this node's identity — reusing the worker-plane plumbing rather
+  than a parallel TLS implementation, because a second implementation is
+  exactly how the half-configured states issue #139 closed get reintroduced.
+  The peer URL scheme follows the posture (`https` vs `http`) so a mismatch
+  cannot be constructed by hand.
+- **Proving the good path is not enough.** The load-bearing test is
+  `a_peer_with_an_untrusted_certificate_cannot_join`: three nodes presenting
+  `badworker.pem` (signed by `badca`) while verifying against `ca.pem` must
+  **never commit a write**, because no quorum can form when every
+  `AppendEntries` fails the handshake. Without it the plane could be
+  configured-but-not-enforcing — which is precisely the bug issue #139 found
+  on the worker plane, where the CA was loaded but the client certificate was
+  never actually required.
+- **Plaintext stays available and now says what it costs.** Local development
+  (`scripts/run-cluster.sh --ha`) still runs unencrypted, but startup logs a
+  warning naming the consequence — anyone who can reach the port can append to
+  the replicated log — instead of a neutral "TLS disabled".
+
+### Verified in WSL2
+
+`cargo test -p brokkr-control --test raft_mtls_cluster -- --ignored`:
+**2 passed in 12.42 s** (mTLS cluster elects, replicates and reads back; the
+untrusted-CA cluster commits nothing). Unit tests: 8 in the `brokkr-control`
+binary including `raft_plane_tls_is_all_or_nothing` (all three flags, none,
+each of the six partial combinations, and configured-with-`--raft`-off).
+Workspace green on CI's exact five commands, with only the 6 known
+`evil_seccomp_caps` failures that need a real kernel.
+
+### Next
+
+- **I10:** the Phase 5 wrap-up and §11 exit-criteria review. All three
+  definition-of-done lines are proven; nothing in §17 remains open.

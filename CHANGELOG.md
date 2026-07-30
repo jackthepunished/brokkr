@@ -1400,3 +1400,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   citing since it was accepted. Records the operator TUI as accepted and
   **explicitly unstarted**, so the phase table stays an honest account of what
   is built when.
+- `brokkr-control` **Raft peer plane over mTLS** (milestone I9d, ADR 0011
+  amendment): `--raft-tls-cert`, `--raft-tls-key` and `--raft-tls-ca` secure
+  peer traffic in **both** directions — the `--raft-listen` server requires a
+  client certificate (`client_ca_root`) and the outbound peer channels present
+  this node's identity while verifying the peer's, reusing the worker-plane
+  TLS plumbing rather than a second code path. The peer URL scheme follows the
+  posture, so an `https`/`http` mismatch cannot be constructed by hand.
+  I9a's plaintext peer links were a *deployment assumption*, not a security
+  property: unlike the client and worker planes — where the worst case is
+  unauthorized access to cache data — `AppendEntries` on the peer plane
+  **appends to the replicated log**, making an unauthenticated peer port a
+  write path into consensus itself. The plane is mutual-only with no JWT: a
+  peer is not a tenant and has no user identity to carry.
+  The three flags are **all-or-nothing** and validated by a pure function, so
+  every half-configuration fails at *startup* naming the missing flag rather
+  than at handshake time when a peer first tries to replicate (the posture
+  issue #139 established for the other planes); configuring them with `--raft`
+  off is refused too. Plaintext remains available for local development and
+  now logs a warning that names the consequence.
+  New `tests/raft_mtls_cluster.rs` (`#[ignore]`) proves both halves: a 3-node
+  mTLS cluster elects, replicates and reads back; and a cluster whose nodes
+  present a certificate signed by an untrusted CA **commits nothing**, which
+  is what distinguishes an enforcing plane from a merely configured one.

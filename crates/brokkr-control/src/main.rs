@@ -139,6 +139,95 @@ struct Args {
     /// flag is required whenever `--raft` is on.
     #[arg(long)]
     advertise_addr: Option<String>,
+
+    /// This node's certificate for the **Raft peer plane** (I9d, ADR 0011).
+    ///
+    /// The peer plane is mutual-TLS-only: a peer is not a tenant and carries
+    /// no user identity, so there is no JWT here — but `AppendEntries` on this
+    /// plane appends to the replicated log, which makes an unauthenticated
+    /// peer port a write path into consensus itself.
+    ///
+    /// All three of `--raft-tls-cert`, `--raft-tls-key` and `--raft-tls-ca`
+    /// must be given together; they configure both the `--raft-listen` server
+    /// and the outbound peer channels, because a one-sided configuration
+    /// fails at handshake time instead of at startup.
+    #[arg(long, requires_all = ["raft_tls_key", "raft_tls_ca"])]
+    raft_tls_cert: Option<PathBuf>,
+
+    /// Private key for [`Self::raft_tls_cert`] (I9d).
+    #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_ca"])]
+    raft_tls_key: Option<PathBuf>,
+
+    /// CA that verifies peer certificates on the Raft plane (I9d). Both
+    /// directions verify against it: inbound peers must present a certificate
+    /// it signs, and outbound channels verify the peer's server certificate.
+    #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_key"])]
+    raft_tls_ca: Option<PathBuf>,
+}
+
+/// The Raft peer plane's transport security, resolved from the flags (I9d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RaftPlaneTls {
+    /// Plaintext — development only; documented as such in
+    /// `docs/operations/running-a-cluster.md`.
+    Disabled,
+    /// Mutual TLS: this node's identity plus the CA that verifies peers.
+    Enabled {
+        cert: PathBuf,
+        key: PathBuf,
+        ca: PathBuf,
+    },
+}
+
+/// Validate the Raft-plane TLS flags as a set (I9d).
+///
+/// A pure function over the four inputs so every half-configuration is
+/// testable without binding a socket — which matters because the failure this
+/// guards against is *silent until a peer first tries to replicate*. Issue
+/// #139 established the posture for the client and worker planes: a
+/// misconfiguration is a startup error, never a runtime surprise.
+fn resolve_raft_tls(
+    raft: bool,
+    cert: Option<&PathBuf>,
+    key: Option<&PathBuf>,
+    ca: Option<&PathBuf>,
+) -> Result<RaftPlaneTls> {
+    match (cert, key, ca) {
+        (None, None, None) => Ok(RaftPlaneTls::Disabled),
+        (Some(cert), Some(key), Some(ca)) => {
+            if !raft {
+                anyhow::bail!(
+                    "--raft-tls-cert/--raft-tls-key/--raft-tls-ca configure the Raft peer \
+                     plane but --raft is off; enable --raft or drop the TLS flags"
+                );
+            }
+            Ok(RaftPlaneTls::Enabled {
+                cert: cert.clone(),
+                key: key.clone(),
+                ca: ca.clone(),
+            })
+        }
+        // clap's `requires_all` already rejects most partial sets; this arm
+        // catches the rest and, more importantly, states the rule in one
+        // place rather than trusting an attribute to be the whole contract.
+        _ => {
+            let missing = [
+                ("--raft-tls-cert", cert.is_none()),
+                ("--raft-tls-key", key.is_none()),
+                ("--raft-tls-ca", ca.is_none()),
+            ]
+            .into_iter()
+            .filter(|(_, absent)| *absent)
+            .map(|(flag, _)| flag)
+            .collect::<Vec<_>>()
+            .join(", ");
+            anyhow::bail!(
+                "the Raft peer plane is half-configured: missing {missing}. Pass all of \
+                 --raft-tls-cert, --raft-tls-key and --raft-tls-ca, or none of them \
+                 (plaintext, development only)"
+            )
+        }
+    }
 }
 
 /// One parsed `--raft-peer id=host:port`.
@@ -426,6 +515,12 @@ async fn main() -> Result<()> {
     // leader kill; nothing downstream of the trait changes.
     let raft_peers = args.raft_peers()?;
     let advertise_addr = args.resolved_advertise_addr()?;
+    let raft_tls = resolve_raft_tls(
+        args.raft,
+        args.raft_tls_cert.as_ref(),
+        args.raft_tls_key.as_ref(),
+        args.raft_tls_ca.as_ref(),
+    )?;
     let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
         // I8c/I9: Raft-replicated metadata. With no peers this is a
         // single-voter cluster; with `--raft-peer`s it is a real HA cluster
@@ -445,14 +540,36 @@ async fn main() -> Result<()> {
             // partition that drops packets silently leaves the h2 connection
             // "alive" forever, and without keepalive the healed cluster can
             // never re-integrate this peer.
-            let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", peer.addr))
-                .with_context(|| format!("raft peer endpoint {}", peer.addr))?
-                .connect_timeout(Duration::from_millis(500))
-                .timeout(Duration::from_secs(1))
-                .http2_keep_alive_interval(Duration::from_millis(500))
-                .keep_alive_timeout(Duration::from_millis(500))
-                .keep_alive_while_idle(true)
-                .connect_lazy();
+            // Scheme follows the plane's security: an https endpoint with no
+            // TLS config (or the reverse) fails at handshake time, which is
+            // exactly the late failure `resolve_raft_tls` exists to prevent.
+            let scheme = match &raft_tls {
+                RaftPlaneTls::Enabled { .. } => "https",
+                RaftPlaneTls::Disabled => "http",
+            };
+            let mut endpoint =
+                tonic::transport::Endpoint::from_shared(format!("{scheme}://{}", peer.addr))
+                    .with_context(|| format!("raft peer endpoint {}", peer.addr))?
+                    .connect_timeout(Duration::from_millis(500))
+                    .timeout(Duration::from_secs(1))
+                    .http2_keep_alive_interval(Duration::from_millis(500))
+                    .keep_alive_timeout(Duration::from_millis(500))
+                    .keep_alive_while_idle(true);
+            if let RaftPlaneTls::Enabled { cert, key, ca } = &raft_tls {
+                // Same plumbing as the worker plane, not a second code path:
+                // a parallel TLS implementation is how the half-configured
+                // states issue #139 closed get reintroduced.
+                let ca_pem = std::fs::read(ca).context("reading --raft-tls-ca")?;
+                let cert_pem = std::fs::read(cert).context("reading --raft-tls-cert")?;
+                let key_pem = std::fs::read(key).context("reading --raft-tls-key")?;
+                let tls = tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem))
+                    .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
+                endpoint = endpoint
+                    .tls_config(tls)
+                    .context("raft peer TLS configuration")?;
+            }
+            let channel = endpoint.connect_lazy();
             transport.insert_peer(peer_id.clone(), channel);
             peer_ids.push(peer_id);
         }
@@ -491,8 +608,35 @@ async fn main() -> Result<()> {
         // Serve RaftService for peers (I9). Plaintext: trusted network only.
         if let Some(raft_addr) = args.raft_listen {
             let adapter = brokkr_raft::RaftServiceAdapter::new(Arc::new(handle.clone()));
+            let peer_tls = match &raft_tls {
+                RaftPlaneTls::Disabled => None,
+                RaftPlaneTls::Enabled { cert, key, ca } => {
+                    let cert_pem = std::fs::read(cert).context("reading --raft-tls-cert")?;
+                    let key_pem = std::fs::read(key).context("reading --raft-tls-key")?;
+                    let ca_pem = std::fs::read(ca).context("reading --raft-tls-ca")?;
+                    // `client_ca_root` makes the client certificate mandatory
+                    // in tonic 0.12 — the peer plane is mutual-only, so an
+                    // unauthenticated peer must not be able to append to the
+                    // replicated log.
+                    Some(
+                        ServerTlsConfig::new()
+                            .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+                            .client_ca_root(tonic::transport::Certificate::from_pem(ca_pem)),
+                    )
+                }
+            };
             tokio::spawn(async move {
-                if let Err(e) = Server::builder()
+                let mut builder = Server::builder();
+                if let Some(tls) = peer_tls {
+                    match builder.tls_config(tls) {
+                        Ok(b) => builder = b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "raft peer TLS configuration rejected");
+                            return;
+                        }
+                    }
+                }
+                if let Err(e) = builder
                     .add_service(adapter.into_server())
                     .serve(raft_addr)
                     .await
@@ -500,8 +644,19 @@ async fn main() -> Result<()> {
                     tracing::error!(error = %e, "raft peer listener exited");
                 }
             });
-            tracing::info!(raft_addr = %raft_addr, node_id = %args.node_id,
-                peers = raft_peers.len(), "raft peer plane listening");
+            match &raft_tls {
+                RaftPlaneTls::Enabled { .. } => tracing::info!(
+                    raft_addr = %raft_addr, node_id = %args.node_id,
+                    peers = raft_peers.len(), "raft peer plane listening (mTLS)"
+                ),
+                RaftPlaneTls::Disabled => tracing::warn!(
+                    raft_addr = %raft_addr, node_id = %args.node_id,
+                    peers = raft_peers.len(),
+                    "RAFT PEER PLANE IS PLAINTEXT — anyone who can reach this port can \
+                     append to the replicated log. Development only; pass \
+                     --raft-tls-cert/--raft-tls-key/--raft-tls-ca in production"
+                ),
+            }
         }
         if raft_peers.is_empty() {
             tracing::warn!("METADATA VIA RAFT (single-voter) — experimental");
@@ -767,6 +922,67 @@ mod tests {
         argv.extend(extra.iter().map(|s| s.to_string()));
         let args = Args::try_parse_from(argv).unwrap();
         (dir, args)
+    }
+
+    /// I9d: the Raft peer plane is all-or-nothing. Every half-configuration
+    /// must fail at **startup**, naming what is missing — the failure this
+    /// guards against is otherwise silent until a peer first tries to
+    /// replicate, which is the posture issue #139 established for the other
+    /// two planes.
+    #[test]
+    fn raft_plane_tls_is_all_or_nothing() {
+        let cert = PathBuf::from("/c.pem");
+        let key = PathBuf::from("/k.pem");
+        let ca = PathBuf::from("/ca.pem");
+
+        // None of the three: plaintext, which is legal (dev-only).
+        assert_eq!(
+            resolve_raft_tls(true, None, None, None).unwrap(),
+            RaftPlaneTls::Disabled
+        );
+        // ...and legal without --raft too, since nothing is configured.
+        assert_eq!(
+            resolve_raft_tls(false, None, None, None).unwrap(),
+            RaftPlaneTls::Disabled
+        );
+
+        // All three: mutual TLS.
+        assert_eq!(
+            resolve_raft_tls(true, Some(&cert), Some(&key), Some(&ca)).unwrap(),
+            RaftPlaneTls::Enabled {
+                cert: cert.clone(),
+                key: key.clone(),
+                ca: ca.clone(),
+            }
+        );
+
+        // Every partial combination is refused, and the message names the
+        // missing flag(s) rather than saying "invalid configuration".
+        for (c, k, a, expected) in [
+            (Some(&cert), None, None, "--raft-tls-key"),
+            (None, Some(&key), None, "--raft-tls-cert"),
+            (None, None, Some(&ca), "--raft-tls-cert"),
+            (Some(&cert), Some(&key), None, "--raft-tls-ca"),
+            (Some(&cert), None, Some(&ca), "--raft-tls-key"),
+            (None, Some(&key), Some(&ca), "--raft-tls-cert"),
+        ] {
+            let err = resolve_raft_tls(true, c, k, a).unwrap_err().to_string();
+            assert!(
+                err.contains("half-configured") && err.contains(expected),
+                "expected the error to name {expected}, got: {err}"
+            );
+        }
+
+        // Fully configured but --raft off: the flags would silently do
+        // nothing, so say so instead of starting an unsecured-but-unused
+        // plane.
+        let err = resolve_raft_tls(false, Some(&cert), Some(&key), Some(&ca))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--raft is off"),
+            "expected the error to point at --raft, got: {err}"
+        );
     }
 
     /// I9b: the advertise address defaults to `--listen`, an explicit value
