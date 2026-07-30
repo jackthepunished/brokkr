@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Closed a `/tmp` symlink race in the sandbox rootfs bootstrap.** The runner
+  mounted the transient rootfs tmpfs onto `/tmp/brokkr-rootfs-<pid>`, a
+  predictable path created with `create_dir_all` (which follows an existing
+  symlink). A local user who predicted the runner PID could pre-create that
+  path as a symlink and redirect the mount point. The directory is now created
+  with `mkdtemp`, which picks a random suffix and creates it atomically with
+  `0700` permissions (`O_EXCL` semantics), so the name is unpredictable and a
+  pre-existing entry cannot be followed. Added a unit test asserting the
+  bootstrap directory is unique, `0700`, and a real (non-symlink) directory.
 - Reviewed the seccomp `socket` / `socketpair` allowance (issue #69) and
   replaced the terse "netns blocks egress" comment with the full
   rationale: the action's network namespace scopes abstract `AF_UNIX`
