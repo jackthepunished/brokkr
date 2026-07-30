@@ -126,6 +126,19 @@ struct Args {
     /// mTLS for the raft plane is a noted follow-up.
     #[arg(long)]
     raft_listen: Option<SocketAddr>,
+
+    /// The client-plane address to advertise to the cluster (I9b), as
+    /// `host:port`. When this node is the Raft leader it publishes this
+    /// address under `cfg/nodes/<node-id>`, so every replica can turn a
+    /// leader *id* into something a client can actually dial: a follower
+    /// refusing a metadata write answers `FAILED_PRECONDITION` with both
+    /// `x-brokkr-leader` and `x-brokkr-leader-addr`.
+    ///
+    /// Defaults to `--listen`. A wildcard bind (`0.0.0.0` / `::`) cannot be
+    /// advertised — it is not reachable — so with a wildcard `--listen` this
+    /// flag is required whenever `--raft` is on.
+    #[arg(long)]
+    advertise_addr: Option<String>,
 }
 
 /// One parsed `--raft-peer id=host:port`.
@@ -276,6 +289,32 @@ impl Args {
         Ok(peers)
     }
 
+    /// The client-plane address this node advertises to the cluster (I9b).
+    ///
+    /// `--advertise-addr` when set, else `--listen`. A wildcard bind is
+    /// refused rather than published: `0.0.0.0:7878` is a *binding*
+    /// instruction, not an address a peer or client can dial, and publishing
+    /// it would hand every redirected client a hint guaranteed to fail. The
+    /// check only fires under `--raft`, so single-node operators keep binding
+    /// wildcards without having to name themselves.
+    fn resolved_advertise_addr(&self) -> Result<String> {
+        if let Some(addr) = &self.advertise_addr {
+            if addr.trim().is_empty() {
+                anyhow::bail!("--advertise-addr must not be empty");
+            }
+            return Ok(addr.clone());
+        }
+        if self.raft && self.listen.ip().is_unspecified() {
+            anyhow::bail!(
+                "--listen is a wildcard address ({}) which cannot be advertised to the \
+                 cluster; pass --advertise-addr <host:port> naming how peers and clients \
+                 reach this node",
+                self.listen
+            );
+        }
+        Ok(self.listen.to_string())
+    }
+
     /// Reject flag combinations that would silently mis-configure auth
     /// (issue #139). Runs before any listener is bound so the operator
     /// gets a clean startup error instead of a runtime `UNAUTHENTICATED`
@@ -386,6 +425,7 @@ async fn main() -> Result<()> {
     // `RedbMetaKv` for `RaftKv` (I8c) is what makes this state survive a
     // leader kill; nothing downstream of the trait changes.
     let raft_peers = args.raft_peers()?;
+    let advertise_addr = args.resolved_advertise_addr()?;
     let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
         // I8c/I9: Raft-replicated metadata. With no peers this is a
         // single-voter cluster; with `--raft-peer`s it is a real HA cluster
@@ -471,9 +511,50 @@ async fn main() -> Result<()> {
                 "METADATA VIA RAFT (HA cluster, I9) — experimental"
             );
         }
-        Arc::new(MetaKvActionCache::new(Arc::new(
-            brokkr_control::RaftKv::new(handle, shared),
-        )))
+        let raft_kv = Arc::new(brokkr_control::RaftKv::new(handle.clone(), shared));
+
+        // Publish this node's client-plane address whenever we hold
+        // leadership (I9b). Only the leader can propose, and the leader's
+        // address is the only one a redirect ever needs, so leadership *is*
+        // the trigger — a follower has nothing to publish and no way to
+        // publish it. `publish_node_record` is idempotent, so a stable leader
+        // writes one entry per term, not one per tick.
+        let publisher_kv = Arc::clone(&raft_kv);
+        let publisher_id = args.node_id.clone();
+        let publisher_addr = advertise_addr.clone();
+        tokio::spawn(async move {
+            loop {
+                // A step-down clears `was_leader`, so regaining leadership
+                // republishes — the record may have been truncated by the
+                // term that deposed us.
+                if matches!(publisher_kv.is_leader().await, Ok(true)) {
+                    match publisher_kv
+                        .publish_node_record(&publisher_id, &publisher_addr)
+                        .await
+                    {
+                        Ok(()) => {}
+                        // Losing leadership mid-propose is ordinary, not an
+                        // error worth shouting about: the next leader
+                        // publishes its own address.
+                        Err(brokkr_control::MetaKvError::NotLeader { .. }) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            node_id = %publisher_id,
+                            "could not publish this node's advertise address; \
+                             redirects to this node will carry an id but no address"
+                        ),
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        tracing::info!(
+            node_id = %args.node_id,
+            advertise_addr = %advertise_addr,
+            "publishing this node's client-plane address while leader"
+        );
+
+        Arc::new(MetaKvActionCache::new(raft_kv))
     } else {
         let meta_kv = Arc::new(
             RedbMetaKv::open(args.data_dir.join("meta.redb"))
@@ -686,6 +767,64 @@ mod tests {
         argv.extend(extra.iter().map(|s| s.to_string()));
         let args = Args::try_parse_from(argv).unwrap();
         (dir, args)
+    }
+
+    /// I9b: the advertise address defaults to `--listen`, an explicit value
+    /// wins, and a wildcard bind under `--raft` is refused rather than
+    /// published as an undialable hint.
+    #[test]
+    fn advertise_addr_resolution_refuses_only_unusable_wildcards() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["brokkr-control".to_string()];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            Args::try_parse_from(argv).unwrap()
+        };
+
+        // Default: whatever we bind is what we advertise.
+        let args = parse(&["--listen", "127.0.0.1:7878"]);
+        assert_eq!(
+            args.resolved_advertise_addr().unwrap(),
+            "127.0.0.1:7878".to_string()
+        );
+
+        // Explicit wins, including over a wildcard bind — the normal
+        // production shape: bind everywhere, advertise one reachable name.
+        let args = parse(&[
+            "--raft",
+            "--listen",
+            "0.0.0.0:7878",
+            "--advertise-addr",
+            "control-1.internal:7878",
+        ]);
+        assert_eq!(
+            args.resolved_advertise_addr().unwrap(),
+            "control-1.internal:7878".to_string()
+        );
+
+        // Wildcard + --raft + no explicit value: refused, and the message
+        // must name the flag that fixes it.
+        let args = parse(&["--raft", "--listen", "0.0.0.0:7878"]);
+        let err = args.resolved_advertise_addr().unwrap_err().to_string();
+        assert!(
+            err.contains("--advertise-addr"),
+            "the error must name the fix, got: {err}"
+        );
+
+        // The IPv6 wildcard is just as undialable.
+        let args = parse(&["--raft", "--listen", "[::]:7878"]);
+        assert!(args.resolved_advertise_addr().is_err());
+
+        // Without --raft nothing is published, so a wildcard bind stays legal:
+        // single-node operators are not made to name themselves.
+        let args = parse(&["--listen", "0.0.0.0:7878"]);
+        assert_eq!(
+            args.resolved_advertise_addr().unwrap(),
+            "0.0.0.0:7878".to_string()
+        );
+
+        // An empty explicit value is a typo, not a default.
+        let args = parse(&["--advertise-addr", "   "]);
+        assert!(args.resolved_advertise_addr().is_err());
     }
 
     #[test]

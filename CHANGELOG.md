@@ -1286,3 +1286,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a build routed to a follower is correct but uncached, surfaced by a
   counter and a not-cached marker rather than silently), and raft-plane
   mTLS is in scope for this phase rather than deferred.
+- `brokkr-control` actionable leader redirects + replicated cluster config
+  (milestone I9b W1+W2, `docs/plan.md` §17 task 7, `docs/phase-5-plan.md`
+  §VII.3): a follower refusing a metadata write has always named the leader,
+  but a node id is not something a client can dial, so the redirect was
+  unusable. The `cfg/` namespace I8a reserved for cluster configuration now
+  carries a `NodeRecord` per node under `cfg/nodes/<node-id>`, and
+  `CasError::NotLeader` / `MetaKvError::NotLeader` carry a `leader_addr`
+  beside the id — surfaced as a new `x-brokkr-leader-addr` gRPC metadata key
+  alongside the unchanged `x-brokkr-leader`. New `--advertise-addr` names the
+  client-plane address this node publishes (defaults to `--listen`; a wildcard
+  bind under `--raft` is **refused** rather than published, because
+  `0.0.0.0:7878` is a binding instruction and not a dialable address).
+  **Only the leader publishes, and only its own record:** a follower cannot
+  propose, and the leader's address is the only one a redirect ever needs — so
+  leadership itself is the trigger, and `publish_node_record` is idempotent so
+  a stable leader writes one entry per term rather than one per tick. A
+  follower resolves the address from its own applied `KvMachine`
+  (`RaftKv::published_addr`) **without** a ReadIndex round trip: this is a
+  routing hint, and demanding linearizability for it would be both pointless
+  (leadership can change immediately after the answer) and impossible on a
+  follower. Each hint is emitted independently, so an id known before its
+  address has replicated still redirects, and an address that will not parse
+  as a header value cannot suppress the id.

@@ -38,10 +38,17 @@ pub enum CasError {
     /// The write reached a metadata replica that is not the Raft leader
     /// (Phase 5 I8c). Carries the leader's identity when known so the
     /// service layer can redirect the caller instead of failing hard.
-    #[error("not the metadata leader (leader hint: {leader:?})")]
+    #[error("not the metadata leader (leader hint: {leader:?} at {leader_addr:?})")]
     NotLeader {
         /// The current leader, if known.
         leader: Option<String>,
+
+        /// The leader's client-plane advertise address (`host:port`) when the
+        /// cluster has published it (Phase 5 I9b). Separate from [`Self::NotLeader::leader`]
+        /// because the id is known the instant a leader is recognized, while
+        /// the address is only known once that leader's record has replicated
+        /// — so a redirect can legitimately carry an id and no address.
+        leader_addr: Option<String>,
     },
 }
 
