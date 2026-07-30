@@ -1374,3 +1374,143 @@ Workspace green on CI's exact five commands, with only the 6 known
 
 - **I10:** the Phase 5 wrap-up and §11 exit-criteria review. All three
   definition-of-done lines are proven; nothing in §17 remains open.
+
+## Phase 5 wrap-up & exit-criteria review (I10)
+
+Phase 5 replaced the control plane's embedded metadata store with a Raft
+implementation written from the paper — no external Raft crate, per CLAUDE.md
+rule 10 — and stood up a control plane that survives losing a node. Shipped
+across PRs #120–#172 and ADR 0013.
+
+### What shipped (by §17 task)
+
+| Task | Capability | Milestones |
+|---|---|---|
+| 1 | `docs/raft-notes.md` — the implementation reference, from the extended paper | I0 |
+| 2 | ADR 0013 + `brokkr-raft`: crash-safe hard state on redb, leader election, log replication, the Figure-8 commit rule | I1–I4 |
+| 3 | Deterministic fault-injection simulator, async `RaftDriver`, tonic-over-turmoil cluster tests | I5a–I5c |
+| 4 | Snapshots + log compaction + `InstallSnapshot` | I6 |
+| 5 | Joint-consensus membership changes + learners with a catch-up gate | I7a–I7c |
+| 6 | `MetaKv` seam, state-machine apply loop, ReadIndex, `RaftKv` | I8a–I8c |
+| 7 | HA control plane; actionable leader redirects; client & worker failover; real-process e2e; raft-plane mTLS | I9a, I9b, I9d |
+| 8 | The 1,000,000-operation certification | I9c |
+
+### §17 Definition of Done — all three lines proven
+
+1. ✅ **Kill the leader → a new one in < 2 s.** 291.9 ms / 288.2 ms on three
+   real processes (`raft_ha_cluster.rs`); **133.4 ms** from SIGKILL to a
+   completed `brokk run` end to end, cache intact (`raft_ha_e2e.rs`).
+2. ✅ **Partition → minority stops accepting writes; rejoin → consistent.**
+   `simulation.rs::minority_partition_cannot_commit_and_heals_consistently`
+   and, over real gRPC, `turmoil_cluster.rs::grpc_cluster_survives_leader_partition_and_heals`.
+   Real-process partitioning needs root + netns and was deliberately not
+   attempted — stated plainly rather than implied.
+3. ✅ **1,000,000 operations under fault injection, zero divergence.**
+   `ops=1000000 rounds=32216 commit=906330 wall=3060.8s rate=327/s
+   seed=20260730` (I9c).
+
+### Exit criteria (`docs/plan.md` §11)
+
+1. **Rustdoc on all public APIs** — ✅ `cargo doc --all-features -D warnings`
+   green in CI. One slip was caught this phase (a public doc linking a private
+   const) and the doc gate is now run as its own step, since clippy and tests
+   both pass while it fails.
+2. **Unit tests ≥80% on logic-heavy code** — ✅ by inspection for `node.rs`
+   (election, replication, Figure-8, ReadIndex), `driver.rs`, `storage.rs`,
+   `raftkv.rs`, `metakv.rs`, plus the pure policy functions added in I9b
+   (`rotation_plan`, `redirect::classify`, `resolve_raft_tls`). **No coverage
+   tool is wired into CI**, so this is an inspection claim rather than a
+   measured number — the same honest caveat Phase 4 recorded, and still worth
+   closing with `cargo-llvm-cov` one day.
+3. **≥1 integration test per capability** — ✅ `crash_consistency.rs`,
+   `driver.rs`, `simulation.rs`, `turmoil_cluster.rs`, `turmoil_wire.rs`,
+   `raft_kv_cluster.rs`, `raft_ha_cluster.rs`, `raft_ha_e2e.rs`,
+   `leader_redirect.rs`, `raft_mtls_cluster.rs`.
+4. **Tracing spans on new code paths** — ✅ `RaftService` handlers, the driver
+   apply loop, `RaftKv` get/put/delete/scan, and the I9b redirect path.
+5. **Retrospective** — ✅ below.
+
+### Retrospective
+
+- **What the paper hid.** The Figure-8 rule is stated in a paragraph and costs
+  a day to get right; the *start-of-term no-op* it implies is barely
+  mentioned, and deferring it (as I4 did) quietly makes ReadIndex unsafe until
+  I8b adds it back. The paper is a specification, not an implementation plan.
+- **What the deterministic simulator caught that turmoil could not.** Seeded
+  reproducibility: a failing interleaving becomes a fixture. Turmoil exercises
+  the real tonic stack but a failure there is a story, not a seed.
+- **What turmoil caught that the simulator could not.** The keepalive lesson
+  (I5c): a partition that silently drops packets leaves an h2 connection
+  "alive" forever, so a healed cluster never re-integrates the peer. No
+  pure-core simulator models that, because it is a property of the transport.
+  I9a shipped the fix into production wiring precisely because I5c wrote it
+  down.
+- **Index churn is a test-design lesson.** Adding the start-of-term no-op
+  shifted ~15 tests' absolute indices by one. Tests asserting *relative*
+  progress survived; tests asserting exact numbers had to be rewritten. The
+  absolute numbers were incidental detail masquerading as specification.
+- **The I8a forcing function fired three times.** Declaring the
+  `From<MetaKvError> for CasError` conversion as an exhaustive match — instead
+  of a catch-all — broke the build at exactly the right place when I8c added
+  `NotLeader` and again when I9b added `leader_addr`, including inside a test's
+  destructuring pattern. A deliberate compile error is worth more than a
+  comment asking future readers to remember something.
+- **Real processes found what no in-process test could.** The I9b e2e exposed
+  two defects on its first two runs: an HA control plane needs a worker on
+  *every* node (the registry is per-node and deliberately unreplicated), and
+  decision D1 had been implemented on only half its path — a follower's cache
+  *lookup* still failed builds before the action ran. Both were invisible to
+  every in-process test, because those pass `skip_cache_lookup` or use a
+  working store.
+- **The certification's first failure was in the test, not the system.** A 1M
+  run decayed from 462 to 188 ops/s and projected past two hours; the cause was
+  the harness storing the entire applied history inside every snapshot blob,
+  making compaction O(history) and the run O(n²). Fixing the *constant* rather
+  than the *requirement* mattered: lowering the operation count to make a
+  number look better would have made the certification worthless.
+- **CI caught a defective assertion inside DoD line 2's own proof — after the
+  phase was declared done.** The wrap-up PR, which changes no code, failed
+  `cargo test` on **aarch64 only**: *a minority-partitioned leader cannot
+  advance its commit index: left: 3, right: 2*. Two defects, both in the test.
+  The assertion tested a **proxy, not the property** — an index of 3 arises
+  equally from "committed its own doomed entry" (a real safety violation) and
+  from "stepped down and legitimately learned the new leader's entry" (correct
+  Raft), so it **failed on correct behaviour while being unable to prove the
+  incorrect one**. And the test was **nondeterministic despite turmoil**: its
+  registry was a `HashMap`, whose per-process randomized iteration order
+  changed the polling order and hence the interleaving — which is why x86_64
+  passed and aarch64 failed on byte-identical code.
+  Fixed by `BTreeMap` for deterministic iteration plus an assertion that splits
+  the cases (still leading ⇒ commit index frozen; stepped down ⇒ must have
+  adopted the higher term), leaving the unconditional post-heal assertions as
+  the real safety proof. Verified over 12 consecutive runs, since one green run
+  says nothing about a per-process nondeterminism. `build_with_rng` would also
+  pin turmoil's latency jitter but needs `rand`, which ADR 0013 deliberately
+  avoided — left as a follow-up rather than quietly added.
+  The lesson is not "tests flake". A test that usually passes can be **testing
+  the wrong thing**, and re-running until green would have buried that
+  permanently inside the evidence for a definition-of-done line.
+
+- **Pure policy functions paid for themselves repeatedly.** Extracting
+  `rotation_plan`, `redirect::classify` and `resolve_raft_tls` and testing them
+  exhaustively caught five bugs no happy-path integration test reaches: a
+  `1 << n` overflow panic, a modulo-by-zero, an https→http downgrade on
+  redirect, a redirect cycle that hung, and half-configured TLS that would have
+  failed only at handshake time.
+
+### Deferred (with reasons)
+
+| Deferred | Why it is safe to defer |
+|---|---|
+| Pre-vote | Election disruption after a partition heals is a liveness annoyance, not a safety hole; terms already step down correctly. |
+| Leadership transfer | Graceful handoff is an operability nicety; kill-and-elect is proven at 291 ms. |
+| Fast log backup (conflict index/term hints) | `nextIndex` back-off is correct, just chattier on a long divergence. |
+| Chunked `InstallSnapshot` | Snapshots are a serialized map today; chunking matters when state outgrows one message. |
+| Follower reads at the read index | Reads are leader-served and linearizable; follower reads are throughput, not correctness. |
+| Dynamic peer discovery / auto-join | Membership is flag-configured plus joint consensus; discovery is deployment convenience. |
+| Raft metrics dashboard | Spans and counters exist; the dashboard is presentation. |
+| D1 alternatives — admission-time refusal, follower→leader forwarding | The chosen best-effort path is correct and observable; both alternatives change the control plane's active/passive posture and deserve their own decision. |
+| Durable scheduler state (job history, leases through Raft) | Ephemeral by ADR 0008–0010 design; replicating it would cost consensus round trips on every heartbeat. |
+| **Hash-chain oracle for the simulator** | The history-blob oracle is correct but O(history); a chain hash would make the certification linear in time *and* memory. The only deferred item that is a known inefficiency rather than a missing feature. |
+
+### Phase 5 status: **complete.** All three DoD lines proven; no §17 task open.

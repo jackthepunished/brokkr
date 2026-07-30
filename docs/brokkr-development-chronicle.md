@@ -7,19 +7,10 @@ standing pair, one gated phase at a time. This is the story of how it got from a
 Cargo workspace to a fault-tolerant, multi-tenant compute cluster — told through the
 project's own planning docs, ADRs, and phase journals.
 
-> **This is a snapshot written at the close of Phase 4 (2026-06-30).** Phase 5
-> has since run from milestone I0 through I9a — a from-scratch Raft engine in
-> `brokkr-raft` carrying real control-plane metadata, with sub-second
-> leader failover demonstrated on real processes. The narrative below stops
-> before all of that; for current state read
-> [`docs/journal/phase-5.md`](journal/phase-5.md) and
-> [`docs/phase-5-plan.md`](phase-5-plan.md). The chronicle gets its Phase 5
-> chapter at the phase wrap-up (milestone I10).
-
 - **Started:** 2026-04-28
 - **Language:** Rust, edition 2021, MSRV 1.85
-- **Crates:** 9 at the time of writing (10 with `brokkr-raft`)
-- **Current phase (at time of writing):** 4 (wrap-up) → 5 (planned)
+- **Crates:** 10
+- **Current phase:** 5 complete → 6 (not started)
 - **License:** Apache-2.0
 
 | Phase | Theme | Status |
@@ -29,7 +20,7 @@ project's own planning docs, ADRs, and phase journals.
 | 2 | Hermetic Sandboxing | done |
 | 3 | Distributed Cache | done |
 | 4 | Scheduler & Multi-Tenancy | wrap-up (one tracked gap) |
-| 5 | Consensus & HA (Raft) | planned, not started *(since: I0–I9a shipped)* |
+| 5 | Consensus & HA (custom Raft) | done |
 
 ---
 
@@ -241,24 +232,54 @@ exit-criteria reviews.
 ---
 
 ## Phase 5 — Consensus & HA
-*Planned, not yet started*
+*Complete. Eleven milestones, PRs #120–#172.*
 
-No Raft code exists yet, but the phase already has a complete, self-contained
-execution plan — eleven milestones (I0–I10), a full pitfall codex of eleven named
-failure modes drawn from the paper and from other implementations' post-mortems, and
-one architectural decision already made before day one: the Raft state machine will
-be a **sans-IO core** — pure, single-threaded, and blind to clocks, threads, and
-sockets.
+The plan committed to one architectural decision before a line of code existed:
+the Raft state machine would be a **sans-IO core** — pure, single-threaded, and
+blind to clocks, threads, and sockets — with a thin shell owning the real clock
+and gRPC transport. The reasoning was that a definition of done demanding a
+million operations under fault injection with zero divergence is only checkable
+if the protocol can be driven by a seeded deterministic loop. That decision held
+all the way through, and it is why the certification exists at all.
 
-The reasoning, laid out in advance: the phase's definition of done requires a
-million operations under fault injection with zero divergence, and that's only
-checkable if the protocol itself can be driven by a seeded, deterministic loop — no
-`tokio`, no sleeps, no flakes. A thin "shell" around the core will own the actual
-clock ticks and gRPC transport; the hard bugs are expected to live entirely in the
-deterministic core, where they're reproducible by construction. `turmoil` — Tokio's
-deterministic network simulator — is the one new dependency pre-approved for the
-whole phase; everything else, including any temptation to reach for `raft-rs` or
-`openraft`, requires stopping and asking first.
+The phase ran the paper's arc in order: crash-safe hard state on redb (a torn
+vote between bumping the term and clearing the vote would let a node vote twice
+in one term), leader election, log replication with the **Figure-8 commit rule**,
+snapshots and log compaction, joint-consensus membership with learners and a
+catch-up gate, and finally a `MetaKv` seam that let the redb store be swapped for
+a Raft-replicated one without a single consumer noticing.
+
+**Three test layers, and each caught what the others structurally could not.**
+The deterministic simulator turns a failing interleaving into a *seed* — a
+permanent fixture. `turmoil` runs the real tonic stack, and caught something no
+pure-core simulator can model: a partition that silently drops packets leaves an
+HTTP/2 connection "alive" forever, so without keepalive a healed cluster never
+re-integrates the peer. And real processes caught what neither could — the
+end-to-end test found, on its first two runs, that an HA control plane needs a
+worker attached to *every* node (the registry is per-node and deliberately
+unreplicated), and that a decision about degrading gracefully on a follower had
+been implemented on only half its path, so a follower's cache *lookup* still
+killed builds before the action ran.
+
+The numbers: kill the leader and a survivor accepts writes in **291.9 ms**; a
+full `brokk run` completes **133.4 ms** after the kill with the cache intact;
+and **1,000,000 operations** under partitions, crashes, restarts, membership
+churn and continuous compaction finished with **zero divergence**.
+
+The certification's own first attempt is the phase's sharpest lesson. It decayed
+from 462 to 188 operations per second and projected past two hours — and the
+cause was the *test harness*, which stored the entire applied history inside
+every snapshot blob so its oracle could compare histories directly, making
+compaction O(history) and the run quadratic. A real state machine snapshots
+bounded state. The fix was to the constant, never to the requirement: lowering
+the operation count to make a number look better would have made the
+certification worthless.
+
+The phase closed by securing the Raft peer plane with mutual TLS, on an
+asymmetry worth stating plainly — on the client and worker planes the worst case
+is unauthorized access to cache data, but `AppendEntries` on the peer plane
+appends to the replicated log, which makes an unauthenticated peer port a write
+path into consensus itself.
 
 ---
 
@@ -291,11 +312,11 @@ whole phase; everything else, including any temptation to reach for `raft-rs` or
 
 ## The project so far
 
-- **4 / 6** phases substantially complete
-- **~45** numbered milestones shipped (Phases 2–4)
-- **#98–#116** PR range for Phase 4 alone
-- **12** architecture decision records
-- **9** workspace crates, zero dependency cycles
+- **5 / 6** phases complete
+- **~60** numbered milestones shipped (Phases 2–5)
+- **#98–#116** PR range for Phase 4; **#120–#172** for Phase 5
+- **13** architecture decision records
+- **10** workspace crates, zero dependency cycles
 - **1.85** pinned MSRV (bumped once, in Phase 0)
 
 **Architecture decision records to date:**
@@ -314,22 +335,34 @@ whole phase; everything else, including any temptation to reach for `raft-rs` or
 | 0010 | Tenants & fair scheduling |
 | 0011 | Auth (JWT + mTLS) |
 | 0012 | Operator TUI |
+| 0013 | Custom Raft consensus |
 
 ---
 
 ## What's next
 
-Phase 4 is complete against its own definition of done except for the tracked
-Bazel-compatibility gap, which is now an explicit owner decision rather than an
-oversight. In parallel, an operator TUI — a read-only terminal console for live
-cluster, job, and cache state — has been pulled forward from Phase 6 under ADR 0012,
-on the reasoning that it's additive and read-mostly enough not to block the much
-larger undertaking waiting behind it.
+Five of six phases are complete. Phase 5 met all three of its definition-of-done
+lines, and the one rule `CLAUDE.md` singles out — implement Raft from the paper,
+never import one — held from the first commit to the millionth operation.
 
-That undertaking is Phase 5: replacing the embedded redb metadata store with a Raft
-implementation written from the paper, with no shortcuts. `CLAUDE.md` calls it out
-by name as the one rule that requires stopping and asking rather than improvising —
-which, six phases in, has been the project's actual operating principle all along.
+Three things are open, and all three are the owner's call rather than oversights:
+
+- **The Bazel-compatibility test** from Phase 4 (§16 task 9): a real
+  `bazel build` against `brokk` as the remote executor. Still untried, because
+  the dev environment has no Bazel.
+- **The operator TUI** (ADR 0012), pulled forward from Phase 6 as additive and
+  read-mostly, accepted on 2026-06-30 and **still unstarted**. Recorded in
+  `docs/plan.md` §11.1 so the phase table stays honest about it.
+- **Phase 6 itself**, which the plan deliberately leaves as a menu rather than a
+  sequence: speculative execution, cross-region replication, GPU scheduling,
+  reproducibility verification, a web UI, federation.
+
+Phase 5's own deferred list — pre-vote, leadership transfer, chunked
+`InstallSnapshot`, follower reads at the read index, and the rest — is in the
+retrospective with the reason each one is safe to defer. The only entry that is a
+known inefficiency rather than a missing feature is the simulator's oracle: it
+stores full history to compare histories, and a hash chain would make the
+certification linear in both time and memory.
 
 ---
 

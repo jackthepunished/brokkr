@@ -18,7 +18,7 @@ storage, hermetic sandboxing, scheduling, and consensus — are implemented
 from scratch as the project's educational core. There is no Docker, no
 runc, no embedded etcd, no third-party Raft.
 
-> **Status:** Phases 0–4 complete. A control plane schedules jobs across many
+> **Status:** Phases 0–5 complete. A control plane schedules jobs across many
 > workers with **platform-constraint matching**, **pluggable strategies**,
 > **fault-tolerant job leases** (a crashed worker's job is reassigned and still
 > completes), **per-tenant virtual-time fair queuing**, **per-tenant quotas**,
@@ -28,7 +28,13 @@ runc, no embedded etcd, no third-party Raft.
 > rendezvous-hashing replica routing, a bloom-filtered `find_missing_blobs`
 > fast path, a hot-LRU + warm tiered backend, quorum replication,
 > reference-counted GC, peer repair, and tree materialisation.
-> **Phase 5 (custom Raft for HA) is next. Not yet production-ready.**
+> The control plane's metadata now lives in a **from-scratch Raft** (no
+> external Raft crate): kill the leader and a survivor accepts writes in
+> **~290 ms**, a `brokk run` completes **133 ms** after the kill with the cache
+> intact, and a **1,000,000-operation** run under partitions, crashes,
+> membership churn and continuous compaction finished with **zero divergence**.
+> Raft peer links are mutual-TLS.
+> **Phase 6 is not started. Not yet production-ready.**
 
 ## What works today
 
@@ -130,12 +136,19 @@ The full plan lives in [`docs/plan.md`](docs/plan.md). At a glance:
 | 2     | Hermetic Linux sandboxing   | done (namespaces, cgroups, seccomp, caps)           |
 | 3     | Distributed CAS (sharded)   | done (HRW, bloom, tiered, replication, GC, repair, tree) |
 | 4     | Scheduler + multi-tenancy   | done (dispatch, strategies, leases, fair-share, quotas, auth)¹ |
-| 5     | Consensus + HA (custom Raft)| next                                                |
+| 5     | Consensus + HA (custom Raft)| done (election, replication, snapshots, joint consensus, ReadIndex, HA + failover, peer mTLS)² |
 | 6+    | Web UI / operator TUI, FUSE inputs, RBE+ | planned                                |
 
 ¹ Phase 4's REAPI **Bazel-compatibility** end-to-end test (a real `bazel build`
 against `brokk`) and the S3 cold tier / FUSE lazy materialisation are tracked
 gaps — see the [Phase 4 retrospective](docs/journal/phase-4.md).
+
+² All three of Phase 5's definition-of-done lines are proven; the deferred list
+(pre-vote, leadership transfer, chunked `InstallSnapshot`, follower reads, and
+others, each with the reason deferring is safe) is in the
+[Phase 5 retrospective](docs/journal/phase-5.md). An HA control plane needs a
+worker attached to **every** node — see
+[running a cluster](docs/operations/running-a-cluster.md).
 
 Phase retrospectives are committed to [`docs/journal/`](docs/journal/) at
 the close of each phase.
