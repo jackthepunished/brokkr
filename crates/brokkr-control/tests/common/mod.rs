@@ -70,11 +70,10 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
         // sandbox-mode integration tests, which require the
         // brokkr-sandboxd binary and an unprivileged userns.
         let cfg = WorkerConfig {
-            control_endpoint: worker_endpoint,
             // Open / single-port test fixture: WorkerService shares the
-            // client listener, so we let `run_worker` fall back to
-            // `control_endpoint` (issue #139).
-            worker_endpoint: None,
+            // client listener, so one `ControlPlane` with no separate worker
+            // port is exactly right (issue #139).
+            control_planes: vec![brokkr_worker::ControlPlane::single_port(worker_endpoint)],
             hostname: "test-worker".to_string(),
             runner: Runner::Plain,
             tls: None,

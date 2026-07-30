@@ -80,6 +80,12 @@ pub struct BrokkrClient {
     /// [`BrokkrClient::connect_with_bearer`]; absent for the no-auth
     /// constructors (ADR 0011, issue #139).
     bearer: Option<Arc<str>>,
+    /// The endpoint URL this client dialed. Carried so a leader redirect can
+    /// inherit the scheme rather than guessing it (I9b W3).
+    endpoint: Arc<str>,
+    /// TLS configuration, retained so the client can re-dial the leader on a
+    /// redirect with the same transport security it started with (I9b W3).
+    tls: Option<TlsConfig>,
 }
 
 /// Channel type carried by the public stubs after the bearer interceptor
@@ -102,7 +108,7 @@ impl BrokkrClient {
             .connect()
             .await
             .map_err(ClientError::Transport)?;
-        Ok(Self::from_channel(channel, None))
+        Ok(Self::from_channel(channel, None, &endpoint))
     }
 
     /// Connect to the control plane at `endpoint` with mTLS authentication.
@@ -111,8 +117,9 @@ impl BrokkrClient {
         endpoint: impl Into<String>,
         tls_cfg: TlsConfig,
     ) -> Result<Self, ClientError> {
-        let channel = connect_tls(endpoint, &tls_cfg).await?;
-        Ok(Self::from_channel(channel, None))
+        let endpoint = endpoint.into();
+        let channel = connect_tls(endpoint.clone(), &tls_cfg).await?;
+        Ok(Self::from_parts(channel, None, &endpoint, Some(tls_cfg)))
     }
 
     /// Connect to the control plane at `endpoint` with a JWT bearer token.
@@ -140,7 +147,11 @@ impl BrokkrClient {
             .connect()
             .await
             .map_err(ClientError::Transport)?;
-        Ok(Self::from_channel(channel, Some(Arc::from(bearer.into()))))
+        Ok(Self::from_channel(
+            channel,
+            Some(Arc::from(bearer.into())),
+            &endpoint,
+        ))
     }
 
     /// Connect to the control plane at `endpoint` with both mTLS and a JWT
@@ -157,13 +168,30 @@ impl BrokkrClient {
         tls_cfg: TlsConfig,
         bearer: impl Into<String>,
     ) -> Result<Self, ClientError> {
-        let channel = connect_tls(endpoint, &tls_cfg).await?;
-        Ok(Self::from_channel(channel, Some(Arc::from(bearer.into()))))
+        let endpoint = endpoint.into();
+        let channel = connect_tls(endpoint.clone(), &tls_cfg).await?;
+        Ok(Self::from_parts(
+            channel,
+            Some(Arc::from(bearer.into())),
+            &endpoint,
+            Some(tls_cfg),
+        ))
     }
 
     /// Build the three client stubs from `channel`, applying the bearer
     /// interceptor to each when a token is configured.
-    fn from_channel(channel: Channel, bearer: Option<Arc<str>>) -> Self {
+    fn from_channel(channel: Channel, bearer: Option<Arc<str>>, endpoint: &str) -> Self {
+        Self::from_parts(channel, bearer, endpoint, None)
+    }
+
+    /// [`Self::from_channel`] plus the TLS configuration to reuse on a
+    /// redirect re-dial.
+    fn from_parts(
+        channel: Channel,
+        bearer: Option<Arc<str>>,
+        endpoint: &str,
+        tls: Option<TlsConfig>,
+    ) -> Self {
         // The interceptor is type-erased behind `Box<dyn FnMut + Send>`
         // and shared across all three stubs via `Arc`. The adapter
         // implements tonic's `Interceptor` trait manually because the
@@ -179,6 +207,8 @@ impl BrokkrClient {
             exec: ExecutionClient::with_interceptor(channel.clone(), interceptor.clone()),
             ac: ActionCacheClient::with_interceptor(channel, interceptor),
             bearer,
+            endpoint: Arc::from(endpoint),
+            tls,
         }
     }
 
@@ -187,6 +217,169 @@ impl BrokkrClient {
     /// split-port integration suite.
     pub fn bearer(&self) -> Option<&str> {
         self.bearer.as_deref()
+    }
+
+    /// The endpoint URL this client is connected to.
+    ///
+    /// Needed to follow a leader redirect without changing scheme: the server
+    /// advertises a bare `host:port`, so the client supplies the `http`/`https`
+    /// it was already using (see [`crate::redirect::hint_to_url`]).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Connect to the first reachable endpoint of an HA control plane
+    /// (Phase 5 I9b W3).
+    ///
+    /// Endpoints are tried in order and the first that connects wins. Any node
+    /// is a valid entry point — a follower serves reads and CAS, and refuses
+    /// metadata writes with a redirect the caller can follow
+    /// ([`crate::redirect::classify`]) — so this only needs *a* live node, not
+    /// the leader.
+    ///
+    /// Returns the last transport error when every endpoint is unreachable;
+    /// that is more useful than a synthetic "all endpoints failed", which
+    /// hides whether the cause was DNS, refusal, or TLS.
+    #[tracing::instrument(name = "client::connect_any", skip(endpoints))]
+    pub async fn connect_any<S: Into<String>>(
+        endpoints: impl IntoIterator<Item = S>,
+    ) -> Result<Self, ClientError> {
+        let endpoints: Vec<String> = endpoints.into_iter().map(Into::into).collect();
+        let mut last_error = None;
+        for endpoint in &endpoints {
+            match Self::connect(endpoint.clone()).await {
+                Ok(client) => {
+                    tracing::debug!(endpoint = %endpoint, "connected");
+                    return Ok(client);
+                }
+                Err(e) => {
+                    tracing::warn!(endpoint = %endpoint, error = %e, "endpoint unreachable; trying the next");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            ClientError::InvalidEndpoint("no control-plane endpoints configured".to_string())
+        }))
+    }
+
+    /// Re-dial `url` with this client's auth configuration, for following a
+    /// leader redirect (I9b W3).
+    async fn reconnect_to(&self, url: &str) -> Result<Self, ClientError> {
+        match (self.tls.clone(), self.bearer.clone()) {
+            (Some(tls), Some(token)) => {
+                Self::connect_with_tls_and_bearer(url.to_string(), tls, token.to_string()).await
+            }
+            (Some(tls), None) => Self::connect_with_tls(url.to_string(), tls).await,
+            (None, Some(token)) => {
+                Self::connect_with_bearer(url.to_string(), token.to_string()).await
+            }
+            (None, None) => Self::connect(url.to_string()).await,
+        }
+    }
+
+    /// Follow a leader redirect, returning a client pointed at the leader.
+    ///
+    /// `Unroutable` (a leader is named but has published no address yet — the
+    /// window between an election and its `cfg/nodes/<id>` record committing)
+    /// is reported as the original status: the caller's own endpoint list is a
+    /// better next move than a hint we cannot dial.
+    async fn follow_redirect(&self, status: &Status, hops: usize) -> Result<Self, Status> {
+        match crate::redirect::classify(status, hops) {
+            crate::redirect::Redirect::Follow { addr, leader } => {
+                let url = crate::redirect::hint_to_url(&addr, self.endpoint());
+                tracing::debug!(leader = ?leader, url = %url, hops, "following leader redirect");
+                self.reconnect_to(&url)
+                    .await
+                    .map_err(|e| Status::unavailable(format!("redirect to leader {url}: {e}")))
+            }
+            crate::redirect::Redirect::Exhausted => Err(Status::failed_precondition(format!(
+                "leader redirect not resolved within {} hops; the cluster's leadership may be \
+                 unstable (last hint: {:?})",
+                crate::redirect::MAX_LEADER_HOPS,
+                status
+                    .metadata()
+                    .get(crate::redirect::LEADER_HINT_METADATA_KEY),
+            ))),
+            crate::redirect::Redirect::Unroutable { leader } => {
+                tracing::debug!(leader = ?leader, "leader known but has published no address yet");
+                Err(clone_status(status))
+            }
+            crate::redirect::Redirect::None => Err(clone_status(status)),
+        }
+    }
+
+    /// Look up a cached `ActionResult`, following a leader redirect if the node
+    /// we asked is a follower (I9b W3). `None` means "not cached".
+    ///
+    /// This is the REAPI surface an external client (Bazel) drives directly,
+    /// and reads are leader-served under I8c, so a follower answers
+    /// `FAILED_PRECONDITION` with the leader's address rather than a result.
+    #[tracing::instrument(name = "client::get_action_result", skip(self))]
+    pub async fn get_action_result(
+        &mut self,
+        action_digest: &rapi::Digest,
+    ) -> Result<Option<rapi::ActionResult>, Status> {
+        let mut client = self.clone();
+        for hops in 0..=crate::redirect::MAX_LEADER_HOPS {
+            let request = rapi::GetActionResultRequest {
+                instance_name: String::new(),
+                action_digest: Some(action_digest.clone()),
+                inline_stdout: false,
+                inline_stderr: false,
+                inline_output_files: vec![],
+                digest_function: 0,
+            };
+            match client.ac.get_action_result(request).await {
+                Ok(resp) => return Ok(Some(resp.into_inner())),
+                // A cache miss is a `NOT_FOUND`, not a failure.
+                Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+                Err(status) => {
+                    client = client.follow_redirect(&status, hops).await?;
+                    // Keep the followed connection so a subsequent call starts
+                    // at the leader: steady state is one hop, not three.
+                    *self = client.clone();
+                }
+            }
+        }
+        Err(Status::failed_precondition(
+            "leader redirect not resolved for GetActionResult",
+        ))
+    }
+
+    /// Store an `ActionResult`, following a leader redirect if the node we
+    /// asked is a follower (I9b W3).
+    ///
+    /// Unlike the scheduler's internal write — best-effort by decision D1 — an
+    /// explicit client write must actually land: a caller that asked for a
+    /// write and got `Ok` must have one, so this redirects rather than
+    /// degrading.
+    #[tracing::instrument(name = "client::update_action_result", skip(self, result))]
+    pub async fn update_action_result(
+        &mut self,
+        action_digest: &rapi::Digest,
+        result: rapi::ActionResult,
+    ) -> Result<rapi::ActionResult, Status> {
+        let mut client = self.clone();
+        for hops in 0..=crate::redirect::MAX_LEADER_HOPS {
+            let request = rapi::UpdateActionResultRequest {
+                instance_name: String::new(),
+                action_digest: Some(action_digest.clone()),
+                action_result: Some(result.clone()),
+                results_cache_policy: None,
+                digest_function: 0,
+            };
+            match client.ac.update_action_result(request).await {
+                Ok(resp) => return Ok(resp.into_inner()),
+                Err(status) => {
+                    client = client.follow_redirect(&status, hops).await?;
+                    *self = client.clone();
+                }
+            }
+        }
+        Err(Status::failed_precondition(
+            "leader redirect not resolved for UpdateActionResult",
+        ))
     }
 
     /// Read a single blob by digest. Returns `None` if the digest is
@@ -657,4 +850,15 @@ mod tests {
         // here, only check the header insertion.
         "header.payload.sig".to_string()
     }
+}
+
+/// Rebuild a `Status`, preserving code, message, and metadata.
+///
+/// `tonic::Status` is not `Clone`, and the leader hints live in its metadata —
+/// dropping them while reporting a redirect we could not follow would hide the
+/// one detail an operator needs.
+fn clone_status(status: &Status) -> Status {
+    let mut rebuilt = Status::new(status.code(), status.message());
+    *rebuilt.metadata_mut() = status.metadata().clone();
+    rebuilt
 }

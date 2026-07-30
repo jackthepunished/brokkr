@@ -6,7 +6,12 @@
 #![deny(missing_docs)]
 
 pub mod client;
+pub mod redirect;
 
 pub use client::{
     check_status, run_command, BrokkrClient, ClientError, ExecuteError, RunOutcome, TlsConfig,
+};
+pub use redirect::{
+    classify, hint_to_url, Redirect, LEADER_ADDR_METADATA_KEY, LEADER_HINT_METADATA_KEY,
+    MAX_LEADER_HOPS,
 };

@@ -1309,3 +1309,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follower. Each hint is emitted independently, so an id known before its
   address has replicated still redirects, and an address that will not parse
   as a header value cannot suppress the id.
+- `brokkr-control` / `brokkr-worker` / `brokkr-sdk` / `brokk` — client and
+  worker failover across control-plane nodes (milestone I9b W3–W5,
+  `docs/plan.md` §17 task 7, `docs/phase-5-plan.md` §VII.3). Three gaps that
+  made the HA control plane unusable from the outside are closed:
+  - **A completed action is never thrown away for a routing accident**
+    (decision D1). The scheduler's post-execution action-cache write is now
+    best-effort **on `NotLeader` only**: the build returns its real result
+    flagged uncached, a `warn` names the digest and leader, a new
+    `Scheduler::uncached_results_not_leader` counter climbs, and the REAPI
+    `ExecuteResponse.message` tells the client. Every *other* cache-write
+    failure still fails the RPC, so a storage fault cannot hide as a cache
+    miss. Previously a `--raft` follower failed the whole Execute with
+    `INTERNAL` **after** the sandbox had already run.
+  - **Workers survive losing the node they are attached to.** `--control` (and
+    `--worker-control`) are repeatable; `WorkerConfig` carries a
+    `Vec<ControlPlane>`, and `run_worker` rotates on failure and
+    **re-registers** — necessary because the worker registry is per-node and
+    ephemeral by ADR design, so a new node has never heard of the worker. The
+    policy is a pure function (`brokkr_worker::rotation_plan`): the whole first
+    cycle runs with **zero delay** (survivors are already up; backing off
+    before trying them adds latency for nothing), then exponential backoff per
+    completed cycle capped at 30 s with attempt-derived jitter so co-restarted
+    fleets do not reconnect in lockstep. A session that registered resets the
+    backoff, so a long-lived worker does not inherit an hours-old delay.
+  - **Clients follow the redirect.** New `brokkr_sdk::redirect` classifies a
+    refusal (`Redirect::{None, Follow, Unroutable, Exhausted}`) and
+    `BrokkrClient::{get_action_result, update_action_result}` follow it,
+    bounded by `MAX_LEADER_HOPS` and keeping the followed connection so steady
+    state is one hop. A redirect is identified by its **metadata**, not by
+    `FAILED_PRECONDITION` alone — the scheduler already returns that code for
+    "no eligible worker" — and `hint_to_url` inherits the caller's scheme so a
+    redirect can never downgrade an https session to plaintext.
+    `BrokkrClient::connect_any` and a repeatable `brokk run --control` use the
+    first node that answers, reporting the last transport error rather than a
+    synthetic aggregate.
