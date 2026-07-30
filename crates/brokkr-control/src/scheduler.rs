@@ -524,12 +524,35 @@ impl Scheduler {
         tenant: TenantId,
     ) -> Result<ExecutionOutcome, ExecutionError> {
         if !skip_cache_lookup {
-            if let Some(cached) = self
-                .action_cache
-                .get_action_result(&action_digest)
-                .await
-                .map_err(|e| anyhow!("action cache get: {e}"))?
-            {
+            // Decision D1 applies to the *lookup* as well as the write, and
+            // for the same reason. Reads are leader-served (I8c ReadIndex), so
+            // on a follower this returns `NotLeader` — but "I cannot check the
+            // cache" is a cache **miss**, not a failed build. Failing here
+            // would be worse than failing on the write: the action has not even
+            // run yet, and the caller asked to execute an action, not to be
+            // told which node they happened to reach.
+            //
+            // Every other error still fails the RPC, exactly as on the write
+            // path: a storage fault must not masquerade as a miss and silently
+            // re-execute work that was already cached.
+            let looked_up = match self.action_cache.get_action_result(&action_digest).await {
+                Ok(found) => found,
+                Err(brokkr_cas::CasError::NotLeader {
+                    leader,
+                    leader_addr,
+                }) => {
+                    tracing::debug!(
+                        action_digest = %action_digest,
+                        leader = ?leader,
+                        leader_addr = ?leader_addr,
+                        "cache lookup unavailable on this node (not the metadata leader); \
+                         treating as a miss"
+                    );
+                    None
+                }
+                Err(e) => return Err(anyhow!("action cache get: {e}").into()),
+            };
+            if let Some(cached) = looked_up {
                 tracing::Span::current()
                     .record("cache_hit", true)
                     .record("exit_code", cached.exit_code);
@@ -923,6 +946,35 @@ mod tests {
         error: fn() -> CasError,
     }
 
+    /// A store where **both** directions fail the way a follower's would:
+    /// reads are leader-served (I8c ReadIndex), so a follower cannot answer a
+    /// cache lookup either.
+    struct FollowerActionCache;
+
+    #[async_trait]
+    impl ActionCache for FollowerActionCache {
+        async fn get_action_result(
+            &self,
+            _action_digest: &Digest,
+        ) -> Result<Option<ActionResult>, CasError> {
+            Err(CasError::NotLeader {
+                leader: Some("control-1".to_string()),
+                leader_addr: Some("10.0.0.1:7878".to_string()),
+            })
+        }
+
+        async fn update_action_result(
+            &self,
+            _action_digest: &Digest,
+            _result: ActionResult,
+        ) -> Result<(), CasError> {
+            Err(CasError::NotLeader {
+                leader: Some("control-1".to_string()),
+                leader_addr: Some("10.0.0.1:7878".to_string()),
+            })
+        }
+    }
+
     #[async_trait]
     impl ActionCache for WriteFailsActionCache {
         async fn get_action_result(
@@ -1310,6 +1362,55 @@ mod tests {
 
     /// §16 DoD: a worker that dies mid-job → the job is reassigned to another
     /// worker and completes. Submit a job onto worker A, disconnect A
+    /// D1 applies to the cache **lookup** too, and the real-process e2e is
+    /// what proved it: a follower-routed `brokk run` died at
+    /// `action cache get: not the metadata leader` before the action ever ran.
+    /// A lookup that cannot be served is a miss, not a failed build.
+    #[tokio::test]
+    async fn a_follower_cache_lookup_is_a_miss_not_a_failure() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            Arc::new(FollowerActionCache),
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        // Note: cache lookup is NOT skipped here — that is the whole point.
+        let exec = {
+            let s = scheduler.clone();
+            tokio::spawn(async move { s.execute(action_digest, false, TenantId::default()).await })
+        };
+        // The action must be dispatched despite the unavailable lookup.
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    stdout_raw: b"ran anyway".to_vec(),
+                    ..Default::default()
+                }),
+                cache_hit: false,
+                error_message: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = exec.await.unwrap().unwrap();
+        assert_eq!(outcome.result.stdout_raw, b"ran anyway");
+        assert!(!outcome.cache_hit, "an unavailable lookup is a miss");
+        assert!(!outcome.result_cached, "and the result could not be stored");
+        assert_eq!(scheduler.uncached_results_not_leader(), 1);
+    }
+
     /// Decision D1 (I9b): on a `--raft` follower the post-execution
     /// action-cache write is refused with `NotLeader`. The action already ran,
     /// so the build must **succeed** with the real result, flagged uncached and

@@ -195,17 +195,52 @@ Or, all three at once:
 ```
 
 Writes are accepted by the **leader**; a follower answers
-`FAILED_PRECONDITION` with the leader's id in `x-brokkr-leader` metadata —
-retry against the hinted node. Reads through the leader are linearizable
+`FAILED_PRECONDITION` with the leader's id in `x-brokkr-leader` **and its
+address in `x-brokkr-leader-addr`** (I9b) — clients built on `brokkr-sdk`
+follow that automatically. Reads through the leader are linearizable
 (ReadIndex). Raft peer links are **plaintext** in this phase: run them on a
 trusted network (mTLS for the peer plane is a noted follow-up).
 
-The real-process failover test (DoD 1 — kill the leader, elect a new one in
-under two seconds):
+### Run a worker on every control node
+
+**This is a requirement, not a suggestion.** The worker registry is per-node
+and deliberately **not** replicated through Raft (ADRs 0008–0010: workers
+re-register and leases reassign on failure, so replicating it would buy
+nothing and cost consensus round trips on every heartbeat). The consequence:
+
+> A control node with no worker attached **cannot execute anything.** A build
+> routed there fails `FAILED_PRECONDITION: no eligible worker` no matter how
+> healthy the Raft cluster is.
+
+So a three-node control plane needs workers on all three. Give each worker
+every endpoint — it attaches to the first that answers and rotates to another
+when that node dies:
+
+```sh
+brokkr-worker --control http://127.0.0.1:7878 \
+              --control http://127.0.0.1:7879 \
+              --control http://127.0.0.1:7880
+```
+
+### What a follower-routed build does
+
+Under decision D1 a build that lands on a follower **succeeds but is not
+cached**: the follower can neither read nor write the replicated action cache,
+and a completed action is too expensive to discard over a routing accident.
+`brokk` prints the reason, and the control plane counts these
+(`uncached_results_not_leader`). A steadily climbing count means clients are
+being served by followers — the builds are correct, but every one of them is
+paying full execution cost. Route clients at the leader, or accept the cost
+deliberately.
+
+### The real-process tests
 
 ```sh
 cargo build --workspace
+# DoD 1: kill the leader, a survivor accepts writes in under two seconds
 cargo test -p brokkr-control --test raft_ha_cluster -- --ignored --nocapture
+# The full story: 3 control nodes + 3 workers + `brokk run` across a leader kill
+cargo test -p brokkr-control --test raft_ha_e2e -- --ignored --nocapture
 ```
 
 ## Known gap

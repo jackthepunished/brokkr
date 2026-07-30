@@ -1132,3 +1132,84 @@ hint terminates on the hop budget instead of looping).
   leader for the assertion to mean anything).
 - Then **I9c** — the 1,000,000-operation certification, the last open
   definition-of-done line.
+
+## I9b W6 — the real-process end-to-end (§17 task 7, completes I9b)
+
+- **Date:** 2026-07-30
+- **Affected:** `crates/brokkr-control` (`scheduler.rs`;
+  `tests/raft_ha_e2e.rs` new), `crates/brokkr-sdk` (`client.rs`),
+  `crates/brokkr-cli` (`main.rs`), `docs/operations/running-a-cluster.md`.
+- **Outcome:** three real `brokkr-control` processes, three workers, and
+  `brokk run` — SIGKILL the leader and the next build succeeds in
+  **133.4 ms**, with the pre-kill cache entry intact and served by a node that
+  was a follower when the write happened.
+
+### The two bugs this test found
+
+Both were invisible to every in-process test, and both are the reason W6 was
+worth writing rather than declaring I9b done after W5.
+
+- **An HA control plane needs a worker on every node.** The first run died on
+  `no eligible worker for action platform`. One worker attaches to exactly one
+  control node, and the worker registry is per-node and **ephemeral by ADR
+  0008–0010 design** — deliberately not replicated through Raft, because
+  workers re-register and leases reassign on failure. So on a three-node
+  control plane with one worker, two nodes can execute nothing: a build routed
+  there fails however healthy Raft is. §VII.1's gap list named "workers pin one
+  endpoint" but missed "one worker only serves one node" — a different problem
+  with a different fix. Now documented as a requirement in
+  `docs/operations/running-a-cluster.md`, not just fixed in the test.
+- **D1 had been implemented on half the path.** With workers everywhere the
+  follower-routed build *still* failed:
+  `action cache get: not the metadata leader (leader hint: Some("control-2")
+  at Some("127.0.0.1:40249"))`. Decision D1 made the post-execution **write**
+  best-effort; the pre-execution **lookup** still failed hard. Reads are
+  leader-served (I8c ReadIndex), so on a follower the lookup returns
+  `NotLeader` and the build died *before the action ever ran* — strictly worse
+  than the write case D1 was written for, because the caller asked to execute
+  an action, not to be told which node they reached. A lookup that cannot be
+  served is now a **miss**; every other error still fails the RPC, so a storage
+  fault cannot masquerade as a miss and silently re-execute cached work.
+  `a_follower_cache_lookup_is_a_miss_not_a_failure` pins it.
+
+That same error message is also the first end-to-end proof of I9b W1/W2: the
+hint carried both the leader's id **and** a dialable address, resolved by a
+follower from its own applied `cfg/nodes/` record.
+
+### Decisions / notes
+
+- **The test is built around D1 rather than despite it.** A follower-routed
+  build caches nothing, so the write whose survival is asserted must go through
+  the **leader** — asserting a cache hit on a follower-routed build would pass
+  for the wrong reason, or fail for one that is by design. The sequence is
+  therefore: follower-routed build succeeds *and reports not-cached* → the same
+  action through the leader is cached → SIGKILL → a new action succeeds within
+  budget → the leader-routed action is a cache hit from a survivor.
+- **`RunOutcome` was dropping `ExecuteResponse.message`,** so `brokk` could not
+  tell a user their build was not cached. D1's "the client is told" was true of
+  the REAPI response and false of the CLI. Fixed here, because the e2e's first
+  assertion is unobservable without it — a good example of an end-to-end test
+  forcing an honest surface.
+- **Budget is 5 s, not 2 s,** and deliberately so: DoD 1's two-second bound is
+  about electing a leader (proven in `raft_ha_cluster.rs`), while this measures
+  election **plus** worker rotation, re-registration, dispatch and a real
+  process execution. The measured 133 ms leaves the budget looking generous;
+  it is sized for a loaded CI host, not for this number.
+
+### Verified in WSL2
+
+`cargo test -p brokkr-control --test raft_ha_e2e -- --ignored --nocapture`:
+**passed in 4.30 s**, leader was node 2, first successful post-kill build
+**133.408551 ms** (budget 5 s), pre-kill leader-routed action confirmed a cache
+hit afterwards. Workspace gates green on CI's exact commands (`fmt --check`,
+`clippy --workspace --all-targets --locked -D warnings`, `doc --all-features
+--locked`, `test --workspace --all-targets --locked`, `test --doc`), with only
+the 6 known `evil_seccomp_caps` failures that need a real kernel.
+
+### Next
+
+- **I9c — the 1,000,000-operation certification** (DoD 3), the last open
+  definition-of-done line: extend the existing `simulation.rs` campaign, count
+  client operations rather than sim steps, run the full fault mix with
+  membership churn and `snapshot_threshold = 16`, and record seeds, ops/sec,
+  wall clock and peak RSS here.
