@@ -15,7 +15,7 @@
 //!   overlays the REAPI `Command`'s argv / env / working_directory,
 //!   and feeds the result through `Sandbox::run`.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Result};
@@ -232,6 +232,25 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R, cap: usize, stream: &str) -
     buf
 }
 
+/// Resolve the action's working directory against the sandbox workdir `base`.
+///
+/// REAPI `working_directory` is input-root-relative. An absolute value would
+/// replace `base` entirely under `Path::join`, and a `..` component would walk
+/// out of it — either way the action could run somewhere other than its input
+/// root. Both are rejected; an empty value keeps `base`.
+fn resolve_workdir(base: &Path, working_directory: &str) -> Result<PathBuf> {
+    if working_directory.is_empty() {
+        return Ok(base.to_path_buf());
+    }
+    let wd = Path::new(working_directory);
+    if wd.is_absolute() || wd.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(anyhow!(
+            "invalid working_directory {working_directory:?}: must be a relative path with no '..' components"
+        ));
+    }
+    Ok(base.join(wd))
+}
+
 async fn run_sandboxed(runner: &SandboxRunner, command: &rapi::Command) -> Result<RunOutcome> {
     if command.arguments.is_empty() {
         return Err(anyhow!("Command.arguments is empty"));
@@ -246,12 +265,10 @@ async fn run_sandboxed(runner: &SandboxRunner, command: &rapi::Command) -> Resul
     // doesn't materialise the input root yet (Phase 3 FUSE), so if the
     // caller specified one we honour it as a sandbox-relative path
     // under workdir; otherwise we land in the template's default
-    // workdir.
-    let workdir = if command.working_directory.is_empty() {
-        runner.template.workdir.clone()
-    } else {
-        runner.template.workdir.join(&command.working_directory)
-    };
+    // workdir. Reject absolute paths and `..` so a client cannot chdir
+    // outside its input root (defeats the "actions run under /work"
+    // invariant even inside the sandbox rootfs).
+    let workdir = resolve_workdir(&runner.template.workdir, &command.working_directory)?;
 
     let cfg = SandboxConfig {
         argv: command.arguments.clone(),
@@ -264,6 +281,9 @@ async fn run_sandboxed(runner: &SandboxRunner, command: &rapi::Command) -> Resul
         determinism: runner.template.determinism.clone(),
         retained_caps: Vec::new(),
         extra_seccomp_allow: Vec::new(),
+        // The worker always provides a rootfs and requires full isolation;
+        // never opt out.
+        no_isolation: false,
     };
 
     let outcome = runner
@@ -300,7 +320,27 @@ pub fn proto_digest(bytes: &[u8]) -> rapi::Digest {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
 mod tests {
-    use super::{read_capped, MAX_CAPTURED_OUTPUT_BYTES};
+    use super::{read_capped, resolve_workdir, MAX_CAPTURED_OUTPUT_BYTES};
+    use std::path::Path;
+
+    #[test]
+    fn resolve_workdir_keeps_base_and_relative_subpaths() {
+        let base = Path::new("/work");
+        assert_eq!(resolve_workdir(base, "").unwrap(), Path::new("/work"));
+        assert_eq!(
+            resolve_workdir(base, "sub/dir").unwrap(),
+            Path::new("/work/sub/dir")
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_rejects_absolute_and_parent_escapes() {
+        let base = Path::new("/work");
+        assert!(resolve_workdir(base, "/etc").is_err());
+        assert!(resolve_workdir(base, "..").is_err());
+        assert!(resolve_workdir(base, "../escape").is_err());
+        assert!(resolve_workdir(base, "sub/../../escape").is_err());
+    }
 
     #[tokio::test]
     async fn read_capped_truncates_at_cap() {

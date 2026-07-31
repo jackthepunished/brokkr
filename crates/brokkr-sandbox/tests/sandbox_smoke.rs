@@ -65,6 +65,8 @@ async fn env_is_passed_through() {
             "echo $BROKKR_TEST".into(),
         ],
         env: vec![("BROKKR_TEST".to_string(), "42".to_string())],
+        // Smoke test on the host (M2 path); opt into no-isolation explicitly.
+        no_isolation: true,
         ..Default::default()
     };
     let outcome = sandbox.run(cfg).await.unwrap();
@@ -82,6 +84,8 @@ async fn workdir_is_honoured() {
     let cfg = SandboxConfig {
         argv: vec!["/bin/sh".to_string(), "-c".into(), "pwd".into()],
         workdir: Some(workdir.clone()),
+        // Smoke test on the host (M2 path); opt into no-isolation explicitly.
+        no_isolation: true,
         ..Default::default()
     };
     let outcome = match sandbox.run(cfg).await {

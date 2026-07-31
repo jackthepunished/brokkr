@@ -48,11 +48,14 @@ pub(super) fn setup_rootfs(spec: &RootfsSpec) -> io::Result<()> {
     //    bootstrap — pivot_root makes it `/`.
     let new_root = PathBuf::from(format!("/tmp/brokkr-rootfs-{}", std::process::id()));
     std::fs::create_dir_all(&new_root)?;
+    // NOSUID + NODEV harden the sandbox root: the action has no legitimate
+    // need for setuid bits or device nodes on the tmpfs (NOEXEC is *not* set —
+    // build actions execute binaries from the rootfs).
     mount(
         Some("brokkr-rootfs"),
         &new_root,
         Some("tmpfs"),
-        MsFlags::empty(),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("size=64M,mode=0755"),
     )
     .map_err(nix_io)?;
@@ -77,12 +80,19 @@ pub(super) fn setup_rootfs(spec: &RootfsSpec) -> io::Result<()> {
         // A second `mount` with `MS_REMOUNT | MS_BIND | MS_RDONLY` flips
         // the bind read-only. The mount(2) man page documents that
         // "fs-independent flags" only take effect on a remount of an
-        // existing mount — exactly what we're doing.
+        // existing mount — exactly what we're doing. NOSUID + NODEV are
+        // applied on the same remount as defence in depth against a
+        // setuid binary or device node reachable through a host bind.
         mount(
             None::<&str>,
             &target,
             None::<&str>,
-            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_REC
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV,
             None::<&str>,
         )
         .map_err(nix_io)?;
@@ -97,7 +107,7 @@ pub(super) fn setup_rootfs(spec: &RootfsSpec) -> io::Result<()> {
             Some("brokkr-tmpfs"),
             &target,
             Some("tmpfs"),
-            MsFlags::empty(),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
             Some(opts.as_str()),
         )
         .map_err(nix_io)?;
