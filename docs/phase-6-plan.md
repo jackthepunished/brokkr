@@ -385,21 +385,52 @@ example policy is Rust:
 
 ## Part VII — Risks and gates
 
-**R1 — MSRV. This is a gate, not a risk: resolve it first.** The toolchain is
-pinned to **1.85.0** (`rust-toolchain.toml`). Recent wasmtime tracks stable
-closely and very likely requires newer. Before any Phase 6 code:
+**R1 — MSRV. RESOLVED in P0: the toolchain bump was forced, not chosen.**
 
-- Determine the newest wasmtime that builds on 1.85.
-- If a usable version exists (must have `PoolingAllocationConfig`, `fuel`, and
-  `epoch_interruption`), pin it and record the pin's reason.
-- If not, the toolchain bump is a **separate, standalone, first commit** — never
-  bundled with a feature. It has a bonus: the `time` pin comment in `deny.toml`
-  says the RUSTSEC-2026-0009 ignore can be dropped once MSRV ≥ 1.88. Dropping it
-  is *also* its own commit (CLAUDE.md rule 7: lockfile changes stand alone).
+The plan assumed the interesting question was *"is there a wasmtime that builds
+on 1.85?"* — and there is. That turned out not to be the deciding question.
 
-**R2 — cargo-deny.** wasmtime pulls the cranelift tree. `Apache-2.0 WITH
-LLVM-exception` is **already** in `deny.toml`'s allow list, so licenses should
-pass; advisories and `multiple-versions` are the unknowns. Run `cargo deny check`
+Measured, 2026-08-01:
+
+| Probe | Result |
+|---|---|
+| Newest wasmtime on rustc 1.85.0 (MSRV-aware resolver) | **34.0.2** — 47.0.3 needs rustc **1.94.0** |
+| Does 34.0.2 have `PoolingAllocationConfig`, fuel, `epoch_interruption`? | **Yes, all three.** Verified by a probe crate: 100 fresh-`Store` calls through one `InstancePre`, a trap surfacing as `Err` rather than a panic, and an infinite-loop guest interrupted in <500 ms by epoch ticks. |
+| `cargo deny check licenses` on the 34.0.2 tree | **Pass** — `Apache-2.0 WITH LLVM-exception` was already allowed, as predicted. |
+| `cargo deny check bans` | **Pass** |
+| `cargo deny check advisories` | **FAIL — two unpatched vulnerabilities.** |
+
+The two advisories are the whole story:
+
+- **RUSTSEC-2026-0114** (GHSA-p8xm-42r7-89xg) — fixed only in `>=36.0.8`.
+- **RUSTSEC-2026-0222** (GHSA-hgjw-h833-99q9), *"Stores can mix up type indices
+  between engines"* — fixed only in `>=24.0.12,<25`, `>=36.0.13,<37`, or
+  `>=46.0.2`.
+
+**Neither has a fix anywhere in the 34.x line**, and the lowest version
+satisfying both is 36.0.13 — which does not build on 1.85 either. So "pin an old
+wasmtime" was never actually on the table. Shipping it would mean knowingly
+embedding a vulnerable WASM runtime in the one component whose entire job is to
+contain semi-trusted code, against the project axiom that *security is not
+bolted on*. Suppressing the advisories in `deny.toml` would be worse: the
+existing ignores there each carry an argument for why the vulnerable path is
+unreachable, and no such argument exists here.
+
+**Decision: bump `rust-toolchain.toml` 1.85.0 → 1.94.0** (the minimum for
+wasmtime 47.0.3, which clears both advisories), as its own standalone commit
+carrying no feature work. Cost measured across the whole workspace: `cargo fmt`
+clean, and exactly **two** new clippy lints, both genuine improvements —
+`io_other_error` in `brokkr-sandbox/src/host/linux.rs` and
+`cloned_ref_to_slice_refs` in `brokkr-proto/build.rs`.
+
+Follow-up, deliberately **not** bundled: `deny.toml` notes the
+RUSTSEC-2026-0009 ignore exists only because `time` was pinned below the fix to
+hold MSRV at 1.85. At 1.94 that constraint is gone and the ignore can be
+dropped. It is a lockfile change, so it is its own commit (CLAUDE.md rule 7).
+
+**R2 — cargo-deny.** Partly answered by R1 above: on the wasmtime tree
+**licenses and bans pass**; advisories are the live constraint and are what
+forced the toolchain bump. Re-run `cargo deny check`
 immediately after the dependency lands, before writing engine code — finding out
 at PR time is the expensive order.
 
@@ -408,11 +439,25 @@ ADR 0014: *"wasmtime — the only Rust WASM runtime offering epoch-based
 interruption, which is the only mechanism that bounds wall-clock time in a guest
 call made while the dispatch mutex is held; fuel bounds work, not time."*
 
-**R4 — Compile time.** Cranelift is heavy and CI is already six jobs. Mitigate by
-putting wasmtime behind a **non-default `wasm-policy` feature on
-`brokkr-policy`**, enabled by `brokkr-control` by default but disableable, so a
-build that doesn't want it doesn't pay. Measure CI wall-clock before and after
-and record it.
+**R4 — Compile time. Measured in P0; smaller than feared, and mostly tunable.**
+
+Cold `cargo build --release` of a crate whose only dependency is wasmtime:
+
+| Feature set | Crates in tree | Cold release build |
+|---|---|---|
+| wasmtime default features | 176 | 46 s |
+| `default-features = false` + `runtime`, `cranelift`, `pooling-allocator`, `std` (+ `wat` as a **dev**-dependency, for the WAT test fixtures) | 101 | **31 s** |
+
+Dropping the default features — `component-model`, `gc`, `threads`,
+`stack-switching`, `wit-parser`, `debug`, `profiling`, `coredump`, none of which
+a scheduling policy can reach — removes 75 crates and a third of the build. **P5
+must use the trimmed set**, and `wat` belongs in `[dev-dependencies]` only: it is
+needed to compile the WAT fixtures in tests, never at runtime.
+
+31 s against a CI `cargo test` job that already runs ~2m20s is acceptable, and
+it is paid once per cache miss. Still put wasmtime behind a non-default
+`wasm-policy` feature on `brokkr-policy` so a build that doesn't want it doesn't
+pay at all, and record the CI wall-clock delta in P9.
 
 **R5 — Scope creep into a plugin platform.** The temptation to add admission
 hooks, GC policies, and retry policies "while the machinery is here" is real and

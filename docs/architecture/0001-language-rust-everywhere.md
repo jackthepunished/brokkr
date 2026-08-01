@@ -26,7 +26,7 @@ deeply.
 
 ## Decision
 
-Use **Rust (edition 2021, MSRV 1.85)** for every native component of Brokkr:
+Use **Rust (edition 2021, MSRV 1.94)** for every native component of Brokkr:
 control plane, CAS, worker, sandbox, SDK, CLI. Internal protos via
 `prost`/`tonic`. No second native language until there is a concrete
 need (e.g. a Go shim purely for downstream integration) — and even then, the

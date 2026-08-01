@@ -6,6 +6,12 @@
 
 #![allow(missing_docs)] // generated code does not carry doc comments
 #![allow(clippy::all)]
+// `prost-build` copies the `.proto` comments verbatim, and those reference
+// other messages by protobuf FQN (`build.bazel.remote.execution.v2.Action`).
+// rustdoc 1.94 resolves bracketed names like that as intra-doc links and fails
+// under `-D warnings`. They are proto names, not Rust paths, and the upstream
+// REAPI/google protos are not ours to reword.
+#![allow(rustdoc::broken_intra_doc_links)]
 
 pub mod build {
     pub mod bazel {

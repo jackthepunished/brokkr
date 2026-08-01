@@ -176,7 +176,10 @@ mod tests {
         let inner = Arc::new(InMemoryCas::new());
         let cas = BloomCas::new(inner, 1024, 0.01);
         let (d, _) = blob(b"x");
-        let missing = cas.find_missing_blobs(&[d.clone()]).await.unwrap();
+        let missing = cas
+            .find_missing_blobs(std::slice::from_ref(&d))
+            .await
+            .unwrap();
         assert_eq!(missing, vec![d]);
     }
 
@@ -230,7 +233,9 @@ mod tests {
         // Before rebuild, the bloom is empty — `find_missing_blobs`
         // ignores the backend and reports the digest as missing.
         assert_eq!(
-            cas.find_missing_blobs(&[d.clone()]).await.unwrap(),
+            cas.find_missing_blobs(std::slice::from_ref(&d))
+                .await
+                .unwrap(),
             vec![d.clone()],
         );
 

@@ -208,7 +208,7 @@ async fn three_node_soak() {
                 let pick = keys[rng.gen_range(0..keys.len())].clone();
                 let expected = live[&pick].clone();
                 let results = cas
-                    .batch_read_blobs(&[pick.clone()])
+                    .batch_read_blobs(std::slice::from_ref(&pick))
                     .await
                     .unwrap_or_else(|e| panic!("read failed at op {op_idx} (seed={seed}): {e:?}"));
                 assert_eq!(results.len(), 1);

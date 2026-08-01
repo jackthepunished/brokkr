@@ -366,7 +366,7 @@ mod tests {
         let cas = RedbCas::open_with_limit(dir.path().join("cas.redb"), 1).unwrap();
         let (d, _) = blob(b"any");
 
-        let binding = &[d.clone()];
+        let binding = std::slice::from_ref(&d);
         let first = cas.find_missing_blobs(binding);
         let second = cas.find_missing_blobs(binding);
 

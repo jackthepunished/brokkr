@@ -127,7 +127,7 @@ pub async fn repair_node<P: ReplicaPool>(
             let Some(src) = pool.get(&replica.node_id) else {
                 continue;
             };
-            let bytes = match src.batch_read_blobs(&[d.clone()]).await {
+            let bytes = match src.batch_read_blobs(std::slice::from_ref(&d)).await {
                 Ok(mut results) => match results.pop() {
                     Some(Ok(b)) => b,
                     _ => continue,
@@ -246,7 +246,7 @@ mod tests {
         backends[lossy_idx].delete_blob(&d).await.unwrap();
         // Confirm the loss.
         assert!(backends[lossy_idx]
-            .find_missing_blobs(&[d.clone()])
+            .find_missing_blobs(std::slice::from_ref(&d))
             .await
             .unwrap()
             .contains(&d));
