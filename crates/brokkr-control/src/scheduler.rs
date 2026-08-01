@@ -511,9 +511,20 @@ impl Scheduler {
                         best = Some((slot.index, candidates, slot.start));
                     }
                 }
-                let Some((idx, candidates, _)) = best else {
+                let Some((idx, mut candidates, _)) = best else {
                     return;
                 };
+                // Sort by worker id, once, for the list that actually reaches
+                // the strategy. Both sources iterate a `HashMap`
+                // (`WorkerRegistry::workers` and `ConnectedWorkers`), so
+                // without this the candidate list arrives in hash order — and
+                // that list *is* the index space a WASM policy returns into
+                // (ADR 0014). Identical cluster state would then produce
+                // different placements run to run, defeating the determinism
+                // the policy ABI is built to guarantee. The built-ins are
+                // unaffected: they already tie-break on id and their answer
+                // never depended on order.
+                candidates.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
                 // The one strategy call per placement. The context is built
                 // from the winning slot only, which is why `FairQueue::get`
                 // exists — re-borrowing beats cloning a `PendingJob` (it

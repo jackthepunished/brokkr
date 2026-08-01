@@ -8,11 +8,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
 use brokkr_control::registry::WorkerRegistry;
+use brokkr_control::wasm_strategy::WasmStrategy;
 use brokkr_control::{
     auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
     CapabilitiesService, CasService, ExecutionService, JwtAuth, MetaKvActionCache, RedbMetaKv,
     Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
 };
+use brokkr_policy::{PolicyEngine, PolicyLimits};
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
     action_cache_server::ActionCacheServer, capabilities_server::CapabilitiesServer,
@@ -163,6 +165,94 @@ struct Args {
     /// it signs, and outbound channels verify the peer's server certificate.
     #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_key"])]
     raft_tls_ca: Option<PathBuf>,
+
+    /// Path to a WebAssembly scheduling policy (ADR 0014).
+    ///
+    /// The module decides which of the eligible, idle, connected workers gets
+    /// each job. It is *operator-supplied* — a file you place next to the
+    /// binary, inside the trust boundary you already own — not something
+    /// tenants can upload.
+    ///
+    /// Without this flag the built-in `SimpleFifo` strategy is used and no
+    /// WASM engine is started. With it, any decision the policy declines or
+    /// fails is served by `SimpleFifo` anyway, so a broken policy degrades
+    /// placement quality rather than stopping the cluster. See
+    /// `docs/operations/writing-a-scheduling-policy.md`.
+    #[arg(long)]
+    policy_wasm: Option<PathBuf>,
+
+    /// Fuel granted to each policy decision — a bound on *work*.
+    ///
+    /// Catches an accidental O(n²) in a policy. It cannot bound *time*; that
+    /// is what `--policy-deadline-ms` is for.
+    #[arg(long, default_value_t = brokkr_policy::DEFAULT_FUEL)]
+    policy_fuel: u64,
+
+    /// Wall-clock budget for each policy decision, in milliseconds.
+    ///
+    /// The bound that actually matters: this call happens while the
+    /// scheduler's dispatch mutex is held, so a policy that stalls stalls
+    /// placement for the whole cluster.
+    #[arg(long, default_value_t = brokkr_policy::DEFAULT_DEADLINE_MS)]
+    policy_deadline_ms: u64,
+
+    /// Consecutive policy failures before the module is quarantined.
+    ///
+    /// Falling back per decision is not enough on its own: a policy that fails
+    /// every call would burn its full deadline forever. Past this count the
+    /// guest stops being called at all until the module is reloaded.
+    #[arg(long, default_value_t = brokkr_policy::QUARANTINE_THRESHOLD)]
+    policy_quarantine_threshold: u32,
+
+    /// Completions remembered per worker for the locality signal (ADR 0014).
+    ///
+    /// Deeper means a repeated build's input root stays visible after more
+    /// unrelated work interleaves, at a linear cost in memory and in the scan
+    /// per candidate.
+    #[arg(long, default_value_t = brokkr_control::locality::DEFAULT_WINDOW)]
+    policy_locality_window: usize,
+}
+
+/// Build the scheduling strategy from the policy flags (ADR 0014).
+///
+/// Returns `None` when no `--policy-wasm` was given, meaning "use the built-in
+/// `SimpleFifo`" — the default, and the only behaviour before Phase 6.
+///
+/// Every failure here is a **startup error**, deliberately, even though a
+/// failure at *decision* time degrades instead. The two are not in tension: an
+/// operator who names a policy file has stated an intent, and silently running
+/// `SimpleFifo` because the file was misspelled would be exactly the kind of
+/// quiet misconfiguration issue #139 established we do not ship. A module that
+/// loads and later misbehaves is a different situation — the cluster is
+/// running, jobs are queued, and degrading beats stopping.
+fn build_policy_strategy(
+    args: &Args,
+    registry: SharedWorkerRegistry,
+) -> Result<Option<Arc<WasmStrategy>>> {
+    let Some(path) = args.policy_wasm.as_ref() else {
+        return Ok(None);
+    };
+    let limits = PolicyLimits {
+        fuel: args.policy_fuel,
+        deadline_ms: args.policy_deadline_ms,
+        quarantine_threshold: args.policy_quarantine_threshold,
+    };
+    let wasm = std::fs::read(path)
+        .with_context(|| format!("reading the scheduling policy {}", path.display()))?;
+    let engine = PolicyEngine::new(limits)
+        .with_context(|| "starting the scheduling-policy engine".to_string())?;
+    let strategy = WasmStrategy::new(engine, Some(registry));
+    strategy
+        .load(&wasm)
+        .with_context(|| format!("loading the scheduling policy {}", path.display()))?;
+    tracing::info!(
+        policy = %path.display(),
+        fuel = limits.fuel,
+        deadline_ms = limits.deadline_ms,
+        quarantine_threshold = limits.quarantine_threshold,
+        "WASM scheduling policy loaded"
+    );
+    Ok(Some(Arc::new(strategy)))
 }
 
 /// The Raft peer plane's transport security, resolved from the flags (I9d).
@@ -734,8 +824,20 @@ async fn main() -> Result<()> {
     // stale entries.
     let worker_registry: SharedWorkerRegistry =
         Arc::new(tokio::sync::Mutex::new(WorkerRegistry::default()));
-    let scheduler =
-        Scheduler::with_worker_registry(cas.clone(), action_cache.clone(), worker_registry.clone());
+    let policy_strategy = build_policy_strategy(&args, worker_registry.clone())?;
+    let scheduler = match policy_strategy.clone() {
+        Some(strategy) => Scheduler::with_strategy(
+            cas.clone(),
+            action_cache.clone(),
+            worker_registry.clone(),
+            strategy,
+        ),
+        None => Scheduler::with_worker_registry(
+            cas.clone(),
+            action_cache.clone(),
+            worker_registry.clone(),
+        ),
+    };
 
     let client_tls_cfg = args.tls_config(false)?;
     let worker_tls_cfg = args.tls_config(true)?;
