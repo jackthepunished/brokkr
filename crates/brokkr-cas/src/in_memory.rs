@@ -129,7 +129,10 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert!(res[0].status.is_ok());
 
-        let read = cas.batch_read_blobs(&[d.clone()]).await.unwrap();
+        let read = cas
+            .batch_read_blobs(std::slice::from_ref(&d))
+            .await
+            .unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].as_ref().unwrap(), &b);
     }

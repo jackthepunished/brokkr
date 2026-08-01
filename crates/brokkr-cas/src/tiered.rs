@@ -451,7 +451,10 @@ mod tests {
         let cas = TieredCas::new(warm, 1024);
         assert_eq!(cas.hot_len(), 0);
         // First read: hot miss → warm hit → promote.
-        let read = cas.batch_read_blobs(&[d.clone()]).await.unwrap();
+        let read = cas
+            .batch_read_blobs(std::slice::from_ref(&d))
+            .await
+            .unwrap();
         assert_eq!(read[0].as_ref().unwrap(), &b);
         assert_eq!(cas.hot_len(), 1);
         // Second read still works (now hot hit).

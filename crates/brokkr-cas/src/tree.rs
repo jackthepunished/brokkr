@@ -38,7 +38,7 @@ use crate::traits::Cas;
 
 /// Fetch a `Directory` proto from CAS and decode it.
 async fn fetch_directory(cas: &dyn Cas, digest: &Digest) -> Result<rapi::Directory, CasError> {
-    let mut results = cas.batch_read_blobs(&[digest.clone()]).await?;
+    let mut results = cas.batch_read_blobs(std::slice::from_ref(digest)).await?;
     let bytes = match results.pop() {
         Some(Ok(b)) => b,
         Some(Err(e)) => return Err(e),
@@ -207,7 +207,7 @@ async fn write_file(
     path: &Path,
     is_executable: bool,
 ) -> Result<(), CasError> {
-    let mut results = cas.batch_read_blobs(&[digest.clone()]).await?;
+    let mut results = cas.batch_read_blobs(std::slice::from_ref(digest)).await?;
     let bytes = match results.pop() {
         Some(Ok(b)) => b,
         Some(Err(e)) => return Err(e),

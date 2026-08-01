@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **MSRV bumped 1.85 → 1.94** (`rust-toolchain.toml`, workspace
+  `rust-version`). Phase 6 needs a WASM runtime with epoch-based interruption
+  (ADR 0014), and the newest wasmtime that builds on 1.85 is 34.0.2, which
+  carries two unpatched advisories — RUSTSEC-2026-0114 (fixed only in
+  `>=36.0.8`) and RUSTSEC-2026-0222 (fixed only in `>=24.0.12,<25`,
+  `>=36.0.13,<37`, or `>=46.0.2`). Neither is fixed anywhere in the 34.x line,
+  and the lowest version clearing both does not build on 1.85 either, so
+  pinning an old wasmtime was never actually available. See
+  `docs/phase-6-plan.md` R1 for the full measurement.
+- `clippy.toml` gained `large-error-threshold = 184`. Rust 1.94 added
+  `clippy::result_large_err` (default threshold 128 bytes), which fires on
+  every tonic handler and interceptor in the workspace because
+  `tonic::Status` is 176 bytes. The trait signatures require
+  `Result<_, Status>` verbatim, so boxing is not available to us; raising the
+  threshold just past `Status` keeps the lint working for a genuinely
+  oversized error type of our own instead of scattering `#[allow]`s.
+
+### Fixed
+- Adopted `std::io::Error::other` in `brokkr-sandbox` and
+  `std::slice::from_ref` at 14 call sites across `brokkr-cas`,
+  `brokkr-worker`, and `brokkr-proto`'s build script, per the
+  `io_other_error` and `cloned_ref_to_slice_refs` lints new in Rust 1.94.
+  Each removes a needless clone or allocation.
+- `brokkr-proto` now allows `rustdoc::broken_intra_doc_links`. `prost-build`
+  copies `.proto` comments verbatim, and the upstream REAPI/google protos
+  reference messages by protobuf FQN (`build.bazel.remote.execution.v2.Action`);
+  rustdoc 1.94 resolves those as intra-doc links and fails under
+  `-D warnings`. They are proto names, not Rust paths.
+
 ### Security
 - **Sandbox isolation hardening (defense-in-depth):**
   - The worker now rejects a REAPI `Command.working_directory` that is absolute

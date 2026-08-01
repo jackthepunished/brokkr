@@ -276,7 +276,7 @@ impl<P: ReplicaPool> Cas for ReplicatedCas<P> {
                 let Some(cas) = self.pool.get(&replica.node_id) else {
                     continue;
                 };
-                match cas.batch_read_blobs(&[d.clone()]).await {
+                match cas.batch_read_blobs(std::slice::from_ref(d)).await {
                     Ok(mut results) => match results.pop() {
                         Some(Ok(bytes)) => {
                             found = Some(bytes);
@@ -477,7 +477,10 @@ mod tests {
         let topo = Arc::new(topology(&[], 2));
         let cas = ReplicatedCas::new(pool, topo);
         let (d, _) = blob(b"orphan");
-        let missing = cas.find_missing_blobs(&[d.clone()]).await.unwrap();
+        let missing = cas
+            .find_missing_blobs(std::slice::from_ref(&d))
+            .await
+            .unwrap();
         assert_eq!(missing, vec![d]);
     }
 }

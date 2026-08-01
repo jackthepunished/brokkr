@@ -296,7 +296,7 @@ Tier 1 is non-negotiable. Tier 2 is the ship goal. Tier 3 is a bonus, not a metr
 | Build system | **Cargo workspaces** | Multi-crate monorepo. |
 | CI | **GitHub Actions** initially | Self-hosted on Brokkr later (eat our own dog food). |
 | OS target | **Linux x86_64** primary, **Linux aarch64** secondary | Workers must be Linux. CLI/control plane can run on macOS/Windows for development. |
-| Min Rust version | **MSRV 1.85** | Pin and bump deliberately. Bumped from 1.78 during Phase 0 because transitive deps required edition 2024. |
+| Min Rust version | **MSRV 1.94** | Pin and bump deliberately. 1.78 → 1.85 in Phase 0 (transitive deps required edition 2024); 1.85 → 1.94 in Phase 6 P0 (the newest wasmtime that builds on 1.85 carries two unpatched advisories — see `docs/phase-6-plan.md` R1). |
 
 **Rejected alternatives** (and why):
 

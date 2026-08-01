@@ -465,8 +465,7 @@ impl KillpgOnDrop {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         match self.child.as_mut() {
             Some(c) => c.wait().await,
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            None => Err(std::io::Error::other(
                 "KillpgOnDrop::wait called after child was taken",
             )),
         }

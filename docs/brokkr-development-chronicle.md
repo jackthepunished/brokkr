@@ -8,7 +8,7 @@ Cargo workspace to a fault-tolerant, multi-tenant compute cluster — told throu
 project's own planning docs, ADRs, and phase journals.
 
 - **Started:** 2026-04-28
-- **Language:** Rust, edition 2021, MSRV 1.85
+- **Language:** Rust, edition 2021, MSRV 1.94
 - **Crates:** 10
 - **Current phase:** 5 complete → 6 (not started)
 - **License:** Apache-2.0
@@ -315,9 +315,10 @@ path into consensus itself.
 - **5 / 6** phases complete
 - **~60** numbered milestones shipped (Phases 2–5)
 - **#98–#116** PR range for Phase 4; **#120–#172** for Phase 5
-- **13** architecture decision records
+- **14** architecture decision records
 - **10** workspace crates, zero dependency cycles
-- **1.85** pinned MSRV (bumped once, in Phase 0)
+- **1.94** pinned MSRV (bumped twice: 1.78 → 1.85 in Phase 0, 1.85 → 1.94 in
+  Phase 6 P0)
 
 **Architecture decision records to date:**
 
@@ -336,6 +337,7 @@ path into consensus itself.
 | 0011 | Auth (JWT + mTLS) |
 | 0012 | Operator TUI |
 | 0013 | Custom Raft consensus |
+| 0014 | WASM scheduling policies |
 
 ---
 

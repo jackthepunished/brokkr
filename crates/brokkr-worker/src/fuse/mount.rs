@@ -468,7 +468,7 @@ async fn fetch_and_mmap(
     expected_size: u64,
     cache_dir: &Path,
 ) -> Result<Arc<Mmap>, FetchError> {
-    let mut results = cas.batch_read_blobs(&[digest.clone()]).await?;
+    let mut results = cas.batch_read_blobs(std::slice::from_ref(digest)).await?;
     let bytes = match results.pop() {
         Some(Ok(b)) => b,
         Some(Err(e)) => return Err(FetchError::Cas(e)),

@@ -1,3 +1,11 @@
+# `clippy::result_large_err` (default threshold 128 bytes) fires on every
+# tonic handler and interceptor in the workspace, because `tonic::Status` is
+# 176 bytes and its size is tonic's choice — the trait signatures require
+# `Result<_, Status>` verbatim, so boxing is not available to us. Raise the
+# threshold just past `Status` rather than scattering `#[allow]`s, so the lint
+# still catches a genuinely oversized error type of our own.
+large-error-threshold = 184
+
 disallowed-methods = [
     { path = "std::result::Result::unwrap", reason = "use ? with thiserror error enum" },
     { path = "std::option::Option::unwrap", reason = "use ok_or / let-else" },
