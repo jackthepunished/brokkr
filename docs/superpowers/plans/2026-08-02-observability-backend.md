@@ -1411,9 +1411,101 @@ Add the flag alongside the Phase 6 policy flags:
     observe_listen: SocketAddr,
 ```
 
+Add the mTLS flags and the insecure-bind escape hatch:
+
+```rust
+    /// Server certificate for the operator listener. All three of
+    /// `--observe-tls-cert`, `--observe-tls-key` and `--observe-tls-ca` must be
+    /// given together; the CA is what authorizes callers.
+    #[arg(long, requires_all = ["observe_tls_key", "observe_tls_ca"])]
+    observe_tls_cert: Option<PathBuf>,
+
+    /// Private key for [`Self::observe_tls_cert`].
+    #[arg(long, requires_all = ["observe_tls_cert", "observe_tls_ca"])]
+    observe_tls_key: Option<PathBuf>,
+
+    /// CA that verifies operator client certificates.
+    #[arg(long, requires_all = ["observe_tls_cert", "observe_tls_key"])]
+    observe_tls_ca: Option<PathBuf>,
+
+    /// Permit a non-loopback `--observe-listen` with no operator mTLS.
+    ///
+    /// For an already-isolated network. A flag someone had to type is a
+    /// decision; the same bind reached by accident is an incident.
+    #[arg(long)]
+    observe_allow_insecure_bind: bool,
+```
+
+Add a pure validator beside `resolve_raft_tls`:
+
+```rust
+/// Refuse an unauthenticated observability listener on a routable address.
+///
+/// D4's argument is that *the listener is the boundary* — but a listener bound
+/// to `0.0.0.0` with no authentication is not a boundary, it is an
+/// unauthenticated read of the whole cluster offered to the network. Loopback
+/// needs nothing further; anything else needs mTLS or an explicit override.
+///
+/// Same posture as issue #139 established for the other planes: a
+/// misconfiguration is a startup error, never a runtime surprise.
+fn validate_observe_bind(
+    listen: SocketAddr,
+    mtls_configured: bool,
+    allow_insecure: bool,
+) -> Result<(), String> {
+    if listen.ip().is_loopback() || mtls_configured || allow_insecure {
+        return Ok(());
+    }
+    Err(format!(
+        "--observe-listen ({listen}) is not a loopback address and no operator \
+         mTLS is configured, which would serve unauthenticated cluster state to \
+         the network. Either pass --observe-tls-cert/--observe-tls-key/\
+         --observe-tls-ca, or bind loopback and reach it over SSH. If the \
+         network is already isolated, --observe-allow-insecure-bind says so \
+         deliberately."
+    ))
+}
+```
+
+Test it in `main.rs`'s test module:
+
+```rust
+    #[test]
+    fn a_loopback_observability_bind_needs_no_further_authorization() {
+        let addr: SocketAddr = "127.0.0.1:7880".parse().unwrap();
+        assert!(validate_observe_bind(addr, false, false).is_ok());
+        let v6: SocketAddr = "[::1]:7880".parse().unwrap();
+        assert!(validate_observe_bind(v6, false, false).is_ok());
+    }
+
+    #[test]
+    fn a_routable_observability_bind_without_mtls_is_rejected() {
+        let addr: SocketAddr = "0.0.0.0:7880".parse().unwrap();
+        let err = validate_observe_bind(addr, false, false).unwrap_err();
+        assert!(err.contains("--observe-tls-cert"), "must name the remedy: {err}");
+        assert!(
+            err.contains("--observe-allow-insecure-bind"),
+            "must name the override: {err}"
+        );
+
+        let specific: SocketAddr = "10.0.0.5:7880".parse().unwrap();
+        assert!(validate_observe_bind(specific, false, false).is_err());
+    }
+
+    #[test]
+    fn a_routable_bind_is_allowed_with_mtls_or_an_explicit_override() {
+        let addr: SocketAddr = "0.0.0.0:7880".parse().unwrap();
+        assert!(validate_observe_bind(addr, true, false).is_ok());
+        assert!(validate_observe_bind(addr, false, true).is_ok());
+    }
+```
+
+Call it before binding and surface the error with `anyhow::bail!`.
+
 Spawn a second `Server::builder()` bound to `args.observe_listen` serving only
-`ObservabilityServiceServer`. Do **not** add the client auth interceptor to it:
-the listener *is* the boundary, and adding a tenant-resolving interceptor to an
+`ObservabilityServiceServer`, with `ServerTlsConfig` applied when the operator
+mTLS flags are set. Do **not** add the client auth interceptor to it: the
+listener *is* the boundary, and adding a tenant-resolving interceptor to an
 operator surface would imply a tenant scope that does not exist.
 
 Log the binding at startup with the same prominence as the TLS posture
@@ -1871,17 +1963,58 @@ mod tests {
         assert_eq!(snap.leader_id.as_deref(), Some("node-1"));
     }
 
-    /// Two nodes both claiming leadership means we are mid-election or
-    /// partitioned. Reporting one of them arbitrarily would be a confident
-    /// lie; report none and mark degraded.
+    /// Two nodes claiming leadership at the *same* term is impossible under
+    /// Raft, so it means our view is internally inconsistent. Report none and
+    /// mark degraded rather than picking one.
     #[test]
-    fn two_claimed_leaders_report_no_leader_and_degraded() {
+    fn two_claimed_leaders_at_the_same_term_report_no_leader_and_degraded() {
         let snap = merge(
             state("node-1", RaftRole::Leader, &[]),
             vec![PeerOutcome::Answered(state("node-2", RaftRole::Leader, &[]))],
             at(),
         );
         assert_eq!(snap.leader_id, None);
+        assert!(snap.degraded);
+    }
+
+    /// A partitioned ex-leader keeps claiming leadership at its old term. It
+    /// must NOT make a healthy cluster look ambiguous — the higher term wins,
+    /// which is exactly what Raft guarantees.
+    #[test]
+    fn a_stale_claimant_at_a_lower_term_does_not_obscure_the_real_leader() {
+        let mut stale = state("node-1", RaftRole::Leader, &[]);
+        stale.node.term = 6; // the old term it was elected in
+        let mut current = state("node-2", RaftRole::Leader, &[]);
+        current.node.term = 7; // the term that superseded it
+
+        let snap = merge(stale, vec![PeerOutcome::Answered(current)], at());
+
+        assert_eq!(
+            snap.leader_id.as_deref(),
+            Some("node-2"),
+            "the highest-term claimant is the leader"
+        );
+        assert!(!snap.degraded, "one stale claimant is not a degraded cluster");
+        // The stale node keeps its own term visible rather than being rewritten.
+        let n1 = snap.nodes.iter().find(|n| n.node_id == "node-1").unwrap();
+        assert_eq!(n1.term, 6);
+    }
+
+    /// An unreachable node's term must not raise the bar. Its last-known term
+    /// is zeroed by `unreachable_node_view`, but even a remembered high term
+    /// should not suppress a live leader.
+    #[test]
+    fn an_unreachable_node_does_not_participate_in_leader_selection() {
+        let snap = merge(
+            state("node-1", RaftRole::Leader, &[]),
+            vec![PeerOutcome::Unreachable {
+                node_id: "node-2".to_string(),
+                advertise_addr: "10.0.0.2:7878".to_string(),
+            }],
+            at(),
+        );
+        assert_eq!(snap.leader_id.as_deref(), Some("node-1"));
+        // Still degraded, because a known node is silent.
         assert!(snap.degraded);
     }
 
@@ -2056,14 +2189,42 @@ pub fn merge(local: NodeState, peers: Vec<PeerOutcome>, as_of: SystemTime) -> Cl
     policies.sort_by(|a, b| a.owning_node.cmp(&b.owning_node));
     cas.sort_by(|a, b| a.owning_node.cmp(&b.owning_node));
 
-    // Leadership comes from Raft, never from counting agreement. Exactly one
-    // claimant is a healthy cluster; zero means an election is in progress and
-    // more than one means a partition. Both are worth surfacing, and picking
-    // one arbitrarily would be a confident lie.
-    let mut claimants = nodes.iter().filter(|n| n.role == RaftRole::Leader);
+    // Leadership comes from Raft, and is reconciled by TERM rather than by
+    // counting claimants. A node partitioned from the cluster keeps believing
+    // it leads at its old term, so "how many nodes claim leadership" is the
+    // wrong question — a stale claimant would make a perfectly healthy cluster
+    // look ambiguous.
+    //
+    // Only claimants at the highest term seen among *reachable* nodes count.
+    // Raft guarantees a higher term supersedes a lower one, so a lower-term
+    // claimant is stale by definition. Its own (stale) term stays visible in
+    // its NodeView; it simply does not win the election here.
+    let highest_term = nodes
+        .iter()
+        .filter(|n| n.reachable)
+        .map(|n| n.term)
+        .max()
+        .unwrap_or(0);
+    let mut claimants = nodes
+        .iter()
+        .filter(|n| n.reachable && n.role == RaftRole::Leader && n.term == highest_term);
     let leader_id = match (claimants.next(), claimants.next()) {
         (Some(only), None) => Some(only.node_id.clone()),
-        _ => None,
+        (Some(a), Some(b)) => {
+            // Two leaders at the *same* term is impossible under Raft, so this
+            // means our view is internally inconsistent — most likely a peer
+            // answered mid-transition. Worth an error rather than a warning:
+            // it is either a bug here or something genuinely alarming there.
+            tracing::error!(
+                term = highest_term,
+                first = %a.node_id,
+                second = %b.node_id,
+                "two nodes claim leadership at the same term; reporting no leader"
+            );
+            None
+        }
+        // Zero claimants at the highest term: an election is in progress.
+        (None, _) => None,
     };
 
     ClusterSnapshot {
@@ -2390,7 +2551,8 @@ use tracing::Instrument as _;
 /// How the poller is configured.
 #[derive(Debug, Clone)]
 pub struct PollerConfig {
-    /// How often to poll peers. Zero disables fan-out entirely.
+    /// How often the snapshot is refreshed. Governs the local read *and* peer
+    /// fan-out. Never zero — rejected at startup.
     pub interval: Duration,
     /// Per-peer deadline. Must be below `interval`.
     pub peer_timeout: Duration,
@@ -2440,17 +2602,16 @@ pub fn spawn_poller(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(
         async move {
-            if cfg.interval.is_zero() {
-                // Still publish local state once, so a single-node or
-                // fan-out-disabled deployment serves something rather than an
-                // empty snapshot forever.
-                let local = deps.local.local_state(true).await;
-                let snapshot = merge(local, Vec::new(), SystemTime::now());
-                *shared.write().await = snapshot;
-                tracing::info!("observability fan-out disabled; serving node-local state");
-                return;
-            }
-
+            // The loop always runs. With `--raft` off `deps.peers` is empty, so
+            // a round is one local read and no network — but it still happens.
+            // Publishing once and returning would leave a single-node operator
+            // staring at permanently stale workers, jobs, CAS and policy, which
+            // is the exact opposite of the point. "No peer traffic" and "no
+            // refresh" are different things and only the first is intended.
+            //
+            // A zero interval is rejected at startup (`validate_observe_timing`),
+            // so `tokio::time::interval` — which panics on a zero period —
+            // cannot be reached with one.
             let mut ticker = tokio::time::interval(cfg.interval);
             let mut since_cas = cfg.cas_interval;
             loop {
@@ -2491,8 +2652,12 @@ Add `pub mod cluster;` to `crates/brokkr-control/src/lib.rs`, before
 In `crates/brokkr-control/src/main.rs`, beside `--observe-listen`:
 
 ```rust
-    /// How often peers are polled for observability state (ADR 0012).
-    /// `0` disables fan-out and serves node-local state only.
+    /// How often the observability snapshot is refreshed (ADR 0012).
+    ///
+    /// Governs both the local read and peer fan-out. Running without `--raft`
+    /// already gives a peer-traffic-free deployment, so there is no "disabled"
+    /// mode here and `0` is rejected — a snapshot that never refreshes is a
+    /// bug, not a configuration.
     #[arg(long, default_value_t = 2)]
     observe_poll_interval_secs: u64,
 
@@ -2523,7 +2688,13 @@ fn validate_observe_timing(
     peer_timeout_ms: u64,
 ) -> Result<(), String> {
     if poll_interval_secs == 0 {
-        return Ok(()); // fan-out disabled; the deadline is unused
+        return Err(
+            "--observe-poll-interval-secs must be greater than 0; a snapshot that \
+             never refreshes would serve permanently stale state. For a deployment \
+             with no peer traffic, run without --raft — the refresh loop then costs \
+             one local read per interval and no network."
+                .to_string(),
+        );
     }
     let interval_ms = poll_interval_secs.saturating_mul(1000);
     if peer_timeout_ms >= interval_ms {
@@ -2545,8 +2716,17 @@ Test it in `main.rs`'s existing test module:
         assert!(validate_observe_timing(2, 750).is_ok());
         assert!(validate_observe_timing(2, 2000).is_err());
         assert!(validate_observe_timing(2, 2001).is_err());
-        // Fan-out disabled: the deadline is unused, so anything is fine.
-        assert!(validate_observe_timing(0, 99_999).is_ok());
+    }
+
+    /// A zero interval is a configuration mistake, not a way to disable the
+    /// feature: it would serve a snapshot captured once at startup forever.
+    #[test]
+    fn a_zero_poll_interval_is_rejected_and_says_what_to_do_instead() {
+        let err = validate_observe_timing(0, 750).unwrap_err();
+        assert!(
+            err.contains("--raft"),
+            "the error must name the peer-traffic-free alternative; got: {err}"
+        );
     }
 ```
 
@@ -2554,9 +2734,12 @@ Call it before spawning the poller and return the error via `anyhow::bail!`.
 
 - [ ] **Step 10: Serve handlers from the snapshot**
 
-Change `ObservabilityService` to hold a `SharedSnapshot` and read it. Preserve
-Task 4's behaviour when fan-out is disabled — local-only, one node — which the
-`interval.is_zero()` branch of `spawn_poller` already guarantees.
+Change `ObservabilityService` to hold a `SharedSnapshot` and read it.
+
+Task 4's single-node behaviour — local-only, one node — falls out naturally:
+with `--raft` off `PeerDirectory::peers()` returns empty, so `poll_peers`
+returns empty and `merge` produces exactly the local view. The refresh loop
+still runs, so that view stays current rather than freezing at startup.
 
 - [ ] **Step 11: Run the full verification gate**
 
@@ -2662,6 +2845,7 @@ mod tests {
             state: JobState::Succeeded,
             worker_id: Some("w-a".to_string()),
             exit_code: Some(0),
+            completed_at_unix_ms: 1_700_000_000_000,
             owning_node: "node-1".to_string(),
         }
     }
@@ -2772,6 +2956,19 @@ pub struct JobSummary {
     pub worker_id: Option<String>,
     /// Exit code, once reported.
     pub exit_code: Option<i32>,
+    /// Wall-clock completion time, in Unix milliseconds.
+    ///
+    /// **The global merge key.** Three nodes each keep their own ring, so a
+    /// union of them has no meaningful order unless one field orders records
+    /// that originated on different machines — and "recent jobs" that are not
+    /// actually the most recent is a display that lies.
+    ///
+    /// Wall-clock (`SystemTime`), deliberately, unlike the monotonic `Instant`
+    /// used for worker liveness: this one *must* be comparable across nodes.
+    /// Clock skew between control-plane nodes therefore skews the ordering.
+    /// That is accepted and is why the field is exposed rather than hidden
+    /// behind an opaque rank an operator could not sanity-check.
+    pub completed_at_unix_ms: u64,
     /// The control-plane node that scheduled this job.
     ///
     /// Per node like every other node-local record: the history ring lives in
@@ -2857,6 +3054,10 @@ Add `job_history: JobHistory` to `Inner` beside `locality`, and record in
                     },
                     worker_id: Some(w.as_str().to_string()),
                     exit_code: result.result.as_ref().map(|r| r.exit_code),
+                    completed_at_unix_ms: SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
                     owning_node: self.node_id.clone(),
                 });
             }
@@ -2888,6 +3089,9 @@ message JobInfo {
   int32 exit_code = 6;
   bool has_exit_code = 7;
   string owning_node = 8;
+  // Wall-clock completion time. The key ListJobs orders by, and the only field
+  // that can order records originating on different nodes.
+  uint64 completed_at_unix_ms = 9;
 }
 
 message ListJobsRequest {
@@ -2908,11 +3112,83 @@ and `repeated JobInfo jobs = 5;` to `GetLocalStateReply` in `raft.proto` so
 jobs aggregate like workers. `has_exit_code` exists because proto3 cannot
 distinguish an unset `int32` from `0`, and `0` is a meaningful exit code.
 
-- [ ] **Step 6: Extend `merge` to union jobs**
+- [ ] **Step 6: Extend `merge` to union jobs in global completion order**
 
-Add `jobs: Vec<JobSummary>` to `NodeState` and `ClusterSnapshot`, unioned and
-sorted like workers. Add an aggregation test asserting jobs from all nodes
-appear with their `owning_node` preserved.
+Add `jobs: Vec<JobSummary>` to `NodeState` and `ClusterSnapshot`. Unlike
+workers, jobs are **not** sorted by id — they are sorted by completion time,
+because that is what "recent" means:
+
+```rust
+    // Union first, then sort globally, then limit. Limiting per node before
+    // the union would let a burst on one node evict another node's genuinely
+    // newer jobs from the result.
+    jobs.sort_by(|a, b| {
+        b.completed_at_unix_ms
+            .cmp(&a.completed_at_unix_ms)
+            // Millisecond resolution makes ties likely, and an unstable
+            // tie-break would reorder the list between identical calls.
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
+```
+
+`ListJobs` applies the caller's limit **after** this sort, never before.
+
+Add these aggregation tests:
+
+```rust
+    /// Jobs from every node merge into one globally-ordered list. Sorting per
+    /// node and concatenating would interleave wrongly; limiting per node
+    /// first would drop genuinely-recent jobs.
+    #[test]
+    fn jobs_from_all_nodes_are_ordered_by_completion_time_not_by_node() {
+        let mut n1 = state("node-1", RaftRole::Leader, &[]);
+        n1.jobs = vec![job("j-old", "node-1", 1_000), job("j-newest", "node-1", 9_000)];
+        let mut n2 = state("node-2", RaftRole::Follower, &[]);
+        n2.jobs = vec![job("j-middle", "node-2", 5_000)];
+
+        let snap = merge(n1, vec![PeerOutcome::Answered(n2)], at());
+        let ids: Vec<&str> = snap.jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["j-newest", "j-middle", "j-old"]);
+    }
+
+    /// Equal timestamps are likely at millisecond resolution, so the tie-break
+    /// must be deterministic or the list reorders between identical calls.
+    #[test]
+    fn jobs_with_equal_timestamps_tie_break_deterministically() {
+        let mut n1 = state("node-1", RaftRole::Leader, &[]);
+        n1.jobs = vec![job("j-zulu", "node-1", 5_000)];
+        let mut n2 = state("node-2", RaftRole::Follower, &[]);
+        n2.jobs = vec![job("j-alpha", "node-2", 5_000)];
+
+        let forward = merge(n1.clone(), vec![PeerOutcome::Answered(n2.clone())], at());
+        let reverse = merge(n2, vec![PeerOutcome::Answered(n1)], at());
+        let ids: Vec<&str> = forward.jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["j-alpha", "j-zulu"]);
+        assert_eq!(forward.jobs, reverse.jobs);
+    }
+```
+
+with the fixture helper:
+
+```rust
+    fn job(id: &str, owner: &str, completed_at_unix_ms: u64) -> JobSummary {
+        JobSummary {
+            job_id: id.to_string(),
+            tenant: "t".to_string(),
+            action_digest: "a".repeat(64),
+            state: JobState::Succeeded,
+            worker_id: Some("w".to_string()),
+            exit_code: Some(0),
+            completed_at_unix_ms,
+            owning_node: owner.to_string(),
+        }
+    }
+```
+
+`Scheduler::report()` sets `completed_at_unix_ms` from
+`SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)`, defaulting to `0`
+on the `Err` branch rather than propagating — a clock before the epoch should
+cost the job its sort position, not fail the report.
 
 - [ ] **Step 7: Run the gate, CHANGELOG, commit**
 
@@ -3241,13 +3517,24 @@ leadership.
 The poller publishes `diff(prev, next)` after each snapshot swap on a
 `tokio::sync::broadcast` channel with capacity 256.
 
-`WatchEvents` first sends a synthetic initial event set describing current
-state, so a newly connected client is not blank until something changes, then
-forwards the broadcast.
+The resync contract, which is what makes the stream safe to rely on:
 
-Handle `RecvError::Lagged(n)` by emitting a `Resync` event rather than dropping
-the client. A slow operator terminal must not silently miss events — silently
-is the problem, not slowly.
+1. **On subscribe — and therefore on every reconnect** — send a complete
+   `Snapshot` event describing current state before any deltas. A reconnecting
+   client is in exactly the position of a first-time client and is treated
+   identically. No sequence numbers, no replay window, no cursor to get wrong.
+2. **On `RecvError::Lagged(n)`** — a slow consumer overflowing the bounded
+   buffer — send a fresh `Snapshot` rather than dropping the client or silently
+   skipping deltas. Falling behind is acceptable; *not knowing* you fell behind
+   is not.
+3. A client therefore needs no reconciliation logic: every `Snapshot` replaces
+   its world, and every delta between two snapshots is complete.
+
+This costs a full snapshot per reconnect, which at cluster size is negligible
+and eliminates an entire class of stale-client bug.
+
+Add a test asserting a subscriber receives a `Snapshot` event **first**, before
+any delta, on a stream opened against an already-populated snapshot.
 
 Publish leadership change and policy quarantine **immediately** on transition
 rather than waiting for the next diff (spec D6): both are incident signals
@@ -3304,7 +3591,9 @@ From the spec, the subset this plan covers:
 3. `GetCluster` shows Raft role, term, commit index and leader; a leadership change reaches a `WatchEvents` client without waiting for a poll. *(Tasks 3, 8)*
 4. Phase 6's policy counters are visible, including quarantine state. *(Tasks 1, 4)*
 5. `ObservabilityService` is unreachable on the tenant-facing listener, proven by test. *(Task 4)*
-7. Single-node (`--raft` off) works with no poller and no peer traffic. *(Tasks 4, 6)*
+7. Single-node (`--raft` off) works with **no peer traffic and a snapshot that stays current** — the refresh loop runs with an empty peer set. *(Tasks 4, 6)*
+8. A non-loopback `--observe-listen` without operator mTLS is a startup error naming both remedies. *(Task 4)*
+9. `ListJobs` across a 3-node cluster returns the globally most-recent jobs by completion time, not the most recent from whichever node answered first. *(Task 7)*
 
 DoD 6 (TUI panic restore) belongs to the TUI plan. The 3-node integration test
 proving DoD 1 and 2 end to end also belongs there, alongside the other
