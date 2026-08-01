@@ -438,8 +438,29 @@ impl Scheduler {
 
                 // The fair queue's lowest-start-tag job that has an idle,
                 // eligible, connected worker (fair-share dequeue, ADR 0010).
-                let mut found: Option<(usize, WorkerId, u64)> = None;
+                //
+                // Selecting the *slot* must not consult the strategy.
+                // `Strategy::choose` is contracted to return `None` iff
+                // `candidates` is empty, so "is this slot dispatchable?" is
+                // exactly `!candidates.is_empty()` — no policy call needed.
+                // Asking the policy per slot made this O(queue²) per drain
+                // (the outer `loop` re-runs per placement), which is free for
+                // a comparison-based built-in but pathological for a WASM
+                // policy called under this very lock (Phase 6, ADR 0014). We
+                // therefore pick the winning slot first and call the strategy
+                // exactly once, for that slot's candidates.
+                let mut best: Option<(usize, Vec<WorkerId>, u64)> = None;
                 for slot in inner.pending.slots() {
+                    // A slot that cannot beat the incumbent start tag can't
+                    // win, so skip building its candidate set at all. `>=`
+                    // keeps first-seen-wins on ties, matching the previous
+                    // `slot.start < best` comparison.
+                    if best
+                        .as_ref()
+                        .is_some_and(|(_, _, incumbent)| slot.start >= *incumbent)
+                    {
+                        continue;
+                    }
                     let candidates: Vec<WorkerId> = match &reg_guard {
                         Some(reg) => eligible_workers(reg, now, &slot.job.platform)
                             .map(|(id, _)| id.clone())
@@ -454,14 +475,21 @@ impl Scheduler {
                             .cloned()
                             .collect(),
                     };
-                    if let Some(w) = self.strategy.choose(&candidates, &inner.connected) {
-                        // Keep the dispatchable slot with the smallest start tag.
-                        if found.as_ref().is_none_or(|(_, _, best)| slot.start < *best) {
-                            found = Some((slot.index, w, slot.start));
-                        }
+                    if !candidates.is_empty() {
+                        best = Some((slot.index, candidates, slot.start));
                     }
                 }
-                let Some((idx, worker_id, _)) = found else {
+                let Some((idx, candidates, _)) = best else {
+                    return;
+                };
+                // The one strategy call per placement.
+                let Some(worker_id) = self.strategy.choose(&candidates, &inner.connected) else {
+                    // Unreachable for a contract-abiding strategy (`candidates`
+                    // is non-empty here). Bail rather than dispatch nowhere.
+                    tracing::warn!(
+                        candidates = candidates.len(),
+                        "strategy returned no worker for a non-empty candidate set"
+                    );
                     return;
                 };
                 let Some(sender) = inner.connected.sender(&worker_id) else {
@@ -1343,6 +1371,98 @@ mod tests {
 
         h1.abort();
         h2.abort();
+    }
+
+    /// A `Strategy` that delegates to `SimpleFifo` but counts how many times
+    /// it was asked. Used to pin the *complexity* of `try_dispatch`, which is
+    /// otherwise invisible: a policy call per pending slot per placement is
+    /// behaviourally identical to one call per placement, and only shows up as
+    /// latency once the policy is expensive (Phase 6's WASM hook, ADR 0014).
+    #[derive(Default)]
+    struct CountingStrategy {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::scheduling::Strategy for CountingStrategy {
+        fn choose(
+            &self,
+            candidates: &[WorkerId],
+            loads: &dyn crate::scheduling::LoadView,
+        ) -> Option<WorkerId> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            crate::scheduling::SimpleFifo.choose(candidates, loads)
+        }
+    }
+
+    /// The strategy is consulted once per *placement*, and **not at all** for
+    /// slots that have no candidate.
+    ///
+    /// Before this was fixed, `try_dispatch` called `choose` for every slot in
+    /// the queue on every pass, purely to decide whether that slot was
+    /// dispatchable — but `choose` is contracted to return `None` iff
+    /// `candidates` is empty, so emptiness already answers that question. With
+    /// Q queued jobs draining one at a time that was O(Q²) calls, all under the
+    /// dispatch mutex.
+    ///
+    /// The shape here makes the difference deterministic rather than
+    /// timing-dependent. One worker and three jobs: ADR 0009's capacity-1
+    /// leases mean job 1 is placed and jobs 2 and 3 *must* queue behind it —
+    /// there is no interleaving in which they don't. Every `try_dispatch` pass
+    /// while the worker is busy therefore walks two slots whose candidate sets
+    /// are empty:
+    ///
+    /// - now: exactly **1** call — the single placement. Empty-candidate slots
+    ///   cost zero policy calls no matter how many passes run.
+    /// - before: 1 call for the placement plus one per queued slot per pass,
+    ///   i.e. **≥ 3** and rising with the number of passes.
+    #[tokio::test]
+    async fn strategy_is_consulted_once_per_placement_and_never_for_empty_slots() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let counting = Arc::new(CountingStrategy::default());
+        let scheduler =
+            Scheduler::with_strategy(cas, ac, registry.clone(), counting.clone() as Arc<_>);
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let (s, d) = (scheduler.clone(), action_digest.clone());
+            handles.push(tokio::spawn(async move {
+                s.execute(d, true, TenantId::default()).await
+            }));
+        }
+
+        // Exactly one job reaches the worker...
+        assert!(
+            recv_within(&mut rx, Duration::from_millis(500))
+                .await
+                .is_some(),
+            "the single worker should have received the first job"
+        );
+        // ...and the other two stay queued, because a capacity-1 lease blocks
+        // them. This wait is also what guarantees they have been enqueued and
+        // that further dispatch passes have walked over them.
+        assert!(
+            recv_within(&mut rx, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the busy worker must not receive a second job (capacity-1 lease)"
+        );
+        for h in handles {
+            h.abort();
+        }
+
+        let calls = counting.calls.load(Ordering::Relaxed);
+        assert_eq!(
+            calls, 1,
+            "expected exactly one strategy call for the one placement; got {calls}. \
+             More than one means try_dispatch is asking the policy which slots \
+             are dispatchable instead of checking whether the candidate set is empty."
+        );
     }
 
     /// Receive one job from `rx` within `budget`, polling cooperatively. Returns

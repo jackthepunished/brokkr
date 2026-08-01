@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oversized error type of our own instead of scattering `#[allow]`s.
 
 ### Fixed
+- **`try_dispatch` now consults the scheduling `Strategy` once per placement**
+  instead of once per pending slot per placement. It was calling `choose` for
+  every queued slot purely to decide whether that slot was dispatchable, but
+  `Strategy::choose` is contracted to return `None` iff `candidates` is empty
+  — so a non-empty candidate set already answers the question without asking
+  the policy. With Q queued jobs draining one at a time the old shape was
+  O(Q²) policy calls, all under the dispatch mutex. Slots with no candidate
+  now cost zero policy calls at all. Free for the comparison-based built-ins,
+  but a prerequisite for Phase 6's WASM policies (ADR 0014), where each call
+  is a guest invocation. Added a call-counting regression test that fails
+  against the old shape.
 - Adopted `std::io::Error::other` in `brokkr-sandbox` and
   `std::slice::from_ref` at 14 call sites across `brokkr-cas`,
   `brokkr-worker`, and `brokkr-proto`'s build script, per the
