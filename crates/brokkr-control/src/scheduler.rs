@@ -493,7 +493,7 @@ impl Scheduler {
                     {
                         continue;
                     }
-                    let candidates: Vec<WorkerId> = match &reg_guard {
+                    let mut candidates: Vec<WorkerId> = match &reg_guard {
                         Some(reg) => eligible_workers(reg, now, &slot.job.platform)
                             .map(|(id, _)| id.clone())
                             .filter(|id| {
@@ -507,6 +507,16 @@ impl Scheduler {
                             .cloned()
                             .collect(),
                     };
+                    // Sort by worker id. Both sources iterate a `HashMap`
+                    // (`WorkerRegistry::workers` and `ConnectedWorkers`), so
+                    // without this the candidate list arrives in hash order —
+                    // and that list *is* the index space a WASM policy returns
+                    // into (ADR 0014). Identical cluster state would then
+                    // produce different placements run to run, which defeats
+                    // the determinism the policy ABI is built to guarantee.
+                    // The built-ins are unaffected: they already tie-break on
+                    // id and their answer never depended on order.
+                    candidates.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
                     if !candidates.is_empty() {
                         best = Some((slot.index, candidates, slot.start));
                     }

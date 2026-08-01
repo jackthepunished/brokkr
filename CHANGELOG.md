@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oversized error type of our own instead of scattering `#[allow]`s.
 
 ### Fixed
+- **The scheduler now sorts candidate workers by id before consulting the
+  strategy.** Both sources (`WorkerRegistry::workers` and `ConnectedWorkers`)
+  are `HashMap`s, so the candidate list — which *is* the index space a WASM
+  policy returns into — arrived in hash order. Identical cluster state
+  therefore placed the same job on different workers run to run, defeating the
+  determinism the policy ABI exists to guarantee. Caught by the end-to-end
+  policy test failing roughly one run in four; the built-in strategies were
+  unaffected because they already tie-break on id.
 - **`try_dispatch` now consults the scheduling `Strategy` once per placement**
   instead of once per pending slot per placement. It was calling `choose` for
   every queued slot purely to decide whether that slot was dispatchable, but
@@ -234,6 +242,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`--policy-wasm` on `brokkr-control`** — an operator-supplied WebAssembly
+  module now decides worker placement (ADR 0014), with `--policy-fuel`,
+  `--policy-deadline-ms`, `--policy-quarantine-threshold` and
+  `--policy-locality-window`. Without the flag the built-in `SimpleFifo` is
+  used and no engine starts. Any decision the policy declines or fails is
+  served by `SimpleFifo` anyway, counted per reason, and logged — a broken
+  policy degrades placement quality rather than stopping the cluster.
+- `brokkr-control::wasm_strategy::{WasmStrategy, PolicyFailureCounts}`.
 - **New crate `brokkr-policy`** — the WebAssembly scheduling-policy engine
   (ADR 0014). Loads an operator-supplied module, validates it, and runs one
   bounded call per placement decision. Holds no `wasmtime::Store`: one

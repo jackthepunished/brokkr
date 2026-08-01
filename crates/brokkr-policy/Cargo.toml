@@ -15,6 +15,10 @@ description = "WebAssembly scheduling-policy engine for Brokkr (ADR 0014)"
 # absent. See docs/phase-6-plan.md R4.
 default = ["wasm-policy"]
 wasm-policy = ["dep:wasmtime"]
+# Accept WebAssembly *text* (WAT) as well as binary. Test-only in practice:
+# it lets policy fixtures live inline in test files instead of as committed
+# `.wasm` blobs, so CI needs no wasm32 target (CLAUDE.md rule 4).
+wat = ["wasmtime?/wat"]
 
 [dependencies]
 brokkr-common.workspace = true

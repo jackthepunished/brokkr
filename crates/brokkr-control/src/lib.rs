@@ -19,6 +19,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod scheduling;
 pub mod services;
+pub mod wasm_strategy;
 pub mod worker_service;
 
 pub use auth::{auth_interceptor, AuthError, Authenticator, JwtAuth};
