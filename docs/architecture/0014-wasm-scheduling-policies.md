@@ -1,7 +1,7 @@
 # 0014 — WASM scheduling policies: operator-supplied, hot-reloadable `Strategy`
 
-- **Status:** proposed
-- **Date:** 2026-08-01
+- **Status:** accepted
+- **Date:** 2026-08-01 (proposed), 2026-08-01 (accepted, implemented in Phase 6 P0–P8)
 - **Deciders:** Brokkr maintainers
 - **Supersedes in part:** [0008](0008-multi-worker-scheduling.md) — the promised
   built-in `LocalityAware` becomes an example *policy*, not an `impl Strategy`.
@@ -144,6 +144,46 @@ it now.
 | Tenant-uploaded policies over an RPC | Untrusted code influencing other tenants' placement. Needs a threat model, quotas, and per-tenant isolation that do not exist yet. |
 | Load once at startup | Kills the iteration loop that motivates the whole ADR. |
 | Fail the dispatch on policy error | Makes an operator's policy bug into the tenants' outage. |
+
+## What implementation changed about this decision
+
+Recorded here because an ADR that only says what was planned is less useful than
+one that says what turned out to be true.
+
+**The MSRV was the real gate, not the runtime choice.** The plan expected the
+question to be "is there a wasmtime that builds on our pinned 1.85?" There is —
+34.0.2, with all three capabilities needed. But it carries two unpatched
+advisories (RUSTSEC-2026-0114, RUSTSEC-2026-0222) with no fix anywhere in the
+34.x line, so pinning an old wasmtime was never actually available and the
+toolchain bump to 1.94 was forced rather than chosen. Cost across the workspace:
+two new clippy lints, both genuine improvements.
+
+**Candidate order had to become part of the contract.** The snapshot's candidate
+list is the index space a guest returns into, and it was being built by
+iterating `HashMap`s — so identical cluster state placed the same job on
+different workers run to run. That silently defeats the determinism this ADR
+claims. `try_dispatch` now sorts candidates by worker id, and that ordering is
+documented as part of the ABI. The built-in strategies were unaffected because
+they already tie-break on id, which is why it went unnoticed until a policy
+could name a *position*.
+
+**Hot reload cannot use `(mtime, len)`.** A policy edit that swaps one constant
+for another changes neither the length nor — within a filesystem's timestamp
+granularity — the mtime. A stat-based watcher silently ignores it, which is
+exactly the "my change didn't take effect and nothing said why" failure that
+would make the feature untrustworthy. Detection is content-addressed.
+
+**Fixture policies are WebAssembly text, not committed binaries.** wasmtime
+compiles WAT directly, so the test suite needs no `wasm32` target in CI and the
+repository carries no build artifacts. The one thing WAT cannot do is decode
+protobuf, so the real `LocalityAware` is Rust under `examples/policies/locality/`
+with `#[ignore]`d tests that fail with the build command rather than skipping
+silently.
+
+**Feature-trimming wasmtime is worth doing.** `default-features = false` with
+`runtime`, `cranelift`, `pooling-allocator`, `std` drops 75 crates and a third
+of the build time versus the default feature set, and a scheduling policy can
+reach none of what was removed.
 
 ## References
 

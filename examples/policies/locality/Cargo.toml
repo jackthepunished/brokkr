@@ -1,0 +1,31 @@
+# Deliberately its own workspace: this crate only builds for
+# `wasm32-unknown-unknown`, so pulling it into the root workspace would break
+# `cargo build --workspace` on the host and drag `prost` into the control
+# plane's dependency graph for no reason.
+[workspace]
+
+[package]
+name = "brokkr-policy-locality"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+publish = false
+description = "Example Brokkr scheduling policy: prefer workers whose caches are already warm"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The snapshot is protobuf, so a guest needs a decoder. `prost` with
+# `default-features = false` keeps the tree small; `std` for the allocator.
+prost = { version = "0.13", default-features = false, features = ["prost-derive", "std"] }
+
+[profile.release]
+# A scheduling policy is called on the dispatch path; optimize for size and
+# speed, and strip everything that only helps a debugger.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
