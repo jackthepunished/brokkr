@@ -242,6 +242,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **Hot reload for the WASM scheduling policy** (ADR 0014). Editing the file
+  named by `--policy-wasm` swaps the module with no restart;
+  `--policy-reload-interval-secs` controls the poll cadence (`0` disables it).
+  Change detection is **content-addressed**, not `(mtime, len)`: a policy edit
+  that swaps one constant for another changes neither the length nor — within
+  a filesystem's timestamp granularity — the mtime, so a stat-based watcher
+  silently ignores it. A module that fails validation never becomes live and
+  the running one keeps serving; a deleted file is not an instruction to stop
+  scheduling. Reloading also clears a quarantine, since that is the documented
+  fix path.
 - **`--policy-wasm` on `brokkr-control`** — an operator-supplied WebAssembly
   module now decides worker placement (ADR 0014), with `--policy-fuel`,
   `--policy-deadline-ms`, `--policy-quarantine-threshold` and
