@@ -16,6 +16,17 @@
 //! `nix::libc::SYS_*` constants, which `libc` defines per `target_arch`.
 //! That is sound because the runner only ever installs a filter for the
 //! current process — host arch and target arch are always the same.
+//!
+//! Crucially, a `SeccompFilter` has exactly *one* match action for the whole
+//! filter (plus one default action for non-matching syscalls). A rule that
+//! matches always yields that single match action — there is no per-rule
+//! action. The base filter uses match = `Allow` (an allowlist), which means
+//! it *cannot* express "allow `ioctl` except when arg1 is `TIOCSTI`": any such
+//! rule would return `Allow`. Per-argument denials therefore live in a
+//! *second, stacked* filter ([`build_deny_filter`]) whose match action is
+//! `Errno(EPERM)`. The kernel runs every installed filter and keeps the most
+//! restrictive verdict, so the pair composes to a true allow-with-exceptions
+//! policy.
 
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
@@ -133,12 +144,12 @@ const DEFAULT_ALLOW: &[&str] = &[
     "fchdir",
     "fcntl",
     "fcntl64",
-    "ioctl", // ioctl filtered further by arg
+    "ioctl", // allowed here; dangerous request codes denied by build_deny_filter
     "prlimit64",
     "getrlimit",
     "setrlimit",
     "arch_prctl",
-    "prctl", // prctl filtered further by arg
+    "prctl", // allowed here; dangerous options denied by build_deny_filter
     "sched_yield",
     "sched_getaffinity",
     "nanosleep",
@@ -443,20 +454,14 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
         }
     }
 
-    // Build per-syscall rules. Most syscalls get an empty rule vector
-    // (unconditional allow). prctl and ioctl get argument-filtered rules.
-    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = numbers
-        .into_iter()
-        .map(|nr| {
-            if nr == libc::SYS_prctl {
-                (nr, prctl_rules())
-            } else if nr == libc::SYS_ioctl {
-                (nr, ioctl_rules())
-            } else {
-                (nr, Vec::new())
-            }
-        })
-        .collect();
+    // Base filter: every allowlisted syscall is permitted unconditionally.
+    // Argument-level denials for `prctl`/`ioctl` cannot live here — seccompiler
+    // applies a single match action per filter, so a rule matching a dangerous
+    // argument would yield this filter's match action (`Allow`), not a denial.
+    // Those denials are enforced by a second, stacked filter; see
+    // [`build_deny_filter`].
+    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+        numbers.into_iter().map(|nr| (nr, Vec::new())).collect();
 
     let filter = SeccompFilter::new(
         rules,
@@ -475,166 +480,150 @@ fn build_filter(extra_allow: &[String]) -> io::Result<BpfProgram> {
     Ok(prog)
 }
 
+/// Build (but do not install) the *argument-denial* BPF program.
+///
+/// The base filter ([`build_filter`]) permits `prctl` and `ioctl`
+/// unconditionally. This second filter is stacked on top of it and returns
+/// `EPERM` when a dangerous argument value matches, `Allow` otherwise.
+///
+/// The kernel evaluates every installed seccomp filter and applies the most
+/// restrictive result (`SECCOMP_RET_ERRNO` outranks `SECCOMP_RET_ALLOW`), so
+/// the stacked pair reads as "allow the syscall except for these argument
+/// values" — a policy a single seccompiler filter cannot express (its one
+/// match action would have to be both `Allow` and `Errno` at once). Splitting
+/// it out is why [`build_filter`] leaves `prctl`/`ioctl` unconditionally
+/// allowed.
+fn build_deny_filter() -> io::Result<BpfProgram> {
+    let arch = host_target_arch()?;
+
+    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+        std::collections::BTreeMap::new();
+    rules.insert(libc::SYS_prctl, prctl_deny_rules());
+    rules.insert(libc::SYS_ioctl, ioctl_deny_rules());
+
+    let filter = SeccompFilter::new(
+        rules,
+        // Default action (argument not in a deny rule): allow, deferring to
+        // the base filter for the accept/reject decision.
+        SeccompAction::Allow,
+        // Match action (a denied argument value): reject with EPERM.
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| io::Error::other(format!("seccomp: build deny filter: {e}")))?;
+
+    filter
+        .try_into()
+        .map_err(|e| io::Error::other(format!("seccomp: compile deny filter to BPF: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // prctl argument filtering
 // ---------------------------------------------------------------------------
 
-/// Return a BPF rule set for the `prctl` syscall.
+/// Argument-denial rules for `prctl`, consumed by [`build_deny_filter`].
 ///
-/// Each rule is evaluated in order; the first matching rule's action applies.
-/// Dangerous options are blocked (EPERM); safe options are allowed.
-/// A catch-all allow rule terminates the chain for anything not explicitly
-/// blocked.
-#[allow(clippy::expect_used, clippy::vec_init_then_push)]
-fn prctl_rules() -> Vec<SeccompRule> {
-    vec![
-        // Block: PR_SET_KEEPCAPS (31) — allows setuid binaries to retain caps
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            31,
-        )
-        .expect("valid condition")])
-        .expect("valid prctl rule"),
-        // Block: PR_CAPBSET_DROP (36) — permanently removes caps from process
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            36,
-        )
-        .expect("valid condition")])
-        .expect("valid prctl rule"),
-        // Block: PR_SET_TSC (10) — enables timing side-channel (RDTSC) control
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            10,
-        )
-        .expect("valid condition")])
-        .expect("valid prctl rule"),
-        // Block: PR_GET_TSC (11) — query CPU timestamp-config state.
-        // Even a read-only query is blocked because observing whether
-        // PR_SET_TSC was previously enabled could aid a timing
-        // side-channel attack (the value encodes CPU frequency state).
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            11,
-        )
-        .expect("valid condition")])
-        .expect("valid prctl rule"),
-        // Catch-all allow: anything not explicitly blocked above is permitted.
-        SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::MaskedEq(0),
-            0,
-        )
-        .expect("valid condition")])
-        .expect("valid prctl rule"),
-    ]
+/// Each rule matches one dangerous `option` value (arg0); a match denies the
+/// call with `EPERM`. Any option not listed here falls through to the deny
+/// filter's default `Allow` and is governed by the base allowlist.
+///
+/// Values come from `libc`, which resolves them per target arch. The previous
+/// hand-written literals (31/36/10/11) named the wrong options entirely —
+/// `PR_TASK_PERF_EVENTS_DISABLE`, `PR_SET_CHILD_SUBREAPER`, `PR_SET_FPEMU`,
+/// `PR_GET_FPEXC` — so even a correctly-actioned filter would have denied the
+/// wrong things.
+#[allow(clippy::expect_used)]
+fn prctl_deny_rules() -> Vec<SeccompRule> {
+    const DENIED_PRCTL_OPTIONS: &[libc::c_int] = &[
+        libc::PR_SET_KEEPCAPS, // 8  — let a setuid exec retain capabilities
+        libc::PR_CAPBSET_DROP, // 24 — mutate the capability bounding set
+        libc::PR_SET_TSC,      // 26 — re-enable the timestamp counter (RDTSC)
+        libc::PR_GET_TSC,      // 25 — probe timestamp-counter state (side channel)
+    ];
+    DENIED_PRCTL_OPTIONS
+        .iter()
+        .map(|&opt| {
+            SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                opt as u64,
+            )
+            .expect("valid prctl condition")])
+            .expect("valid prctl deny rule")
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // ioctl argument filtering
 // ---------------------------------------------------------------------------
 
-/// Return a BPF rule set for the `ioctl` syscall.
+/// Argument-denial rules for `ioctl`, consumed by [`build_deny_filter`].
 ///
-/// The request code is in `arg1` (arg0 is the file descriptor).
-/// Terminal/device-manipulation calls are blocked; all others are allowed.
-#[allow(clippy::expect_used, clippy::vec_init_then_push)]
-fn ioctl_rules() -> Vec<SeccompRule> {
-    vec![
-        // Block TIOCSTI (0x5412) — simulates terminal input
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            0x5412,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-        // Block TIOCSWINSZ (0x5414) — set terminal window size
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            0x5414,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-        // Block TIOCGWINSZ (0x5413) — get terminal window size (info leak)
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            0x5413,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-        // Block TIOCSBRK (0x5427) — set break condition on terminal
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            0x5427,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-        // Block TIOCCBRK (0x5428) — clear break condition
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            0x5428,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-        // Block TIOCSPTLCK (0x4D60) — unlock pseudo-terminal device lock
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            0x4D60,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-        // Note: TIOCGSID (0x5429) is distinct from TIOCSBRK (0x5427) and
-        // TIOCCBRK (0x5428); it is not explicitly blocked here, but since
-        // the syscall's mismatch_action is Errno(EPERM), any ioctl request
-        // not explicitly matched above (including TIOCGSID) returns EPERM.
-        //
-        // Catch-all allow: any ioctl request not explicitly blocked above is
-        // permitted. MaskedEq(0) on arg1 always matches.
-        SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::MaskedEq(0),
-            0,
-        )
-        .expect("valid condition")])
-        .expect("valid ioctl rule"),
-    ]
+/// The request code is in arg1 (arg0 is the file descriptor). Each rule
+/// matches one dangerous request; a match denies with `EPERM`. Anything else
+/// falls through to the deny filter's default `Allow` and is governed by the
+/// base allowlist. Request codes come from `libc` so they are correct for the
+/// target arch (the previous `TIOCSPTLCK` literal `0x4D60` was also wrong).
+//
+// `req as u64` widens the `libc::Ioctl` request to the `u64` that
+// `SeccompCondition::new` expects. On 64-bit targets `Ioctl` is already `u64`
+// so the cast is a no-op there, but it is needed on arches where `Ioctl` is
+// narrower — hence the local `unnecessary_cast` allow.
+#[allow(clippy::expect_used, clippy::unnecessary_cast)]
+fn ioctl_deny_rules() -> Vec<SeccompRule> {
+    // Typed as `[libc::Ioctl; _]` by inference — the values carry the correct
+    // per-arch request encoding without us naming the (per-target) alias.
+    let denied_ioctl_requests = [
+        libc::TIOCSTI,    // inject characters into a terminal's input queue
+        libc::TIOCSWINSZ, // set terminal window size
+        libc::TIOCGWINSZ, // read terminal window size
+        libc::TIOCSBRK,   // assert a break condition on the line
+        libc::TIOCCBRK,   // clear a break condition on the line
+        libc::TIOCSPTLCK, // (un)lock a pseudo-terminal slave
+    ];
+    denied_ioctl_requests
+        .iter()
+        .map(|&req| {
+            SeccompRule::new(vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                req as u64,
+            )
+            .expect("valid ioctl condition")])
+            .expect("valid ioctl deny rule")
+        })
+        .collect()
 }
 
-/// Install a default-deny seccomp filter on the calling thread.
+/// Install the sandbox's seccomp policy on the calling thread.
 ///
-/// `extra_allow` is an additive allowlist of syscall names beyond
-/// [`DEFAULT_ALLOW`]. Unknown names are rejected with
-/// [`io::ErrorKind::InvalidInput`] so misconfiguration surfaces loudly
-/// instead of silently widening the policy.
+/// Two filters are stacked: the base allowlist ([`build_filter`], additively
+/// widened by `extra_allow`) and the argument-denial overlay
+/// ([`build_deny_filter`]). Unknown names in `extra_allow` are rejected with
+/// [`io::ErrorKind::InvalidInput`] so misconfiguration surfaces loudly instead
+/// of silently widening the policy.
 pub(super) fn install(extra_allow: &[String]) -> io::Result<()> {
-    let prog = build_filter(extra_allow)?;
-    let bpf_instruction_count = prog.len();
-    apply_filter(&prog).map_err(|e| io::Error::other(format!("seccomp: apply_filter: {e}")))?;
+    let base = build_filter(extra_allow)?;
+    let deny = build_deny_filter()?;
+    let base_len = base.len();
+    let deny_len = deny.len();
+    // Install order matters: `seccomp` itself is NOT in the base allowlist, so
+    // once the base filter is active a further `apply_filter` would be denied.
+    // Install the deny overlay first (its default action is `Allow`, so it
+    // permits the base install), then the base allowlist last. Stacked filters
+    // are evaluated independently, so the runtime semantics do not depend on
+    // this order — only the bootstrap does.
+    apply_filter(&deny)
+        .map_err(|e| io::Error::other(format!("seccomp: apply_filter (deny): {e}")))?;
+    apply_filter(&base)
+        .map_err(|e| io::Error::other(format!("seccomp: apply_filter (base): {e}")))?;
     tracing::debug!(
-        bpf_instructions = bpf_instruction_count,
-        "installed seccomp filter"
+        base_bpf_instructions = base_len,
+        deny_bpf_instructions = deny_len,
+        "installed seccomp filters"
     );
     Ok(())
 }
@@ -660,6 +649,106 @@ mod tests {
         // process and break subsequent tests in the same binary.
         let prog = build_filter(&[]).expect("filter must compile on host arch");
         assert!(!prog.is_empty(), "BPF program should be non-empty");
+
+        let deny = build_deny_filter().expect("deny filter must compile on host arch");
+        assert!(!deny.is_empty(), "deny BPF program should be non-empty");
+    }
+
+    /// The stacked filters must actually deny the dangerous `prctl`/`ioctl`
+    /// arguments while leaving benign ones alone.
+    ///
+    /// This installs the compiled filters in a *forked child* (so the parent
+    /// test process stays unrestricted) after `PR_SET_NO_NEW_PRIVS`, which
+    /// lets an unprivileged process install seccomp with no user namespace or
+    /// elevated privilege. It therefore runs on ordinary CI and does **not**
+    /// skip — unlike the end-to-end `evil_seccomp_caps` tests, which need
+    /// unprivileged userns and previously masked this bug by skipping.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used, unsafe_code)]
+    fn stacked_filters_deny_dangerous_args_and_allow_benign() {
+        let base = build_filter(&[]).expect("base filter compiles");
+        let deny = build_deny_filter().expect("deny filter compiles");
+
+        // SAFETY: `fork` in a test. The child path only calls
+        // async-signal-safe libc functions and `_exit`, and touches no shared
+        // allocator state that the parent relies on.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+
+        if pid == 0 {
+            // Child: lock down, then probe. Failures are encoded as bits in
+            // the exit code (0 == all expectations met).
+            // SAFETY: raw prctl/seccomp calls affect only this thread.
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(100);
+                }
+            }
+            // Deny overlay first, then the base allowlist — mirrors `install`
+            // (the base filter blocks the `seccomp` syscall, so it must be
+            // installed last).
+            if apply_filter(&deny).is_err() {
+                // SAFETY: terminate the child without unwinding.
+                unsafe { libc::_exit(101) }
+            }
+            if apply_filter(&base).is_err() {
+                // SAFETY: as above.
+                unsafe { libc::_exit(102) }
+            }
+
+            let mut mask: i32 = 0;
+
+            // PR_SET_KEEPCAPS must be denied with EPERM.
+            // SAFETY: prctl with scalar arguments.
+            let rc = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) };
+            if !(rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)) {
+                mask |= 1;
+            }
+
+            // PR_SET_NAME is benign and must still succeed.
+            let name = b"brokkr-sbx\0";
+            // SAFETY: `name` is NUL-terminated; prctl reads a <=16-byte string.
+            let rc = unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0) };
+            if rc != 0 {
+                mask |= 2;
+            }
+
+            // ioctl(TIOCSTI) must be denied with EPERM regardless of the fd:
+            // seccomp rejects it before the kernel ever inspects the fd, so a
+            // non-EPERM errno (e.g. ENOTTY) means the filter let it through.
+            let mut ch: u8 = b'x';
+            // SAFETY: ioctl on stderr with a byte pointer; denied pre-dispatch.
+            let rc = unsafe { libc::ioctl(2, libc::TIOCSTI, &mut ch as *mut u8) };
+            if !(rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)) {
+                mask |= 4;
+            }
+
+            // SAFETY: terminate the child without running atexit handlers.
+            unsafe { libc::_exit(mask) }
+        }
+
+        // Parent: reap and assert the child reported no failures.
+        let mut status: i32 = 0;
+        // SAFETY: `waitpid` with a valid out pointer for the child we forked.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            io::Error::last_os_error()
+        );
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally (status={status})"
+        );
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 0,
+            "child probe failed. codes 100-102 = setup failure; otherwise bitmask \
+             bit0=PR_SET_KEEPCAPS not denied, bit1=PR_SET_NAME rejected, \
+             bit2=ioctl(TIOCSTI) not denied (code={code})"
+        );
     }
 
     #[test]

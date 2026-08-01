@@ -186,10 +186,10 @@ async fn ev04_ptrace_blocked_by_seccomp() {
 async fn ev09_prctl_set_tsc_blocked() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());
-    // PR_SET_TSC = 10, PR_TSC_SIGSEGV = 1
+    // PR_SET_TSC = 26, PR_TSC_SIGSEGV = 1
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
-         rc = libc.prctl(10, 1, 0, 0, 0)\n\
+         rc = libc.prctl(26, 1, 0, 0, 0)\n\
          if rc == -1:\n\
          \x20   sys.exit(ctypes.get_errno())\n\
          sys.exit(1)\n"; // exit 1 if it didn't error (unexpectedly succeeded)
@@ -213,10 +213,10 @@ async fn ev09_prctl_set_tsc_blocked() {
 async fn ev_prctl_keepcaps_blocked() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());
-    // PR_SET_KEEPCAPS = 31
+    // PR_SET_KEEPCAPS = 8
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
-         rc = libc.prctl(31, 1, 0, 0, 0)\n\
+         rc = libc.prctl(8, 1, 0, 0, 0)\n\
          if rc == -1:\n\
          \x20   sys.exit(ctypes.get_errno())\n\
          sys.exit(1)\n";
@@ -240,10 +240,10 @@ async fn ev_prctl_keepcaps_blocked() {
 async fn ev_prctl_capbset_drop_blocked() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());
-    // PR_CAPBSET_DROP = 36
+    // PR_CAPBSET_DROP = 24
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
-         rc = libc.prctl(36, 0, 0, 0, 0)\n\
+         rc = libc.prctl(24, 0, 0, 0, 0)\n\
          if rc == -1:\n\
          \x20   sys.exit(ctypes.get_errno())\n\
          sys.exit(1)\n";
@@ -268,10 +268,10 @@ async fn ev_prctl_capbset_drop_blocked() {
 async fn ev_prctl_get_tsc_blocked() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());
-    // PR_GET_TSC = 11 — read-only query but blocked to prevent info leak
+    // PR_GET_TSC = 25 — read-only query but blocked to prevent info leak
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
-         rc = libc.prctl(11, 0, 0, 0, 0)\n\
+         rc = libc.prctl(25, 0, 0, 0, 0)\n\
          if rc == -1:\n\
          \x20   sys.exit(ctypes.get_errno())\n\
          sys.exit(1)\n";
@@ -389,13 +389,13 @@ async fn ev_ioctl_tiocswinsz_blocked() {
 async fn ev_ioctl_tiocptlck_blocked() {
     skip_if_unsupported!();
     let sandbox = Sandbox::new(runner_path());
-    // TIOCSPTLCK = 0x4D60 — unlock pseudo-terminal device lock
+    // TIOCSPTLCK = 0x40045431 — (un)lock pseudo-terminal slave
     let script = "import ctypes, sys\n\
          libc = ctypes.CDLL('libc.so.6', use_errno=True)\n\
          fd = libc.open(b'/dev/null', 0)\n\
          if fd == -1:\n\
          \x20   sys.exit(2)\n\
-         rc = libc.ioctl(fd, 0x4D60, 0)\n\
+         rc = libc.ioctl(fd, 0x40045431, 0)\n\
          libc.close(fd)\n\
          if rc == -1:\n\
          \x20   sys.exit(ctypes.get_errno())\n\
