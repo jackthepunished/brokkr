@@ -1,0 +1,74 @@
+// Brokkr scheduling-policy ABI (ADR 0014).
+//
+// This is NOT an RPC surface. It is the wire format between the control plane
+// and an operator-supplied WebAssembly scheduling policy: the host encodes a
+// DecisionSnapshot, writes it into the guest's linear memory, and the guest
+// returns a candidate index.
+//
+// Protobuf rather than a hand-rolled packed layout for one reason above all:
+// operators compile modules against this, and field numbers mean a field added
+// next year does not break a module compiled today. A packed struct would
+// either freeze the ABI forever or silently misparse on drift — and misparsing
+// here produces *wrong placements*, not errors.
+//
+// Compatibility rules for anyone editing this file:
+//   - Never renumber or reuse a field. Add new fields with new numbers.
+//   - Never change a field's type or its meaning.
+//   - Bump POLICY_ABI_VERSION only for a change a module compiled against the
+//     previous version could not survive. Additive fields do not qualify.
+syntax = "proto3";
+
+package brokkr.v1;
+
+// A key/value platform constraint, mirroring REAPI's Platform.Property but
+// carried here so a guest needs no REAPI protos to read a snapshot.
+message PolicyPlatformProperty {
+  string name = 1;
+  string value = 2;
+}
+
+// What is known about the job being placed.
+message PolicyJobFacts {
+  // Submitting tenant (ADR 0010). Empty string for the default tenant.
+  string tenant = 1;
+  // Lowercase hex sha256 of the REAPI Action. Hex rather than raw bytes so a
+  // guest can compare and log it without a hex encoder.
+  string action_digest = 2;
+  // Lowercase hex sha256 of the action's input root. Empty when the action has
+  // no input root, or when its digest failed validation — locality is a hint,
+  // so an unusable one is simply absent.
+  string input_root_digest = 3;
+  // The action's platform constraints. Every candidate already satisfies
+  // these; a policy may still read them to distinguish *how well* a candidate
+  // matches.
+  repeated PolicyPlatformProperty platform = 4;
+}
+
+// One worker the policy may choose. Its position in
+// DecisionSnapshot.candidates is what brokkr_choose returns.
+message PolicyCandidate {
+  string worker_id = 1;
+  // Jobs dispatched to this worker but not yet reported back.
+  uint32 inflight = 2;
+  // The worker's advertised capability labels.
+  repeated PolicyPlatformProperty labels = 3;
+  // How many of this worker's recent completions used the job's input root.
+  // Zero when the job has no input root, or when the control plane is not
+  // recording locality. Drawn from a bounded window, so this answers
+  // "recently, how often?" and not "ever".
+  uint32 input_root_hits = 4;
+  // How many of this worker's recent completions were this exact action.
+  uint32 action_hits = 5;
+}
+
+// The complete input to one placement decision. Read-only and by value: the
+// guest gets a copy and cannot hold a reference into host state across calls.
+message DecisionSnapshot {
+  // Must equal the host's POLICY_ABI_VERSION. Present in the payload as well
+  // as in the brokkr_abi_version export so a guest can defend itself even if
+  // the host's load-time gate were ever bypassed.
+  uint32 abi_version = 1;
+  PolicyJobFacts job = 2;
+  // Never empty: the host does not ask a policy to choose from nothing.
+  repeated PolicyCandidate candidates = 3;
+}

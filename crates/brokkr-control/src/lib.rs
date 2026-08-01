@@ -13,6 +13,7 @@ pub mod locality;
 pub mod matching;
 pub mod membership;
 pub mod metakv;
+pub mod policy_abi;
 pub mod raftkv;
 pub mod registry;
 pub mod scheduler;

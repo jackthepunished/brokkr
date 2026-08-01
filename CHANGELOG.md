@@ -234,6 +234,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`brokkr/v1/policy.proto` and `brokkr-control::policy_abi`** — the wire
+  format between the control plane and an operator-supplied WASM scheduling
+  policy (ADR 0014), plus the host-side `build_snapshot` that projects a
+  `DecisionContext` into it. Protobuf rather than a packed layout because
+  operators compile modules against this ABI, and field numbers mean a field
+  added next year does not break a module compiled today — a packed struct
+  would either freeze the ABI or silently misparse, and misparsing here
+  produces *wrong placements* rather than errors. No WASM runtime is involved
+  yet; the projection is a pure function and is tested as one, including
+  byte-for-byte determinism.
 - **`brokkr-control::locality::LocalityIndex`** — bounded per-worker history of
   recently completed actions, the source of the `LocalityView` signal a
   scheduling `Strategy` can consult (ADR 0014). Populated when a lease
