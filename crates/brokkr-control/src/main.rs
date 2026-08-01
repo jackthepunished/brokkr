@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
+use brokkr_control::policy_reload::spawn_policy_reloader;
 use brokkr_control::registry::WorkerRegistry;
 use brokkr_control::wasm_strategy::WasmStrategy;
 use brokkr_control::{
@@ -211,6 +212,15 @@ struct Args {
     /// per candidate.
     #[arg(long, default_value_t = brokkr_control::locality::DEFAULT_WINDOW)]
     policy_locality_window: usize,
+
+    /// How often `--policy-wasm` is checked for changes, in seconds.
+    ///
+    /// Editing the file swaps the policy with no restart — that iteration loop
+    /// is most of why the hook exists. A module that fails validation never
+    /// becomes live, so a bad edit costs a log line rather than the scheduler.
+    /// `0` disables reloading.
+    #[arg(long, default_value_t = brokkr_control::policy_reload::DEFAULT_RELOAD_INTERVAL.as_secs())]
+    policy_reload_interval_secs: u64,
 }
 
 /// Build the scheduling strategy from the policy flags (ADR 0014).
@@ -825,6 +835,10 @@ async fn main() -> Result<()> {
     let worker_registry: SharedWorkerRegistry =
         Arc::new(tokio::sync::Mutex::new(WorkerRegistry::default()));
     let policy_strategy = build_policy_strategy(&args, worker_registry.clone())?;
+    if let (Some(strategy), Some(path)) = (policy_strategy.clone(), args.policy_wasm.clone()) {
+        let interval = Duration::from_secs(args.policy_reload_interval_secs);
+        spawn_policy_reloader(strategy, path, interval);
+    }
     let scheduler = match policy_strategy.clone() {
         Some(strategy) => Scheduler::with_strategy(
             cas.clone(),
