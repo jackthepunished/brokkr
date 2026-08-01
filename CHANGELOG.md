@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Sandbox isolation hardening (defense-in-depth):**
+  - The worker now rejects a REAPI `Command.working_directory` that is absolute
+    or contains a `..` component instead of `Path::join`-ing it verbatim onto
+    the sandbox workdir (an absolute value replaced the base entirely and `..`
+    walked out of the input root).
+  - An empty `RootfsSpec` no longer *silently* runs the action on the host with
+    no namespaces, capability drop, or seccomp. Zero isolation now requires an
+    explicit `SandboxConfig::no_isolation` opt-in (`SandboxConfig::new`, the M2
+    in-process constructor, sets it); a missing rootfs otherwise fails closed.
+  - The sandbox rootfs tmpfs and read-only host binds are mounted `MS_NOSUID |
+    MS_NODEV` (previously only `/proc` was), so a setuid bit or device node
+    reachable through the rootfs cannot be honored. `MS_NOEXEC` is intentionally
+    not set — build actions execute binaries from the rootfs.
 - **Closed a `/tmp` symlink race in the sandbox rootfs bootstrap.** The runner
   mounted the transient rootfs tmpfs onto `/tmp/brokkr-rootfs-<pid>`, a
   predictable path created with `create_dir_all` (which follows an existing

@@ -61,14 +61,31 @@ pub struct SandboxConfig {
     /// (M7).
     #[serde(default)]
     pub extra_seccomp_allow: Vec<String>,
+
+    /// Explicitly opt out of all isolation (the M2 in-process path: no
+    /// namespaces, no capability drop, no seccomp — the action runs on the
+    /// host filesystem as the runner's user).
+    ///
+    /// This must be set deliberately. The runner refuses to run a config with
+    /// an empty [`RootfsSpec`] unless this is `true`, so a *missing* rootfs can
+    /// never silently degrade to zero isolation — it fails closed instead.
+    #[serde(default)]
+    pub no_isolation: bool,
 }
 
 impl SandboxConfig {
-    /// Construct a minimal config that runs `argv` with no env, no workdir,
-    /// default policies for everything else.
+    /// Construct a minimal **no-isolation** (M2 in-process) config that runs
+    /// `argv` on the host with no env, no workdir, and default policies.
+    ///
+    /// It has an empty [`RootfsSpec`], which has always meant "run on the host
+    /// with no namespaces/caps/seccomp", so `no_isolation` is set to `true` to
+    /// declare that explicitly (the runner refuses an empty rootfs otherwise).
+    /// Production callers build the struct directly with a real rootfs; they
+    /// get `no_isolation = false` from `Default` and full isolation.
     pub fn new(argv: Vec<String>) -> Self {
         Self {
             argv,
+            no_isolation: true,
             ..Default::default()
         }
     }

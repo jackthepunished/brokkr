@@ -45,6 +45,16 @@ const PR_TSC_SIGSEGV: nix::libc::c_ulong = 1;
 /// `docs/phase-2-plan.md` §3.3.
 const CONFIG_FD: RawFd = 3;
 
+/// Whether an empty-rootfs config is a misconfiguration that must fail closed.
+///
+/// Zero isolation (no namespaces / caps / seccomp) is only legitimate when the
+/// caller sets [`SandboxConfig::no_isolation`] deliberately. An empty rootfs
+/// *without* that opt-in is treated as an error rather than silently degrading
+/// to a host-filesystem exec.
+fn empty_rootfs_without_opt_in(cfg: &SandboxConfig) -> bool {
+    cfg.rootfs.is_empty() && !cfg.no_isolation
+}
+
 pub(super) fn runner_main() -> ! {
     let cfg = match read_config() {
         Ok(c) => c,
@@ -52,6 +62,15 @@ pub(super) fn runner_main() -> ! {
     };
 
     if cfg.rootfs.is_empty() {
+        if empty_rootfs_without_opt_in(&cfg) {
+            // Fail closed: an empty rootfs must never silently drop namespaces,
+            // capabilities, and seccomp. Zero isolation is only reachable via
+            // the explicit `no_isolation` opt-in (the M2 in-process path).
+            die(
+                "refusing to run without isolation",
+                "empty rootfs requires the explicit `no_isolation` opt-in",
+            );
+        }
         // M2 path: no isolation, run the action in-process.
         chdir_and_exec(&cfg);
     }
@@ -213,4 +232,27 @@ fn build_env(env: &[(String, String)]) -> Result<Vec<CString>, &'static str> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_rootfs_without_opt_in;
+    use crate::config::SandboxConfig;
+
+    #[test]
+    fn empty_rootfs_fails_closed_without_opt_in() {
+        // Default config has an empty rootfs and no opt-in → must be rejected.
+        let cfg = SandboxConfig::default();
+        assert!(cfg.rootfs.is_empty());
+        assert!(empty_rootfs_without_opt_in(&cfg));
+    }
+
+    #[test]
+    fn empty_rootfs_allowed_only_with_explicit_opt_in() {
+        let cfg = SandboxConfig {
+            no_isolation: true,
+            ..Default::default()
+        };
+        assert!(!empty_rootfs_without_opt_in(&cfg));
+    }
 }

@@ -108,6 +108,10 @@ async fn wall_clock_timeout_kills_long_action() {
             wall_clock_secs: Some(2),
             ..Default::default()
         },
+        // Runs on the host (M2 path) to exercise the cgroup mechanism in
+        // isolation; opt into no-isolation explicitly per the fail-closed
+        // contract (an empty rootfs otherwise refuses to run).
+        no_isolation: true,
         ..Default::default()
     };
     let started = Instant::now();
@@ -156,6 +160,10 @@ async fn fork_bomb_capped_by_pids_max() {
             wall_clock_secs: Some(15),
             ..Default::default()
         },
+        // Runs on the host (M2 path) to exercise the cgroup mechanism in
+        // isolation; opt into no-isolation explicitly per the fail-closed
+        // contract (an empty rootfs otherwise refuses to run).
+        no_isolation: true,
         ..Default::default()
     };
     let outcome = sandbox.run(cfg).await.unwrap();
@@ -184,6 +192,10 @@ async fn memory_max_triggers_oom_status() {
             wall_clock_secs: Some(15),
             ..Default::default()
         },
+        // Runs on the host (M2 path) to exercise the cgroup mechanism in
+        // isolation; opt into no-isolation explicitly per the fail-closed
+        // contract (an empty rootfs otherwise refuses to run).
+        no_isolation: true,
         ..Default::default()
     };
     let outcome = sandbox.run(cfg).await.unwrap();
@@ -216,6 +228,10 @@ async fn accounting_is_populated_for_a_normal_action() {
             wall_clock_secs: Some(15),
             ..Default::default()
         },
+        // Runs on the host (M2 path) to exercise the cgroup mechanism in
+        // isolation; opt into no-isolation explicitly per the fail-closed
+        // contract (an empty rootfs otherwise refuses to run).
+        no_isolation: true,
         ..Default::default()
     };
     let outcome = sandbox.run(cfg).await.unwrap();
