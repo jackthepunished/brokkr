@@ -1,6 +1,7 @@
 # Phase 6 — WASM Scheduling Hooks
 
-**Status:** design approved 2026-08-01, unstarted.
+**Status:** **complete**, 2026-08-01. All five DoD lines met — see
+`docs/journal/phase-6.md` for the retrospective and the measured numbers.
 **Plan reference:** `docs/plan.md` §18 — "WASM-based extension hooks. User-defined
 scheduling policies."
 **ADR:** [0014](architecture/0014-wasm-scheduling-policies.md).
@@ -55,6 +56,24 @@ and iterates without a rebuild or a restart.
 5. Measured: p99 added latency per placement decision **< 250µs**, and the
    number of `Strategy` calls per dispatch drain is **O(placements)**, not
    O(queue²).
+
+**All five met.** Measured p99 per decision, 20,000 samples after 2,000
+warm-up, against the real `LocalityAware` module:
+
+| Strategy | Workers | mean | p50 | **p99** | p99.9 |
+|---|---|---|---|---|---|
+| `SimpleFifo` (baseline) | 64 | 1.76µs | 1.72µs | **3.43µs** | 11.06µs |
+| `WasmStrategy` | 8 | 30.00µs | 28.52µs | **56.77µs** | 170.94µs |
+| `WasmStrategy` | 32 | 33.54µs | 31.89µs | **63.84µs** | 219.10µs |
+| `WasmStrategy` | 64 | 40.10µs | 38.12µs | **67.32µs** | 232.39µs |
+| `WasmStrategy` | 128 | 56.69µs | 53.87µs | **103.59µs** | 232.02µs |
+| `WasmStrategy` | 256 | 84.10µs | 81.42µs | **130.66µs** | 268.34µs |
+
+A WASM decision costs roughly 20–50× a built-in one, which is affordable only
+because P1 made the scheduler ask once per placement rather than once per queued
+slot. `crates/brokkr-control/tests/policy_latency.rs` reproduces this; the
+O(placements) half is pinned by
+`strategy_is_consulted_once_per_placement_and_never_for_empty_slots`.
 
 ---
 
@@ -455,9 +474,19 @@ must use the trimmed set**, and `wat` belongs in `[dev-dependencies]` only: it i
 needed to compile the WAT fixtures in tests, never at runtime.
 
 31 s against a CI `cargo test` job that already runs ~2m20s is acceptable, and
-it is paid once per cache miss. Still put wasmtime behind a non-default
-`wasm-policy` feature on `brokkr-policy` so a build that doesn't want it doesn't
-pay at all, and record the CI wall-clock delta in P9.
+it is paid once per cache miss.
+
+**Measured CI wall-clock delta (P9):**
+
+| Job | Before Phase 6 | After |
+|---|---|---|
+| `cargo test (x86_64)` | ~2m11s | ~2m56s |
+| `cargo test (aarch64)` | ~1m52s | ~2m23s |
+| `cargo test`, cold cache | — | 4m49s |
+
+wasmtime is behind a non-default `wasm-policy` feature on `brokkr-policy`, and
+`cargo check -p brokkr-policy --no-default-features` is verified to build, so a
+consumer that does not want cranelift does not pay for it.
 
 **R5 — Scope creep into a plugin platform.** The temptation to add admission
 hooks, GC policies, and retry policies "while the machinery is here" is real and

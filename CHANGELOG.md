@@ -242,6 +242,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **Phase 6 is complete.** All five definition-of-done lines met; see
+  `docs/journal/phase-6.md` for the retrospective and measured numbers.
+  `crates/brokkr-control/tests/policy_latency.rs` reproduces the latency
+  measurement (worst p99 **130.7µs** at 256 workers against a 250µs budget; a
+  WASM decision costs roughly 20–50× a built-in one, affordable only because
+  the scheduler asks once per placement rather than once per queued slot).
 - **`examples/policies/locality/`** — a complete, working scheduling policy in
   Rust, compiled to `wasm32-unknown-unknown`. This is the `LocalityAware` ADR
   0008 promised and never built, delivered as an *operator-editable module*
