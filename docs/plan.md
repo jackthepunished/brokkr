@@ -441,7 +441,8 @@ Each phase is a **shippable milestone**, not a time estimate. Move to the next o
 | **3** | Distributed CAS | Multiple CAS nodes with hash-prefix sharding. Workers fetch inputs over network. FUSE materialization. |
 | **4** | Scheduler & multi-tenancy | 10+ workers, parallel jobs, fair scheduling across tenants, REAPI-compatible enough to run a real Bazel build. |
 | **5** | Raft consensus & HA | Replace embedded KV with custom Raft. Survive control-plane node loss. |
-| **6+** | Advanced features | Speculative execution, FUSE optimizations, GPU scheduling, federation, web UI, etc. |
+| **6** | WASM scheduling hooks | An operator-supplied `.wasm` module decides worker placement, hot-swappable with no restart, degrading to the built-in when it misbehaves. Delivers ADR 0008's never-built `LocalityAware` as an example policy. |
+| **7+** | Advanced features | Speculative execution, FUSE optimizations, GPU scheduling, federation, web UI, etc. |
 
 **Phase exit criteria** (every phase must satisfy these before moving on):
 - All public APIs documented with rustdoc.
@@ -637,10 +638,13 @@ In rough priority order. Pick what's interesting; nothing here is required.
 - **Stream-mode execution.** Not just batch — long-running services with structured restarts.
 - **Bazel BES integration.** Build event stream for IDE integrations.
 - **Connector plugins.** PostgreSQL CDC, Kafka, Elasticsearch sources/sinks.
-- **WASM-based extension hooks.** User-defined scheduling policies. — **selected
-  as Phase 6.** Design approved 2026-08-01: see `docs/phase-6-plan.md` and
-  [ADR 0014](architecture/0014-wasm-scheduling-policies.md). Delivers ADR 0008's
-  never-built `LocalityAware` as an *example policy* rather than a built-in.
+- ~~**WASM-based extension hooks.** User-defined scheduling policies.~~ —
+  **done: this became Phase 6.** See `docs/phase-6-plan.md`,
+  [ADR 0014](architecture/0014-wasm-scheduling-policies.md),
+  `docs/journal/phase-6.md`, and
+  [the operator guide](operations/writing-a-scheduling-policy.md). Delivered
+  ADR 0008's never-built `LocalityAware` as an *example policy* rather than a
+  built-in.
 
 ---
 

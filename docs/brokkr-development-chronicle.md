@@ -10,7 +10,7 @@ project's own planning docs, ADRs, and phase journals.
 - **Started:** 2026-04-28
 - **Language:** Rust, edition 2021, MSRV 1.94
 - **Crates:** 10
-- **Current phase:** 5 complete → 6 (not started)
+- **Current phase:** 6 complete → 7 (not started)
 - **License:** Apache-2.0
 
 | Phase | Theme | Status |
@@ -314,9 +314,9 @@ path into consensus itself.
 
 - **5 / 6** phases complete
 - **~60** numbered milestones shipped (Phases 2–5)
-- **#98–#116** PR range for Phase 4; **#120–#172** for Phase 5
+- **#98–#116** PR range for Phase 4; **#120–#172** for Phase 5; **#178–#189** for Phase 6
 - **14** architecture decision records
-- **10** workspace crates, zero dependency cycles
+- **11** workspace crates, zero dependency cycles
 - **1.94** pinned MSRV (bumped twice: 1.78 → 1.85 in Phase 0, 1.85 → 1.94 in
   Phase 6 P0)
 
