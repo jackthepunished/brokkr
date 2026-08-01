@@ -242,6 +242,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`Cas::stats()`** returning `CasStats { objects, bytes }`, with a scanning
+  default and a `RedbCas` override. Needed by ADR 0012's observability surface.
+  Deliberately *not* derived from `list_digests()` on the polling path: that
+  materializes every digest into a `Vec` and takes a throughput permit a poller
+  could otherwise steal from real CAS traffic. `CasStats` is documented as
+  never summable across nodes — each node opens its own store, so one blob on
+  three nodes is three copies.
 - **`brokkr-control::views`** — the read-model behind ADR 0012's observability
   surface. Pure projections from node-local state into DTOs, with `owning_node`
   on every one: in an HA cluster the worker registry, job history, CAS and

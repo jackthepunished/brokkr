@@ -15,6 +15,19 @@ pub struct UpdateResult {
     pub status: Result<(), String>,
 }
 
+/// Size of a single CAS store.
+///
+/// **Per store, never summed across nodes.** Each control-plane node opens its
+/// own CAS, so three nodes holding one blob is three copies of one blob, not
+/// three blobs. Adding these together reports storage that does not exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CasStats {
+    /// Number of distinct blobs stored.
+    pub objects: u64,
+    /// Total bytes stored, summing each blob once.
+    pub bytes: u64,
+}
+
 /// Content-Addressable Storage backend.
 ///
 /// Mirrors the three core REAPI `ContentAddressableStorage` RPCs. Backends must
@@ -65,5 +78,58 @@ pub trait Cas: Send + Sync + 'static {
     /// compiling.
     async fn delete_blob(&self, _digest: &Digest) -> Result<(), CasError> {
         Ok(())
+    }
+
+    /// Size of this store.
+    ///
+    /// The default implementation derives stats from
+    /// [`list_digests`](Cas::list_digests), which is a full scan on most
+    /// backends. **Backends that can answer cheaply should override this** —
+    /// callers may poll it, and `RedbCas` in particular takes a throughput
+    /// permit for a scan that a poller could otherwise steal from real
+    /// traffic.
+    async fn stats(&self) -> Result<CasStats, CasError> {
+        let digests = self.list_digests().await?;
+        let bytes = digests
+            .iter()
+            .map(|d| u64::try_from(d.size_bytes()).unwrap_or(0))
+            .sum();
+        Ok(CasStats {
+            objects: digests.len() as u64,
+            bytes,
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::in_memory::InMemoryCas;
+
+    #[tokio::test]
+    async fn stats_counts_objects_and_bytes() {
+        let cas = InMemoryCas::new();
+        let a = Bytes::from_static(b"hello");
+        let b = Bytes::from_static(b"world!!");
+        cas.batch_update_blobs(vec![
+            (Digest::of(&a), a.clone()),
+            (Digest::of(&b), b.clone()),
+        ])
+        .await
+        .unwrap();
+
+        let stats = cas.stats().await.unwrap();
+        assert_eq!(stats.objects, 2);
+        assert_eq!(stats.bytes, (a.len() + b.len()) as u64);
+    }
+
+    #[tokio::test]
+    async fn stats_on_an_empty_cas_is_zero_not_an_error() {
+        let stats = InMemoryCas::new().stats().await.unwrap();
+        assert_eq!(stats.objects, 0);
+        assert_eq!(stats.bytes, 0);
     }
 }

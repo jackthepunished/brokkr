@@ -32,4 +32,4 @@ pub use replicated::{ReplicaPool, ReplicatedCas, StaticPool};
 pub use ring::{replicas_for, score, NodeStatus, RingNode};
 pub use router::{Router, Topology};
 pub use tiered::TieredCas;
-pub use traits::Cas;
+pub use traits::{Cas, CasStats};
