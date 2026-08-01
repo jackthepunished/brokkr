@@ -25,7 +25,9 @@ use tracing::Instrument;
 use crate::fairqueue::FairQueue;
 use crate::lease::LeaseTable;
 use crate::matching::eligible_workers;
-use crate::scheduling::{ConnectedWorkers, SimpleFifo, Strategy};
+use crate::scheduling::{
+    ConnectedWorkers, DecisionContext, JobFacts, NoLocality, SimpleFifo, Strategy,
+};
 use crate::worker_service::SharedWorkerRegistry;
 
 /// Maximum dispatch attempts for a job before it is failed, to bound requeue
@@ -102,6 +104,16 @@ struct PendingJob {
     platform: rapi::Platform,
     lease_duration: Duration,
     attempts: u32,
+    /// Digest of the action being run. Also reachable via
+    /// `job.action_digest`, but kept here as the typed newtype so the dispatch
+    /// path can build a [`JobFacts`] without re-validating a proto message on
+    /// every placement.
+    action_digest: Digest,
+    /// Digest of the action's input root, when it has one. `None` for an
+    /// action with no inputs, or when the proto digest failed validation —
+    /// locality is a hint, so an unparseable input root degrades to "no
+    /// locality signal" rather than failing the dispatch.
+    input_root_digest: Option<Digest>,
 }
 
 /// Dispatch state held under a single mutex, so every routing decision (which
@@ -482,8 +494,27 @@ impl Scheduler {
                 let Some((idx, candidates, _)) = best else {
                     return;
                 };
-                // The one strategy call per placement.
-                let Some(worker_id) = self.strategy.choose(&candidates, &inner.connected) else {
+                // The one strategy call per placement. The context is built
+                // from the winning slot only, which is why `FairQueue::get`
+                // exists — re-borrowing beats cloning a `PendingJob` (it
+                // inlines the whole Action and Command).
+                let Some(winner) = inner.pending.get(idx) else {
+                    return;
+                };
+                let facts = JobFacts {
+                    tenant: &winner.job.tenant,
+                    action_digest: &winner.job.action_digest,
+                    input_root_digest: winner.job.input_root_digest.as_ref(),
+                    platform: &winner.job.platform,
+                };
+                // Locality history arrives in a later increment; until then a
+                // policy that asks sees an honest "no recent overlap".
+                let ctx = DecisionContext {
+                    loads: &inner.connected,
+                    locality: &NoLocality,
+                    job: facts,
+                };
+                let Some(worker_id) = self.strategy.choose_with(&candidates, &ctx) else {
                     // Unreachable for a contract-abiding strategy (`candidates`
                     // is non-empty here). Bail rather than dispatch nowhere.
                     tracing::warn!(
@@ -620,6 +651,16 @@ impl Scheduler {
             .or_else(|| command.platform.clone())
             .unwrap_or_default();
 
+        // The action's input root, for the locality signal a `Strategy` may
+        // read (ADR 0014). A worker that recently ran an action with this same
+        // input root probably still has those inputs materialized. This is a
+        // hint, not a constraint, so a digest that fails validation degrades to
+        // `None` — "no locality signal" — rather than failing the dispatch.
+        let input_root = action
+            .input_root_digest
+            .as_ref()
+            .and_then(|d| Digest::new(d.hash.clone(), d.size_bytes).ok());
+
         // Fail fast when a registry is wired in and *no healthy worker* matches
         // the platform — an action nothing can run should not queue forever.
         // (A matching-but-busy worker still leads to queueing below.)
@@ -684,6 +725,8 @@ impl Scheduler {
             // than the lease window so a hung worker is retried.
             lease_duration: effective_timeout.min(self.lease_duration),
             attempts: 0,
+            action_digest: action_digest.clone(),
+            input_root_digest: input_root,
         };
         // Admission: enqueue + count one in-flight for the tenant, unless it is
         // already at its max-concurrent quota (checked and incremented under the

@@ -109,6 +109,21 @@ impl<J> FairQueue<J> {
         })
     }
 
+    /// Borrow the slot at `index`, or `None` if out of range.
+    ///
+    /// Lets a caller that selected an index during a [`slots`](Self::slots)
+    /// walk read that job again — to build a scheduling decision context from
+    /// it, say — without cloning the job or re-scanning the queue. Indices are
+    /// only valid until the next [`take`](Self::take) or
+    /// [`push`](Self::push), because `take` uses `swap_remove`.
+    pub fn get(&self, index: usize) -> Option<Slot<'_, J>> {
+        self.entries.get(index).map(|e| Slot {
+            index,
+            start: e.start,
+            job: &e.job,
+        })
+    }
+
     /// Remove the entry at `index`, returning its job and advancing virtual
     /// time to that entry's start tag (the SFQ service rule). `None` if the
     /// index is out of range.
