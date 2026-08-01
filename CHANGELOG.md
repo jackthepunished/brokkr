@@ -234,6 +234,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **New crate `brokkr-policy`** — the WebAssembly scheduling-policy engine
+  (ADR 0014). Loads an operator-supplied module, validates it, and runs one
+  bounded call per placement decision. Holds no `wasmtime::Store`: one
+  `Engine` with the pooling allocator plus one `InstancePre` per module, and a
+  fresh `Store` per decision, which is both what makes the engine `Send + Sync`
+  and what keeps decisions deterministic. Budgets are fuel *and* epoch
+  interruption — fuel bounds work, only epochs bound wall-clock time, and this
+  call happens under the scheduler's dispatch mutex. A guest gets **no
+  imports**: no clocks, files, sockets, or randomness. Failures degrade to the
+  built-in strategy with a typed reason, and 16 consecutive failures quarantine
+  the module until it is reloaded. wasmtime is behind a `wasm-policy` feature
+  (on by default) so a build that does not want cranelift need not pay for it.
 - **`brokkr/v1/policy.proto` and `brokkr-control::policy_abi`** — the wire
   format between the control plane and an operator-supplied WASM scheduling
   policy (ADR 0014), plus the host-side `build_snapshot` that projects a
