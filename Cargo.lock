@@ -259,6 +259,7 @@ dependencies = [
  "async-trait",
  "brokkr-cas",
  "brokkr-common",
+ "brokkr-policy",
  "brokkr-proto",
  "brokkr-raft",
  "brokkr-sdk",
