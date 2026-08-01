@@ -234,6 +234,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`Strategy::choose_with` and `DecisionContext`** (`brokkr-control::scheduling`).
+  A scheduling policy can now see the job it is placing — tenant, action
+  digest, input-root digest, platform constraints — and a new `LocalityView`
+  reporting how much of each candidate's *recent* work overlaps with it. The
+  method carries a default implementation forwarding to the existing
+  `choose`, so `SimpleFifo` and `BinPacking` are untouched and stay honest
+  about consulting only load. This is the seam Phase 6's WASM policies plug
+  into (ADR 0014), and it is what makes ADR 0008's never-built
+  `LocalityAware` expressible at all.
+- `NoLocality`, a `LocalityView` that reports no overlap rather than failing,
+  for callers that do not track history yet.
+- `FairQueue::get(index)`, to re-borrow a slot chosen during a `slots()` walk
+  without cloning the job.
 - Phase 0 bootstrap: Cargo workspace, 9 crates, toolchain pin to Rust 1.85,
   rustfmt/clippy/deny configuration, root README, CONTRIBUTING, LICENSE
   (Apache-2.0), CHANGELOG, CODE_OF_CONDUCT, justfile.

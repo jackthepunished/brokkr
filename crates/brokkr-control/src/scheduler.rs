@@ -25,7 +25,9 @@ use tracing::Instrument;
 use crate::fairqueue::FairQueue;
 use crate::lease::LeaseTable;
 use crate::matching::eligible_workers;
-use crate::scheduling::{ConnectedWorkers, SimpleFifo, Strategy};
+use crate::scheduling::{
+    ConnectedWorkers, DecisionContext, JobFacts, NoLocality, SimpleFifo, Strategy,
+};
 use crate::worker_service::SharedWorkerRegistry;
 
 /// Maximum dispatch attempts for a job before it is failed, to bound requeue
@@ -102,6 +104,16 @@ struct PendingJob {
     platform: rapi::Platform,
     lease_duration: Duration,
     attempts: u32,
+    /// Digest of the action being run. Also reachable via
+    /// `job.action_digest`, but kept here as the typed newtype so the dispatch
+    /// path can build a [`JobFacts`] without re-validating a proto message on
+    /// every placement.
+    action_digest: Digest,
+    /// Digest of the action's input root, when it has one. `None` for an
+    /// action with no inputs, or when the proto digest failed validation —
+    /// locality is a hint, so an unparseable input root degrades to "no
+    /// locality signal" rather than failing the dispatch.
+    input_root_digest: Option<Digest>,
 }
 
 /// Dispatch state held under a single mutex, so every routing decision (which
@@ -482,8 +494,27 @@ impl Scheduler {
                 let Some((idx, candidates, _)) = best else {
                     return;
                 };
-                // The one strategy call per placement.
-                let Some(worker_id) = self.strategy.choose(&candidates, &inner.connected) else {
+                // The one strategy call per placement. The context is built
+                // from the winning slot only, which is why `FairQueue::get`
+                // exists — re-borrowing beats cloning a `PendingJob` (it
+                // inlines the whole Action and Command).
+                let Some(winner) = inner.pending.get(idx) else {
+                    return;
+                };
+                let facts = JobFacts {
+                    tenant: &winner.job.tenant,
+                    action_digest: &winner.job.action_digest,
+                    input_root_digest: winner.job.input_root_digest.as_ref(),
+                    platform: &winner.job.platform,
+                };
+                // Locality history arrives in a later increment; until then a
+                // policy that asks sees an honest "no recent overlap".
+                let ctx = DecisionContext {
+                    loads: &inner.connected,
+                    locality: &NoLocality,
+                    job: facts,
+                };
+                let Some(worker_id) = self.strategy.choose_with(&candidates, &ctx) else {
                     // Unreachable for a contract-abiding strategy (`candidates`
                     // is non-empty here). Bail rather than dispatch nowhere.
                     tracing::warn!(
@@ -620,6 +651,30 @@ impl Scheduler {
             .or_else(|| command.platform.clone())
             .unwrap_or_default();
 
+        // The action's input root, for the locality signal a `Strategy` may
+        // read (ADR 0014). A worker that recently ran an action with this same
+        // input root probably still has those inputs materialized. This is a
+        // hint, not a constraint, so a digest that fails validation degrades to
+        // `None` — "no locality signal" — rather than failing the dispatch.
+        let input_root = action.input_root_digest.as_ref().and_then(|d| {
+            match Digest::new(d.hash.clone(), d.size_bytes) {
+                Ok(digest) => Some(digest),
+                Err(e) => {
+                    // Observable, like every other degrade-to-best-effort path
+                    // here (cf. the `NotLeader` cache lookup): a client that
+                    // persistently sends a malformed input root silently costs
+                    // every locality-aware policy its signal, and a log line is
+                    // the only way that surfaces.
+                    tracing::debug!(
+                        action_digest = %action_digest,
+                        error = %e,
+                        "invalid input-root digest; no locality signal for this action"
+                    );
+                    None
+                }
+            }
+        });
+
         // Fail fast when a registry is wired in and *no healthy worker* matches
         // the platform — an action nothing can run should not queue forever.
         // (A matching-but-busy worker still leads to queueing below.)
@@ -684,6 +739,8 @@ impl Scheduler {
             // than the lease window so a hung worker is retried.
             lease_duration: effective_timeout.min(self.lease_duration),
             attempts: 0,
+            action_digest: action_digest.clone(),
+            input_root_digest: input_root,
         };
         // Admission: enqueue + count one in-flight for the tenant, unless it is
         // already at its max-concurrent quota (checked and incremented under the
@@ -1463,6 +1520,86 @@ mod tests {
              More than one means try_dispatch is asking the policy which slots \
              are dispatchable instead of checking whether the candidate set is empty."
         );
+    }
+
+    /// An action whose `input_root_digest` is malformed must still dispatch.
+    ///
+    /// The input root feeds the locality signal a `Strategy` may read (ADR
+    /// 0014); it is a hint, not a constraint. A client that sends a digest
+    /// failing validation should lose *the hint*, not the build — so this
+    /// asserts the job reaches a worker and completes normally.
+    #[tokio::test]
+    async fn an_invalid_input_root_digest_costs_the_hint_not_the_dispatch() {
+        use crate::registry::WorkerRegistry;
+        use brokkr_cas::Cas as _;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let command = rapi::Command {
+            arguments: vec!["/bin/echo".to_string(), "hi".to_string()],
+            ..Default::default()
+        };
+        let command_bytes = command.encode_to_vec();
+        let command_digest = Digest::of(&command_bytes);
+        let action = rapi::Action {
+            command_digest: Some(rapi::Digest {
+                hash: command_digest.hash().to_string(),
+                size_bytes: command_digest.size_bytes(),
+            }),
+            platform: Some(os_platform("linux")),
+            // Not a valid digest: the hash is not 64 hex characters. Asserted
+            // below, so this test cannot start passing for the wrong reason if
+            // `Digest::new` ever loosens.
+            input_root_digest: Some(rapi::Digest {
+                hash: "not-a-digest".to_string(),
+                size_bytes: -1,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            Digest::new("not-a-digest".to_string(), -1).is_err(),
+            "the fixture must actually be rejected, or this test proves nothing"
+        );
+
+        let action_bytes = action.encode_to_vec();
+        let action_digest = Digest::of(&action_bytes);
+        cas.batch_update_blobs(vec![
+            (action_digest.clone(), Bytes::from(action_bytes)),
+            (command_digest, Bytes::from(command_bytes)),
+        ])
+        .await
+        .unwrap();
+
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        let exec: tokio::task::JoinHandle<Result<ExecutionOutcome, ExecutionError>> = {
+            let s = scheduler.clone();
+            tokio::spawn(async move { s.execute(action_digest, true, TenantId::default()).await })
+        };
+        // A malformed input root must not block dispatch.
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = exec.await.unwrap().unwrap();
+        assert_eq!(outcome.result.exit_code, 0);
     }
 
     /// Receive one job from `rx` within `budget`, polling cooperatively. Returns
