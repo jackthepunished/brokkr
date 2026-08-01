@@ -24,10 +24,9 @@ use tracing::Instrument;
 
 use crate::fairqueue::FairQueue;
 use crate::lease::LeaseTable;
+use crate::locality::LocalityIndex;
 use crate::matching::eligible_workers;
-use crate::scheduling::{
-    ConnectedWorkers, DecisionContext, JobFacts, NoLocality, SimpleFifo, Strategy,
-};
+use crate::scheduling::{ConnectedWorkers, DecisionContext, JobFacts, SimpleFifo, Strategy};
 use crate::worker_service::SharedWorkerRegistry;
 
 /// Maximum dispatch attempts for a job before it is failed, to bound requeue
@@ -124,6 +123,11 @@ struct Inner {
     connected: ConnectedWorkers,
     pending: FairQueue<PendingJob>,
     leases: LeaseTable<PendingJob>,
+    /// Bounded per-worker completion history, the source of the locality
+    /// signal a `Strategy` may read (ADR 0014). Lives here rather than beside
+    /// `ConnectedWorkers` because it deliberately outlives a worker's
+    /// connection: a reconnecting worker still has its inputs on disk.
+    locality: LocalityIndex,
     /// Per-tenant count of in-flight jobs (queued + leased), for the
     /// max-concurrent quota (ADR 0010). A job is counted from admission in
     /// `execute` until that call returns (success / timeout / failure).
@@ -330,6 +334,7 @@ impl Scheduler {
                 pending: FairQueue::new(),
                 leases: LeaseTable::new(),
                 tenant_inflight: HashMap::new(),
+                locality: LocalityIndex::default(),
             }),
             strategy,
             max_concurrent_per_tenant,
@@ -351,6 +356,21 @@ impl Scheduler {
     /// the symptom of a routing problem, not a storage one.
     pub fn uncached_results_not_leader(&self) -> u64 {
         self.uncached_results_not_leader.load(Ordering::Relaxed)
+    }
+
+    /// How many of `worker`'s recent completions used `input_root` (ADR 0014).
+    ///
+    /// The locality index lives under the dispatch mutex, so this is the only
+    /// way to observe it from outside — used by tests and, later, by the
+    /// observability read-model. Cheap: one hash lookup plus a scan of a
+    /// bounded window.
+    pub async fn locality_input_root_hits(&self, worker: &WorkerId, input_root: &Digest) -> u32 {
+        use crate::scheduling::LocalityView as _;
+        self.inner
+            .lock()
+            .await
+            .locality
+            .input_root_hits(worker, input_root)
     }
 
     /// Register a connected worker's job channel (called by
@@ -507,11 +527,9 @@ impl Scheduler {
                     input_root_digest: winner.job.input_root_digest.as_ref(),
                     platform: &winner.job.platform,
                 };
-                // Locality history arrives in a later increment; until then a
-                // policy that asks sees an honest "no recent overlap".
                 let ctx = DecisionContext {
                     loads: &inner.connected,
-                    locality: &NoLocality,
+                    locality: &inner.locality,
                     job: facts,
                 };
                 let Some(worker_id) = self.strategy.choose_with(&candidates, &ctx) else {
@@ -881,7 +899,20 @@ impl Scheduler {
             .map_err(|e| anyhow!("invalid job_id in result: {}", e))?;
         let known = {
             let mut inner = self.inner.lock().await;
-            inner.leases.complete(&job_id).is_some()
+            // Read the holder before completing, because `complete` removes
+            // the lease and with it the worker association.
+            let worker = inner.leases.worker_of(&job_id).cloned();
+            let completed = inner.leases.complete(&job_id);
+            // Record locality only for a lease the worker actually reported.
+            // A lease that *expired* is deliberately not recorded: the worker
+            // never reported, so it is most likely dead or partitioned and its
+            // cache state is unknown.
+            if let (Some(w), Some(pj)) = (worker, completed.as_ref()) {
+                inner
+                    .locality
+                    .record(&w, &pj.action_digest, pj.input_root_digest.as_ref());
+            }
+            completed.is_some()
         };
         if !known {
             tracing::debug!(
@@ -1600,6 +1631,210 @@ mod tests {
             .unwrap();
         let outcome = exec.await.unwrap().unwrap();
         assert_eq!(outcome.result.exit_code, 0);
+    }
+
+    /// A worker's own report populates the locality index; a lease that merely
+    /// *expires* does not.
+    ///
+    /// That asymmetry is the whole point of recording on `report` rather than
+    /// on `complete`: an expired lease means the worker never answered, so it
+    /// is most likely dead or partitioned and its cache state is unknown.
+    /// Recording it would teach the scheduler to prefer a worker that may have
+    /// nothing.
+    #[tokio::test]
+    async fn locality_is_recorded_on_report_and_not_on_lease_expiry() {
+        use crate::registry::WorkerRegistry;
+        use brokkr_cas::Cas as _;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        // An action with a real input root, so there is something to record.
+        let input_root = Digest::of(b"the-input-root");
+        let command = rapi::Command {
+            arguments: vec!["/bin/echo".to_string(), "hi".to_string()],
+            ..Default::default()
+        };
+        let command_bytes = command.encode_to_vec();
+        let command_digest = Digest::of(&command_bytes);
+        let action = rapi::Action {
+            command_digest: Some(rapi::Digest {
+                hash: command_digest.hash().to_string(),
+                size_bytes: command_digest.size_bytes(),
+            }),
+            platform: Some(os_platform("linux")),
+            input_root_digest: Some(rapi::Digest {
+                hash: input_root.hash().to_string(),
+                size_bytes: input_root.size_bytes(),
+            }),
+            ..Default::default()
+        };
+        let action_bytes = action.encode_to_vec();
+        let action_digest = Digest::of(&action_bytes);
+        cas.batch_update_blobs(vec![
+            (action_digest.clone(), Bytes::from(action_bytes)),
+            (command_digest, Bytes::from(command_bytes)),
+        ])
+        .await
+        .unwrap();
+
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let wid_a = WorkerId::new("w-a".to_string()).unwrap();
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        assert_eq!(
+            scheduler
+                .locality_input_root_hits(&wid_a, &input_root)
+                .await,
+            0,
+            "nothing recorded before anything completes"
+        );
+
+        // Run one job to completion via a real report.
+        let exec: tokio::task::JoinHandle<Result<ExecutionOutcome, ExecutionError>> = {
+            let (s, d) = (scheduler.clone(), action_digest.clone());
+            tokio::spawn(async move { s.execute(d, true, TenantId::default()).await })
+        };
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        exec.await.unwrap().unwrap();
+
+        assert_eq!(
+            scheduler
+                .locality_input_root_hits(&wid_a, &input_root)
+                .await,
+            1,
+            "a reported completion must warm the worker's locality history"
+        );
+
+        // Now dispatch a second job and let its lease expire instead.
+        let exec2: tokio::task::JoinHandle<Result<ExecutionOutcome, ExecutionError>> = {
+            let (s, d) = (scheduler.clone(), action_digest.clone());
+            tokio::spawn(async move { s.execute(d, true, TenantId::default()).await })
+        };
+        assert!(
+            recv_within(&mut rx, Duration::from_millis(500))
+                .await
+                .is_some(),
+            "the second job should have been dispatched"
+        );
+        // Reap with a deadline far in the future: the lease expires unreported.
+        scheduler
+            .reap_expired_at(Instant::now() + Duration::from_secs(3600))
+            .await;
+        exec2.abort();
+
+        assert_eq!(
+            scheduler
+                .locality_input_root_hits(&wid_a, &input_root)
+                .await,
+            1,
+            "an expired lease must NOT be recorded — the worker never reported, \
+             so its cache state is unknown"
+        );
+    }
+
+    /// Locality survives a disconnect, because a reconnecting worker almost
+    /// certainly still has its inputs on disk. Forgetting on disconnect would
+    /// discard exactly the signal being collected.
+    #[tokio::test]
+    async fn locality_survives_a_worker_disconnect() {
+        use crate::registry::WorkerRegistry;
+        use brokkr_cas::Cas as _;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let input_root = Digest::of(b"sticky-inputs");
+        let command = rapi::Command {
+            arguments: vec!["/bin/echo".to_string(), "hi".to_string()],
+            ..Default::default()
+        };
+        let command_bytes = command.encode_to_vec();
+        let command_digest = Digest::of(&command_bytes);
+        let action = rapi::Action {
+            command_digest: Some(rapi::Digest {
+                hash: command_digest.hash().to_string(),
+                size_bytes: command_digest.size_bytes(),
+            }),
+            platform: Some(os_platform("linux")),
+            input_root_digest: Some(rapi::Digest {
+                hash: input_root.hash().to_string(),
+                size_bytes: input_root.size_bytes(),
+            }),
+            ..Default::default()
+        };
+        let action_bytes = action.encode_to_vec();
+        let action_digest = Digest::of(&action_bytes);
+        cas.batch_update_blobs(vec![
+            (action_digest.clone(), Bytes::from(action_bytes)),
+            (command_digest, Bytes::from(command_bytes)),
+        ])
+        .await
+        .unwrap();
+
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let wid_a = WorkerId::new("w-a".to_string()).unwrap();
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        let exec: tokio::task::JoinHandle<Result<ExecutionOutcome, ExecutionError>> = {
+            let (s, d) = (scheduler.clone(), action_digest.clone());
+            tokio::spawn(async move { s.execute(d, true, TenantId::default()).await })
+        };
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        exec.await.unwrap().unwrap();
+        assert_eq!(
+            scheduler
+                .locality_input_root_hits(&wid_a, &input_root)
+                .await,
+            1
+        );
+
+        scheduler.disconnect_worker(&wid_a).await;
+
+        assert_eq!(
+            scheduler
+                .locality_input_root_hits(&wid_a, &input_root)
+                .await,
+            1,
+            "history must outlive the connection — a reconnecting worker still \
+             has its inputs materialized"
+        );
     }
 
     /// Receive one job from `rx` within `budget`, polling cooperatively. Returns

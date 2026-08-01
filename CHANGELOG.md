@@ -234,6 +234,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`brokkr-control::locality::LocalityIndex`** — bounded per-worker history of
+  recently completed actions, the source of the `LocalityView` signal a
+  scheduling `Strategy` can consult (ADR 0014). Populated when a lease
+  completes on a worker's own report, and deliberately **not** on lease
+  expiry: an expired lease means the worker never answered, so its cache state
+  is unknown and preferring it would be a guess. History **survives
+  disconnect**, because a reconnecting worker almost certainly still has its
+  inputs materialized — forgetting on disconnect would discard exactly the
+  signal being collected. Bounded twice over: a per-worker window (default 64)
+  and an LRU cap over workers (default 1024), giving an explicit ~4 MiB
+  worst-case ceiling.
+- `Scheduler::locality_input_root_hits`, to observe the index from outside the
+  dispatch mutex.
 - **`Strategy::choose_with` and `DecisionContext`** (`brokkr-control::scheduling`).
   A scheduling policy can now see the job it is placing — tenant, action
   digest, input-root digest, platform constraints — and a new `LocalityView`
