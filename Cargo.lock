@@ -212,7 +212,7 @@ dependencies = [
  "futures",
  "hex",
  "parking_lot",
- "prost",
+ "prost 0.13.5",
  "rand",
  "redb",
  "sha2",
@@ -232,8 +232,8 @@ dependencies = [
  "brokkr-proto",
  "brokkr-sdk",
  "clap",
- "prost",
- "prost-types",
+ "prost 0.13.5",
+ "prost-types 0.14.4",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -267,8 +267,8 @@ dependencies = [
  "clap",
  "hex",
  "jsonwebtoken",
- "prost",
- "prost-types",
+ "prost 0.13.5",
+ "prost-types 0.14.4",
  "redb",
  "serde_json",
  "sha2",
@@ -288,7 +288,7 @@ version = "0.1.0"
 dependencies = [
  "brokkr-common",
  "brokkr-proto",
- "prost",
+ "prost 0.13.5",
  "thiserror 2.0.18",
  "tracing",
  "wasmtime",
@@ -298,8 +298,8 @@ dependencies = [
 name = "brokkr-proto"
 version = "0.1.0"
 dependencies = [
- "prost",
- "prost-types",
+ "prost 0.13.5",
+ "prost-types 0.14.4",
  "protoc-bin-vendored",
  "tonic",
  "tonic-build",
@@ -313,7 +313,7 @@ dependencies = [
  "brokkr-proto",
  "bytes",
  "hyper-util",
- "prost",
+ "prost 0.13.5",
  "redb",
  "tempfile",
  "thiserror 2.0.18",
@@ -353,7 +353,7 @@ dependencies = [
  "brokkr-proto",
  "bytes",
  "hex",
- "prost",
+ "prost 0.13.5",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -387,7 +387,7 @@ dependencies = [
  "memmap2",
  "nix 0.29.0",
  "parking_lot",
- "prost",
+ "prost 0.13.5",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -1553,7 +1553,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -1569,8 +1579,8 @@ dependencies = [
  "once_cell",
  "petgraph",
  "prettyplease",
- "prost",
- "prost-types",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
  "regex",
  "syn",
  "tempfile",
@@ -1590,12 +1600,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
- "prost",
+ "prost 0.13.5",
+]
+
+[[package]]
+name = "prost-types"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
+dependencies = [
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -2323,7 +2355,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "prost",
+ "prost 0.13.5",
  "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
@@ -2344,7 +2376,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost-build",
- "prost-types",
+ "prost-types 0.13.5",
  "quote",
  "syn",
 ]
