@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-D warnings`. They are proto names, not Rust paths.
 
 ### Security
+- **Dropped the `RUSTSEC-2026-0009` suppression** (DoS via stack exhaustion in
+  `time` date parsing) by updating `time` 0.3.36 → 0.3.55. The ignore existed
+  only because the fix (`>=0.3.47`) required rustc 1.88, above the then-MSRV of
+  1.85; the Phase 6 P0 bump to 1.94 removed that constraint. `deny.toml` no
+  longer suppresses it and `cargo deny check advisories` passes on its own
+  merits rather than by exception.
 - **Sandbox isolation hardening (defense-in-depth):**
   - The worker now rejects a REAPI `Command.working_directory` that is absolute
     or contains a `..` component instead of `Path::join`-ing it verbatim onto
