@@ -26,3 +26,8 @@ lcov.info
 # Env
 .env
 .env.local
+
+# Built example policies (ADR 0014). Build with:
+#   cd examples/policies/locality
+#   cargo build --release --target wasm32-unknown-unknown
+examples/policies/*/target/

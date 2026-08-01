@@ -242,6 +242,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`examples/policies/locality/`** — a complete, working scheduling policy in
+  Rust, compiled to `wasm32-unknown-unknown`. This is the `LocalityAware` ADR
+  0008 promised and never built, delivered as an *operator-editable module*
+  rather than a built-in: it scores each candidate as
+  `10*input_root_hits + 3*action_hits - 4*inflight`, so a warm cache can
+  outweigh an idle worker, but a saturated one still loses. Tune the three
+  weights and rebuild; the control plane picks it up without a restart. The
+  `.wasm` is not committed (CLAUDE.md rule 4) — its tests are `#[ignore]`d and
+  fail with the build command rather than skipping silently.
+- **`docs/operations/writing-a-scheduling-policy.md`** — the operator guide:
+  required exports, what the snapshot carries, budgets, the failure taxonomy
+  and what each reason means, hot-reload semantics, and the trust model.
 - **Hot reload for the WASM scheduling policy** (ADR 0014). Editing the file
   named by `--policy-wasm` swaps the module with no restart;
   `--policy-reload-interval-secs` controls the poll cadence (`0` disables it).
