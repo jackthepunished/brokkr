@@ -242,6 +242,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **Raft state in the `views` read-model** — `NodeView` and `RaftRole`,
+  projecting `DriverStatus` into role, term, commit index and applied index.
+  `RaftRole::Unknown` is deliberately distinct from `Follower`: a node
+  recognising no leader is mid-election or partitioned, which is precisely what
+  an operator needs to see during an incident.
 - **`Cas::stats()`** returning `CasStats { objects, bytes }`, with a scanning
   default and a `RedbCas` override. Needed by ADR 0012's observability surface.
   Deliberately *not* derived from `list_digests()` on the polling path: that
