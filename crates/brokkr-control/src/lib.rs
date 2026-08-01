@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod fairqueue;
 pub mod lease;
+pub mod locality;
 pub mod matching;
 pub mod membership;
 pub mod metakv;
