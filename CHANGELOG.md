@@ -21,6 +21,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     MS_NODEV` (previously only `/proc` was), so a setuid bit or device node
     reachable through the rootfs cannot be honored. `MS_NOEXEC` is intentionally
     not set — build actions execute binaries from the rootfs.
+- **Closed a `/tmp` symlink race in the sandbox rootfs bootstrap.** The runner
+  mounted the transient rootfs tmpfs onto `/tmp/brokkr-rootfs-<pid>`, a
+  predictable path created with `create_dir_all` (which follows an existing
+  symlink). A local user who predicted the runner PID could pre-create that
+  path as a symlink and redirect the mount point. The directory is now created
+  with `mkdtemp`, which picks a random suffix and creates it atomically with
+  `0700` permissions (`O_EXCL` semantics), so the name is unpredictable and a
+  pre-existing entry cannot be followed. Added a unit test asserting the
+  bootstrap directory is unique, `0700`, and a real (non-symlink) directory.
+- **Fixed the seccomp `prctl` / `ioctl` argument filter, which silently
+  enforced nothing.** The runner built a single `SeccompFilter` with
+  match-action `Allow`, then added per-argument "block" rules for `prctl`
+  (`PR_SET_KEEPCAPS`, `PR_CAPBSET_DROP`, `PR_SET_TSC`, `PR_GET_TSC`) and
+  `ioctl` (`TIOCSTI` et al.). Because seccompiler applies one match action per
+  filter, every "block" rule actually *allowed* the call, and a trailing
+  `MaskedEq(0)` catch-all allowed everything else — so the sandboxed action
+  could inject terminal input (`TIOCSTI`) and manipulate its capability
+  bounding set. The rule constants were wrong too (e.g. `31` was used for
+  `PR_SET_KEEPCAPS`, whose real value is `8`), so even a correctly-actioned
+  filter would have targeted the wrong options. The denials now live in a
+  second, stacked filter (match-action `Errno(EPERM)`) built from `libc`
+  constants; the kernel keeps the most restrictive verdict across both
+  filters. Added a forked-child unit test that installs the compiled filters
+  after `PR_SET_NO_NEW_PRIVS` and asserts the dangerous `prctl`/`ioctl`
+  arguments return `EPERM` while benign ones succeed — it needs no user
+  namespace and therefore does not skip on CI, unlike the end-to-end tests
+  that previously masked this bug.
 - Reviewed the seccomp `socket` / `socketpair` allowance (issue #69) and
   replaced the terse "netns blocks egress" comment with the full
   rationale: the action's network namespace scopes abstract `AF_UNIX`
