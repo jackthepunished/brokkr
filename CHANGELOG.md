@@ -242,6 +242,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`brokkr-control::views`** — the read-model behind ADR 0012's observability
+  surface. Pure projections from node-local state into DTOs, with `owning_node`
+  on every one: in an HA cluster the worker registry, job history, CAS and
+  policy engine are all per node, so aggregation must never present three
+  local truths as one cluster fact. Worker liveness crosses as *seconds since
+  last seen* rather than an `Instant`, which is monotonic, process-local, and
+  not comparable between nodes.
 - **Phase 6 is complete.** All five definition-of-done lines met; see
   `docs/journal/phase-6.md` for the retrospective and measured numbers.
   `crates/brokkr-control/tests/policy_latency.rs` reproduces the latency

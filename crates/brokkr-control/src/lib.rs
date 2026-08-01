@@ -20,6 +20,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod scheduling;
 pub mod services;
+pub mod views;
 pub mod wasm_strategy;
 pub mod worker_service;
 
