@@ -637,7 +637,10 @@ In rough priority order. Pick what's interesting; nothing here is required.
 - **Stream-mode execution.** Not just batch — long-running services with structured restarts.
 - **Bazel BES integration.** Build event stream for IDE integrations.
 - **Connector plugins.** PostgreSQL CDC, Kafka, Elasticsearch sources/sinks.
-- **WASM-based extension hooks.** User-defined scheduling policies.
+- **WASM-based extension hooks.** User-defined scheduling policies. — **selected
+  as Phase 6.** Design approved 2026-08-01: see `docs/phase-6-plan.md` and
+  [ADR 0014](architecture/0014-wasm-scheduling-policies.md). Delivers ADR 0008's
+  never-built `LocalityAware` as an *example policy* rather than a built-in.
 
 ---
 
