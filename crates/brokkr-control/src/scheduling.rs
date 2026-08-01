@@ -80,6 +80,11 @@ pub struct JobFacts<'a> {
 /// Grouped into one struct so that adding a signal later — GPU class, rack
 /// topology, a cost model — is an additive change to this type rather than a
 /// new trait method and a new default implementation.
+///
+/// Not `Debug`: [`LoadView`] and [`LocalityView`] are plain object-safe traits
+/// with no `Debug` supertrait, so this cannot derive it without imposing that
+/// bound on every implementation — including guest-backed ones, where there is
+/// no meaningful `Debug` to render.
 pub struct DecisionContext<'a> {
     /// Per-worker in-flight counts.
     pub loads: &'a dyn LoadView,
