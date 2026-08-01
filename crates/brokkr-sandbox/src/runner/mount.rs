@@ -5,8 +5,8 @@
 //! 1. Make `/` propagation private so any mounts we add don't leak back
 //!    to the host (defence in depth — the new mount namespace already
 //!    isolates us, but `MS_PRIVATE` defeats slave-propagation tricks).
-//! 2. Build the rootfs in a fresh tmpfs at
-//!    `/tmp/brokkr-rootfs-<pid>`.
+//! 2. Build the rootfs in a fresh tmpfs on an unpredictably-named
+//!    `mkdtemp` directory under `/tmp` (see [`create_bootstrap_root`]).
 //! 3. Apply `RootfsSpec.ro_binds` (bind, then remount read-only),
 //!    `RootfsSpec.tmpfs`, and `RootfsSpec.symlinks`.
 //! 4. `pivot_root` into the new rootfs, detach and `rmdir` the old one.
@@ -43,11 +43,10 @@ pub(super) fn setup_rootfs(spec: &RootfsSpec) -> io::Result<()> {
     )
     .map_err(nix_io)?;
 
-    // 2. Create the new rootfs and mount a tmpfs there. The path lives in
-    //    the host's /tmp namespace, which is fine because it's a transient
-    //    bootstrap — pivot_root makes it `/`.
-    let new_root = PathBuf::from(format!("/tmp/brokkr-rootfs-{}", std::process::id()));
-    std::fs::create_dir_all(&new_root)?;
+    // 2. Create the new rootfs and mount a tmpfs there. The mount point is a
+    //    freshly-created, unpredictably-named directory on the host's /tmp;
+    //    it's a transient bootstrap — pivot_root makes it `/`.
+    let new_root = create_bootstrap_root()?;
     mount(
         Some("brokkr-rootfs"),
         &new_root,
@@ -141,6 +140,17 @@ pub(super) fn setup_rootfs(spec: &RootfsSpec) -> io::Result<()> {
     Ok(())
 }
 
+/// Create the transient bootstrap directory the sandbox rootfs is mounted on.
+///
+/// `mkdtemp` picks a random suffix and creates the directory atomically with
+/// `0700` permissions (`O_EXCL` semantics). This closes a `/tmp` symlink race:
+/// the previous implementation used a PID-derived name (`brokkr-rootfs-<pid>`)
+/// created with `create_dir_all`, so a local user who predicted the PID could
+/// pre-create that path as a symlink and redirect the subsequent tmpfs mount.
+fn create_bootstrap_root() -> io::Result<PathBuf> {
+    nix::unistd::mkdtemp("/tmp/brokkr-rootfs-XXXXXX").map_err(nix_io)
+}
+
 /// Treat a sandbox path as relative to `new_root`. Both `/etc` and `etc`
 /// resolve to `new_root/etc`.
 fn inside(new_root: &Path, sandbox_path: &Path) -> PathBuf {
@@ -164,4 +174,43 @@ fn ensure_target_dir(host: &Path, target: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The bootstrap rootfs directory must be unpredictable, freshly created,
+    /// and private — the properties that defeat a `/tmp` symlink race.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn bootstrap_root_is_unique_private_and_a_real_dir() {
+        let a = create_bootstrap_root().expect("mkdtemp a");
+        let b = create_bootstrap_root().expect("mkdtemp b");
+
+        // Distinct, random names — not a fixed/PID-derived path an attacker
+        // could predict and pre-create.
+        assert_ne!(a, b, "two bootstrap roots must not collide");
+
+        for p in [&a, &b] {
+            let meta = std::fs::symlink_metadata(p).expect("stat bootstrap root");
+            // A real directory we created — not a pre-existing symlink that a
+            // race winner planted and mkdtemp followed.
+            assert!(meta.file_type().is_dir(), "{p:?} must be a directory");
+            assert!(
+                !meta.file_type().is_symlink(),
+                "{p:?} must not be a symlink"
+            );
+            // mkdtemp creates with 0700, so no other local user can enter it.
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "{p:?} must be 0700"
+            );
+        }
+
+        let _ = std::fs::remove_dir(&a);
+        let _ = std::fs::remove_dir(&b);
+    }
 }
