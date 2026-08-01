@@ -166,11 +166,23 @@ impl WasmStrategy {
     ///
     /// On failure the running policy is untouched — the engine validates
     /// before it swaps.
+    ///
+    /// Recovers from a poisoned lock rather than refusing forever. Poisoning
+    /// means some earlier holder panicked, but [`PolicyEngine`]'s only mutating
+    /// operation is `load`, which either leaves the previous module in place or
+    /// installs a fully validated one — there is no half-written state to
+    /// inherit. Treating poison as fatal would instead mean an operator could
+    /// never install a working policy again after a single panic, which is a
+    /// far worse outcome than continuing with known-consistent state.
     pub fn load(&self, wasm: &[u8]) -> Result<(), PolicyError> {
-        let mut guard = self
-            .engine
-            .write()
-            .map_err(|_| PolicyError::Engine("policy engine lock poisoned".to_string()))?;
+        let mut guard = self.engine.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "policy engine lock was poisoned by an earlier panic; recovering \
+                 (engine state is consistent by construction)"
+            );
+            self.engine.clear_poison();
+            poisoned.into_inner()
+        });
         guard.load(wasm)
     }
 
@@ -212,16 +224,16 @@ impl Strategy for WasmStrategy {
             return None;
         }
 
-        // A poisoned lock means a previous holder panicked. Rather than
-        // propagate that into dispatch, treat it as one more reason to use the
-        // built-in.
-        let Ok(engine) = self.engine.read() else {
-            return self.fall_back(
-                &PolicyFailure::Instantiate("policy engine lock poisoned".to_string()),
-                candidates,
-                ctx,
-            );
-        };
+        // A poisoned lock means an earlier holder panicked. Recover rather
+        // than degrade permanently: the engine's only mutating operation is
+        // `load`, which leaves either the old module or a fully validated new
+        // one, so there is no half-written state to inherit. Falling back
+        // forever after one panic would be a much worse outcome than reading
+        // known-consistent state.
+        let engine = self.engine.read().unwrap_or_else(|poisoned| {
+            self.engine.clear_poison();
+            poisoned.into_inner()
+        });
 
         // Building the snapshot needs the registry for capability labels.
         // `try_lock` deliberately: this runs under the scheduler's dispatch
@@ -507,6 +519,46 @@ mod tests {
             counts.for_reason("quarantined") > 0,
             "later calls must be counted as quarantined, not as bad_index"
         );
+    }
+
+    /// A panic while holding the engine lock must not disable the policy
+    /// permanently. Treating poison as fatal would mean one panic anywhere
+    /// leaves the operator unable to install a working policy ever again —
+    /// strictly worse than continuing with state that is consistent by
+    /// construction, since `load` never leaves a half-written module.
+    #[test]
+    fn a_poisoned_engine_lock_recovers_instead_of_disabling_the_policy() {
+        let s = Arc::new(strategy("i32.const 0"));
+        let cands = vec![wid("a"), wid("b")];
+        let loads = MapLoads(HashMap::from([(wid("a"), 9), (wid("b"), 0)]));
+
+        // Poison the lock by panicking while holding it for writing.
+        let engine = s.engine();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = engine.write().unwrap();
+            panic!("deliberate panic to poison the lock");
+        });
+        assert!(poisoner.join().is_err(), "the poisoning thread must panic");
+        assert!(s.engine().is_poisoned(), "the lock should now be poisoned");
+
+        // Decisions still reach the guest: index 0 is "a", which is also the
+        // *more loaded* worker, so a silent fallback to SimpleFifo would pick
+        // "b" and fail this assertion.
+        with_ctx(&loads, |ctx| {
+            assert_eq!(s.choose_with(&cands, ctx), Some(wid("a")));
+        });
+        assert_eq!(s.decided(), 1);
+        assert_eq!(s.failure_counts().total(), 0);
+
+        // And a reload still works.
+        assert!(s.load(wat("i32.const -1").as_bytes()).is_ok());
+        with_ctx(&loads, |ctx| {
+            assert_eq!(
+                s.choose_with(&cands, ctx),
+                Some(wid("b")),
+                "the reloaded declining policy should defer to SimpleFifo"
+            );
+        });
     }
 
     #[test]
