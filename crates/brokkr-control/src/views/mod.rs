@@ -15,8 +15,10 @@
 //! record must say which node it came from or the merged view would present
 //! three different local truths as one cluster fact.
 
+mod cas;
 mod policy;
 mod worker;
 
+pub use cas::{cas_stats_view, CasStatsView};
 pub use policy::{policy_view, PolicyView, REASONS};
 pub use worker::{worker_views, WorkerView};

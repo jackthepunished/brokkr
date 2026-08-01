@@ -14,7 +14,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use tokio::sync::Semaphore;
 
 use crate::error::CasError;
-use crate::traits::{Cas, UpdateResult};
+use crate::traits::{Cas, CasStats, UpdateResult};
 
 /// Default max concurrent `spawn_blocking` tasks for [`RedbCas`].
 const DEFAULT_REDB_CAS_CONCURRENCY: usize = 64;
@@ -160,6 +160,36 @@ impl Cas for RedbCas {
                 });
             }
             Ok(out)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    async fn stats(&self) -> Result<CasStats, CasError> {
+        // Still a scan — redb has no O(1) byte total — but summing during the
+        // walk avoids materializing every `Digest` into a `Vec` just to add up
+        // their sizes, which on a large store is the difference between a
+        // transient allocation and a large one. Callers poll this.
+        let _permit = self
+            .semaphore
+            .try_acquire()
+            .map_err(|_| CasError::ThroughputLimit {
+                limit: self.max_concurrent,
+            })?;
+        let db = self.db.clone();
+        let span = tracing::info_span!("redb::stats");
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
+            let txn = db.begin_read()?;
+            let table = txn.open_table(BLOBS)?;
+            let mut objects = 0u64;
+            let mut bytes = 0u64;
+            for entry in table.iter()? {
+                let (_key, value) = entry?;
+                objects += 1;
+                bytes += value.value().len() as u64;
+            }
+            Ok(CasStats { objects, bytes })
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
@@ -519,5 +549,22 @@ mod tests {
             }
         };
         assert!(matches!(err, CasError::ThroughputLimit { limit: 1 }));
+    }
+    #[tokio::test]
+    async fn redb_stats_match_a_manual_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = RedbCas::open(dir.path().join("cas.redb")).unwrap();
+        let blobs: Vec<(Digest, Bytes)> = (0..5u8)
+            .map(|i| {
+                let b = Bytes::from(vec![i; (i as usize + 1) * 10]);
+                (Digest::of(&b), b)
+            })
+            .collect();
+        let expected_bytes: u64 = blobs.iter().map(|(_, b)| b.len() as u64).sum();
+        cas.batch_update_blobs(blobs).await.unwrap();
+
+        let stats = cas.stats().await.unwrap();
+        assert_eq!(stats.objects, 5);
+        assert_eq!(stats.bytes, expected_bytes);
     }
 }
