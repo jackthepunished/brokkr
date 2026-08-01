@@ -5,6 +5,7 @@ members = [
     "crates/brokkr-proto",
     "crates/brokkr-raft",
     "crates/brokkr-cas",
+    "crates/brokkr-policy",
     "crates/brokkr-control",
     "crates/brokkr-worker",
     "crates/brokkr-sandbox",
@@ -27,6 +28,17 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
+
+# WebAssembly scheduling policies (ADR 0014). The only Rust WASM runtime with
+# epoch-based interruption, which is the only mechanism that bounds wall-clock
+# time in a guest call made while the dispatch mutex is held; fuel bounds work,
+# not time. Default features off — see crates/brokkr-policy/Cargo.toml.
+wasmtime = { version = "47", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "pooling-allocator",
+    "std",
+] }
 
 # RPC / proto
 tonic = { version = "0.12", features = ["tls"] }
@@ -89,6 +101,7 @@ brokkr-common = { path = "crates/brokkr-common", version = "0.1.0" }
 brokkr-proto = { path = "crates/brokkr-proto", version = "0.1.0" }
 brokkr-raft = { path = "crates/brokkr-raft", version = "0.1.0" }
 brokkr-cas = { path = "crates/brokkr-cas", version = "0.1.0" }
+brokkr-policy = { path = "crates/brokkr-policy", version = "0.1.0" }
 brokkr-control = { path = "crates/brokkr-control", version = "0.1.0" }
 brokkr-worker = { path = "crates/brokkr-worker", version = "0.1.0" }
 brokkr-sandbox = { path = "crates/brokkr-sandbox", version = "0.1.0" }

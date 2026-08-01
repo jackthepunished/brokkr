@@ -1,0 +1,36 @@
+[package]
+name = "brokkr-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WebAssembly scheduling-policy engine for Brokkr (ADR 0014)"
+
+[features]
+# On by default so `brokkr-control` gets a working engine, but separable: a
+# build that does not want cranelift in its dependency tree can turn it off and
+# the crate still compiles, with `PolicyEngine::load` reporting the feature is
+# absent. See docs/phase-6-plan.md R4.
+default = ["wasm-policy"]
+wasm-policy = ["dep:wasmtime"]
+
+[dependencies]
+brokkr-common.workspace = true
+brokkr-proto.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Trimmed hard: the default feature set pulls component-model, gc, threads,
+# stack-switching, wit-parser, debug, profiling and coredump — none of which a
+# scheduling policy can reach — for 75 extra crates and ~15s of build time
+# (measured, docs/phase-6-plan.md R4).
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `wat` lets tests compile WebAssembly text inline, so policy fixtures need no
+# wasm32 target in CI and no committed binaries (CLAUDE.md rule 4).
+wasmtime = { workspace = true, features = ["wat"] }
+prost.workspace = true
+brokkr-proto.workspace = true
