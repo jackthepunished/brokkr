@@ -242,6 +242,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`brokkr.v1.ObservabilityService`** on a dedicated operator listener
+  (`--observe-listen`, default `127.0.0.1:7880`) — read-only `GetCluster`,
+  `ListWorkers`, `GetPolicy`, `GetCasStats`. Deliberately not on the
+  tenant-facing port: ADR 0011's auth resolves a token to a tenant and has no
+  scope concept, so a tenant reaching this service could enumerate every worker
+  and every other tenant's jobs. `GetPolicy` and `GetCasStats` return one entry
+  *per node* rather than a combined figure, because neither is summable.
+  A **non-loopback bind is refused at startup** unless operator mTLS
+  (`--observe-tls-cert/-key/-ca`) is configured or
+  `--observe-allow-insecure-bind` is passed — a listener on `0.0.0.0` with no
+  authentication is not a boundary, it is an unauthenticated read of the whole
+  cluster offered to the network.
+- `Scheduler::inflight_snapshot()` and `views::standalone_node_view`, both
+  needed by the above.
 - **Raft state in the `views` read-model** — `NodeView` and `RaftRole`,
   projecting `DriverStatus` into role, term, commit index and applied index.
   `RaftRole::Unknown` is deliberately distinct from `Follower`: a node

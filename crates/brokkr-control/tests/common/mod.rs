@@ -27,6 +27,7 @@ use brokkr_proto::reapi_v2::{
 };
 use brokkr_worker::{run_worker, Runner, WorkerConfig};
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 pub async fn boot_cluster() -> (String, tempfile::TempDir) {
@@ -85,4 +86,74 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
     tokio::time::sleep(Duration::from_millis(120)).await;
 
     (endpoint, dir)
+}
+
+/// Boot a control plane with the tenant listener **and** the operator
+/// observability listener on separate ephemeral ports (ADR 0012).
+///
+/// Returns `(client_endpoint, observe_endpoint, tempdir)`. No worker is
+/// spawned: the tests that use this are about the *routing* of observability
+/// RPCs, not about running jobs.
+///
+/// Deliberately a second function rather than a change to [`boot_cluster`] —
+/// its callers do not need a second endpoint, and a rival boot pattern in a
+/// new file would be worse than one extra function here.
+pub async fn boot_with_observability() -> (String, String, tempfile::TempDir) {
+    use brokkr_control::services::{ObservabilityDeps, ObservabilityService};
+    use brokkr_control::WorkerRegistry;
+    use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityServiceServer;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(RedbCas::open(dir.path().join("cas.redb")).unwrap());
+    let meta_kv = Arc::new(RedbMetaKv::open(dir.path().join("meta.redb")).unwrap());
+    let ac = Arc::new(MetaKvActionCache::new(meta_kv));
+    let registry = Arc::new(tokio::sync::Mutex::new(WorkerRegistry::default()));
+    let scheduler = Scheduler::with_worker_registry(cas.clone(), ac.clone(), registry.clone());
+
+    // Tenant-facing listener: exactly the services main.rs mounts there, and
+    // deliberately NOT ObservabilityService.
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_endpoint = format!("http://{}", client_listener.local_addr().unwrap());
+    let client_scheduler = scheduler.clone();
+    let client_cas = cas.clone();
+    let client_ac = ac.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ContentAddressableStorageServer::new(CasService::new(
+                client_cas,
+            )))
+            .add_service(ActionCacheServer::new(ActionCacheService::new(client_ac)))
+            .add_service(CapabilitiesServer::new(CapabilitiesService))
+            .add_service(ExecutionServer::new(ExecutionService::new(
+                client_scheduler,
+            )))
+            .serve_with_incoming(TcpListenerStream::new(client_listener))
+            .await
+            .unwrap();
+    });
+
+    // Operator listener: only ObservabilityService.
+    let observe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let observe_endpoint = format!("http://{}", observe_listener.local_addr().unwrap());
+    let deps = ObservabilityDeps {
+        node_id: "test-node".to_string(),
+        advertise_addr: "127.0.0.1:0".to_string(),
+        registry,
+        scheduler,
+        cas,
+        policy: None,
+        raft: None,
+    };
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ObservabilityServiceServer::new(ObservabilityService::new(
+                deps,
+            )))
+            .serve_with_incoming(TcpListenerStream::new(observe_listener))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    (client_endpoint, observe_endpoint, dir)
 }

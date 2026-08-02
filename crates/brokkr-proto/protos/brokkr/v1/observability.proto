@@ -1,0 +1,93 @@
+// Brokkr operator observability (ADR 0012).
+//
+// Read-only. Served on a dedicated operator listener, never on the
+// tenant-facing port — ADR 0011's auth has no scope concept, so a tenant token
+// reaching this service could enumerate every worker and every other tenant's
+// jobs.
+syntax = "proto3";
+
+package brokkr.v1;
+
+// One control-plane node.
+message NodeInfo {
+  string node_id = 1;
+  string advertise_addr = 2;
+  // "leader" | "follower" | "unknown". A string rather than an enum so adding
+  // a role later cannot renumber an existing one.
+  string role = 3;
+  uint64 term = 4;
+  uint64 commit_index = 5;
+  uint64 last_applied = 6;
+  // False when this node did not answer the most recent poll. It still
+  // appears, so "known but silent" stays distinct from "not a member".
+  bool reachable = 7;
+  uint64 last_seen_secs = 8;
+}
+
+// One worker. Always carries the node whose registry holds it: the registry is
+// per-node, so this is never a cluster-wide fact.
+message WorkerInfo {
+  string worker_id = 1;
+  string hostname = 2;
+  map<string, string> labels = 3;
+  uint32 inflight = 4;
+  // Seconds since last heard from, computed by the owning node. Relative
+  // because Instant is monotonic and process-local — an absolute timestamp
+  // would not be comparable between nodes.
+  uint64 last_seen_secs = 5;
+  bool stale = 6;
+  string owning_node = 7;
+}
+
+// One node's scheduling-policy state (ADR 0014). Per node: nodes may
+// legitimately have different policies loaded, or differ in quarantine state.
+message PolicyInfo {
+  bool loaded = 1;
+  bool quarantined = 2;
+  uint64 decided = 3;
+  uint64 declined = 4;
+  map<string, uint64> failures_by_reason = 5;
+  string owning_node = 6;
+}
+
+// One node's CAS size. NEVER summed across nodes: each node opens its own
+// store, so one blob on three nodes is three copies of one blob.
+message CasInfo {
+  uint64 objects = 1;
+  uint64 bytes = 2;
+  string owning_node = 3;
+}
+
+message ClusterInfo {
+  repeated NodeInfo nodes = 1;
+  string leader_id = 2;
+  bool quorum_healthy = 3;
+  // True when any known node did not answer the most recent poll, or when
+  // leadership is ambiguous.
+  bool degraded = 4;
+  // Unix seconds when the snapshot was taken. Zero before the first poll.
+  uint64 as_of_unix_secs = 5;
+}
+
+message GetClusterRequest {}
+message GetClusterReply { ClusterInfo cluster = 1; }
+
+message ListWorkersRequest {}
+message ListWorkersReply { repeated WorkerInfo workers = 1; }
+
+// Repeated, one entry per node, because policy state is per node and must
+// never be combined into a single figure.
+message GetPolicyRequest {}
+message GetPolicyReply { repeated PolicyInfo policies = 1; }
+
+// Repeated for the same reason, and more sharply: each node opens its own CAS,
+// so a combined total would report storage that does not exist.
+message GetCasStatsRequest {}
+message GetCasStatsReply { repeated CasInfo stores = 1; }
+
+service ObservabilityService {
+  rpc GetCluster(GetClusterRequest) returns (GetClusterReply);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersReply);
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyReply);
+  rpc GetCasStats(GetCasStatsRequest) returns (GetCasStatsReply);
+}

@@ -75,6 +75,25 @@ pub fn node_view_from_status(
     }
 }
 
+/// This node, on a deployment with no Raft configured.
+///
+/// Role is [`RaftRole::Unknown`] rather than `Leader`: nothing elected it, and
+/// claiming leadership would be a lie that a later multi-node view could
+/// contradict. It is `reachable` because it is answering right now — that is
+/// what distinguishes it from [`unreachable_node_view`].
+pub fn standalone_node_view(node_id: &str, advertise_addr: &str) -> NodeView {
+    NodeView {
+        node_id: node_id.to_string(),
+        advertise_addr: advertise_addr.to_string(),
+        role: RaftRole::Unknown,
+        term: 0,
+        commit_index: 0,
+        last_applied: 0,
+        reachable: true,
+        last_seen_secs: 0,
+    }
+}
+
 /// A node that is known to the cluster configuration but did not answer.
 ///
 /// Present rather than omitted: dropping it would make "a node I know about is
@@ -144,6 +163,15 @@ mod tests {
     /// An unreachable node still appears, with its identity and zeroed state.
     /// Dropping it would make "a node I know about is not answering"
     /// indistinguishable from "that node does not exist".
+    /// A standalone node is reachable but claims no role: nothing elected it.
+    #[test]
+    fn a_standalone_node_is_reachable_with_no_claimed_role() {
+        let v = standalone_node_view("solo", "127.0.0.1:7878");
+        assert!(v.reachable);
+        assert_eq!(v.role, RaftRole::Unknown);
+        assert_eq!(v.term, 0);
+    }
+
     #[test]
     fn an_unreachable_node_is_present_but_marked() {
         let v = unreachable_node_view("node-4", "10.0.0.4:7878");
