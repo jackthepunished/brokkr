@@ -7,12 +7,20 @@
 //! `docs/superpowers/specs/2026-08-02-observability-read-model-design.md`
 //! rests on that separation, so it gets its own test rather than being assumed.
 
-#![allow(clippy::unwrap_used, clippy::disallowed_methods, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    // `expect` messages here carry the diagnostic — "the stream must send
+    // something without waiting for a change" is the whole point of the
+    // assertion. `split_port_cluster.rs` allows it for the same reason.
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    clippy::panic
+)]
 
 use brokkr_proto::brokkr_v1::observability_service_client::ObservabilityServiceClient;
 use brokkr_proto::brokkr_v1::{
     GetCasStatsRequest, GetClusterRequest, GetJobRequest, GetPolicyRequest, ListJobsRequest,
-    ListWorkersRequest,
+    ListWorkersRequest, WatchEventsRequest,
 };
 
 mod common;
@@ -157,4 +165,70 @@ async fn get_job_reports_not_found_rather_than_an_empty_reply() {
         Err(status) => status,
     };
     assert_eq!(status.code(), tonic::Code::NotFound);
+}
+
+/// The resync contract's first half: a subscriber's very first message is
+/// always a full `Snapshot`, so a client that has just connected — or
+/// reconnected — needs no reconciliation logic.
+#[tokio::test]
+async fn watch_events_opens_with_a_full_snapshot() {
+    use tokio_stream::StreamExt as _;
+
+    let (_client, observe, _dir) = common::boot_with_observability().await;
+    let mut c = ObservabilityServiceClient::connect(observe).await.unwrap();
+
+    let mut stream = c
+        .watch_events(WatchEventsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream must send something without waiting for a change")
+        .expect("stream ended immediately")
+        .unwrap();
+
+    let event = first.event.expect("the first message must carry an event");
+    let snapshot = match event {
+        brokkr_proto::brokkr_v1::cluster_event::Event::Snapshot(s) => s,
+        other => panic!("the first message must be a Snapshot, got {other:?}"),
+    };
+    let cluster = snapshot.cluster.expect("a snapshot carries the cluster");
+    assert_eq!(cluster.nodes.len(), 1);
+    assert_eq!(cluster.nodes[0].node_id, "test-node");
+    // Per-node collections are present even when empty, so a client can
+    // replace its whole world from this one message.
+    assert_eq!(snapshot.policies.len(), 1);
+    assert_eq!(snapshot.stores.len(), 1);
+}
+
+/// A second subscriber gets its own opening snapshot. Nothing about the
+/// stream is single-consumer, and a console opened twice must work twice.
+#[tokio::test]
+async fn every_subscriber_gets_its_own_opening_snapshot() {
+    use tokio_stream::StreamExt as _;
+
+    let (_client, observe, _dir) = common::boot_with_observability().await;
+    let mut a = ObservabilityServiceClient::connect(observe.clone())
+        .await
+        .unwrap();
+    let mut b = ObservabilityServiceClient::connect(observe).await.unwrap();
+
+    for client in [&mut a, &mut b] {
+        let mut stream = client
+            .watch_events(WatchEventsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("each subscriber gets an opening snapshot")
+            .expect("stream ended")
+            .unwrap();
+        assert!(matches!(
+            first.event,
+            Some(brokkr_proto::brokkr_v1::cluster_event::Event::Snapshot(_))
+        ));
+    }
 }

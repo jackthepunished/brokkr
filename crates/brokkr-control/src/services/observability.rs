@@ -21,7 +21,7 @@ use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityService 
 use brokkr_raft::RaftHandle;
 use tonic::{Request, Response, Status};
 
-use crate::cluster::SharedSnapshot;
+use crate::cluster::{ClusterEvent, ClusterSnapshot, SharedSnapshot};
 use crate::scheduler::Scheduler;
 use crate::views::{
     cas_stats_view, node_view_from_status, policy_view, worker_views, CasStatsView, JobState,
@@ -54,13 +54,14 @@ pub struct ObservabilityDeps {
     pub raft: Option<Arc<RaftHandle>>,
 }
 
-/// The gRPC surface over a [`ClusterSnapshot`](crate::cluster::ClusterSnapshot).
+/// The gRPC surface over a [`ClusterSnapshot`].
 ///
 /// Reads only; the poller is the sole writer. Serving from the snapshot rather
 /// than projecting per request is what keeps peer traffic independent of how
 /// many operators are watching.
 pub struct ObservabilityService {
     snapshot: SharedSnapshot,
+    events: tokio::sync::broadcast::Sender<ClusterEvent>,
 }
 
 impl std::fmt::Debug for ObservabilityService {
@@ -71,9 +72,26 @@ impl std::fmt::Debug for ObservabilityService {
 }
 
 impl ObservabilityService {
-    /// Serve reads from `snapshot`.
-    pub fn new(snapshot: SharedSnapshot) -> Self {
-        Self { snapshot }
+    /// Serve reads from `snapshot`, and stream deltas from `events`.
+    pub fn new(
+        snapshot: SharedSnapshot,
+        events: tokio::sync::broadcast::Sender<ClusterEvent>,
+    ) -> Self {
+        Self { snapshot, events }
+    }
+
+    /// The current state, as the `Snapshot` event a stream opens with.
+    async fn snapshot_event(&self) -> bv1::ClusterEvent {
+        let snap = self.snapshot.read().await;
+        bv1::ClusterEvent {
+            event: Some(bv1::cluster_event::Event::Snapshot(bv1::SnapshotEvent {
+                cluster: Some(cluster_to_proto(&snap)),
+                workers: snap.workers.iter().map(worker_to_proto).collect(),
+                jobs: snap.jobs.iter().map(job_to_proto).collect(),
+                policies: snap.policies.iter().map(policy_to_proto).collect(),
+                stores: snap.cas.iter().map(cas_to_proto).collect(),
+            })),
+        }
     }
 }
 
@@ -175,6 +193,70 @@ pub(crate) fn policy_to_proto(v: &PolicyView) -> bv1::PolicyInfo {
     }
 }
 
+pub(crate) fn cluster_to_proto(snap: &ClusterSnapshot) -> bv1::ClusterInfo {
+    bv1::ClusterInfo {
+        nodes: snap.nodes.iter().map(node_to_proto).collect(),
+        leader_id: snap.leader_id.clone().unwrap_or_default(),
+        // Derived, never hardcoded: a view that claimed health while a node was
+        // silent would be lying about the one thing it exists for.
+        quorum_healthy: !snap.degraded,
+        degraded: snap.degraded,
+        as_of_unix_secs: snap
+            .as_of
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }
+}
+
+/// Map a delta onto the wire.
+pub(crate) fn event_to_proto(e: &ClusterEvent) -> bv1::ClusterEvent {
+    use bv1::cluster_event::Event as E;
+    let event = match e {
+        // `Snapshot` is built by the service, which holds the state; a delta
+        // stream never carries one through this path.
+        ClusterEvent::Snapshot(_) => return bv1::ClusterEvent { event: None },
+        ClusterEvent::NodeUnreachable { node_id } => E::NodeUnreachable(bv1::NodeEvent {
+            node_id: node_id.clone(),
+        }),
+        ClusterEvent::NodeRecovered { node_id } => E::NodeRecovered(bv1::NodeEvent {
+            node_id: node_id.clone(),
+        }),
+        ClusterEvent::WorkerAdded {
+            worker_id,
+            owning_node,
+        } => E::WorkerAdded(bv1::WorkerEvent {
+            worker_id: worker_id.clone(),
+            owning_node: owning_node.clone(),
+        }),
+        ClusterEvent::WorkerRemoved {
+            worker_id,
+            owning_node,
+        } => E::WorkerRemoved(bv1::WorkerEvent {
+            worker_id: worker_id.clone(),
+            owning_node: owning_node.clone(),
+        }),
+        ClusterEvent::WorkerStale {
+            worker_id,
+            owning_node,
+        } => E::WorkerStale(bv1::WorkerEvent {
+            worker_id: worker_id.clone(),
+            owning_node: owning_node.clone(),
+        }),
+        ClusterEvent::PolicyQuarantined { owning_node } => E::PolicyQuarantined(bv1::PolicyEvent {
+            owning_node: owning_node.clone(),
+        }),
+        ClusterEvent::PolicyRecovered { owning_node } => E::PolicyRecovered(bv1::PolicyEvent {
+            owning_node: owning_node.clone(),
+        }),
+        ClusterEvent::LeaderChanged { from, to } => E::LeaderChanged(bv1::LeaderEvent {
+            from: from.clone().unwrap_or_default(),
+            to: to.clone().unwrap_or_default(),
+        }),
+    };
+    bv1::ClusterEvent { event: Some(event) }
+}
+
 pub(crate) fn job_to_proto(v: &JobSummary) -> bv1::JobInfo {
     bv1::JobInfo {
         job_id: v.job_id.clone(),
@@ -208,21 +290,7 @@ impl ObservabilityRpc for ObservabilityService {
     ) -> Result<Response<bv1::GetClusterReply>, Status> {
         let snap = self.snapshot.read().await;
         Ok(Response::new(bv1::GetClusterReply {
-            cluster: Some(bv1::ClusterInfo {
-                nodes: snap.nodes.iter().map(node_to_proto).collect(),
-                leader_id: snap.leader_id.clone().unwrap_or_default(),
-                // Quorum is healthy when a leader was elected and every known
-                // node answered. Derived, never hardcoded: a view that claimed
-                // health while a node was silent would be lying about the one
-                // thing it exists for.
-                quorum_healthy: !snap.degraded,
-                degraded: snap.degraded,
-                as_of_unix_secs: snap
-                    .as_of
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            }),
+            cluster: Some(cluster_to_proto(&snap)),
         }))
     }
 
@@ -246,6 +314,78 @@ impl ObservabilityRpc for ObservabilityService {
         Ok(Response::new(bv1::GetPolicyReply {
             policies: snap.policies.iter().map(policy_to_proto).collect(),
         }))
+    }
+
+    type WatchEventsStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<bv1::ClusterEvent, Status>> + Send>>;
+
+    /// Stream cluster deltas.
+    ///
+    /// The resync contract, which is what makes this safe to rely on:
+    ///
+    /// 1. **On subscribe — and therefore on every reconnect** — a full
+    ///    `Snapshot` is sent before any delta. A reconnecting client is in
+    ///    exactly the position of a first-time client and is treated
+    ///    identically. No sequence numbers, no replay window, no cursor to get
+    ///    wrong.
+    /// 2. **On lag** — a slow consumer overflowing the bounded buffer — a
+    ///    fresh `Snapshot` is sent rather than dropping the client or silently
+    ///    skipping deltas. Falling behind is acceptable; *not knowing* you fell
+    ///    behind is not.
+    ///
+    /// A client therefore needs no reconciliation logic: every `Snapshot`
+    /// replaces its world, and every delta between two of them is complete.
+    #[tracing::instrument(name = "observability::watch_events", level = "debug", skip_all)]
+    async fn watch_events(
+        &self,
+        _request: Request<bv1::WatchEventsRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        // Subscribe *before* taking the initial snapshot, so a delta occurring
+        // between the two is buffered rather than lost.
+        let mut rx = self.events.subscribe();
+        let initial = self.snapshot_event().await;
+        let snapshot = self.snapshot.clone();
+
+        let (tx, out) = tokio::sync::mpsc::channel(crate::cluster::EVENT_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            if tx.send(Ok(initial)).await.is_err() {
+                return;
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if tx.send(Ok(event_to_proto(&event))).await.is_err() {
+                            return; // client went away
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(
+                            missed,
+                            "observability subscriber fell behind; resending a full snapshot"
+                        );
+                        let snap = snapshot.read().await;
+                        let resync = bv1::ClusterEvent {
+                            event: Some(bv1::cluster_event::Event::Snapshot(bv1::SnapshotEvent {
+                                cluster: Some(cluster_to_proto(&snap)),
+                                workers: snap.workers.iter().map(worker_to_proto).collect(),
+                                jobs: snap.jobs.iter().map(job_to_proto).collect(),
+                                policies: snap.policies.iter().map(policy_to_proto).collect(),
+                                stores: snap.cas.iter().map(cas_to_proto).collect(),
+                            })),
+                        };
+                        drop(snap);
+                        if tx.send(Ok(resync)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(out),
+        )))
     }
 
     #[tracing::instrument(name = "observability::list_jobs", level = "debug", skip_all)]

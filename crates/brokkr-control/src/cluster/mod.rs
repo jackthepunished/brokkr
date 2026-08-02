@@ -10,10 +10,12 @@
 //! interval. [`ClusterSnapshot::as_of`] carries that so a consumer can show it.
 
 mod aggregate;
+mod events;
 mod probe;
 
 pub use aggregate::{merge, ClusterSnapshot, NodeState, PeerOutcome, SharedSnapshot};
 
+pub use events::{diff, ClusterEvent};
 pub use probe::{poll_peers, GrpcPeerProbe, PeerAddr, PeerProbe, ProbeError};
 
 use std::sync::Arc;
@@ -69,6 +71,13 @@ pub struct PollerDeps {
     pub probe: Arc<dyn PeerProbe>,
 }
 
+/// Capacity of the event broadcast.
+///
+/// A subscriber that falls further behind than this gets a fresh `Snapshot`
+/// rather than being dropped or silently skipping deltas — falling behind is
+/// acceptable, *not knowing* you fell behind is not.
+pub const EVENT_CHANNEL_CAPACITY: usize = 256;
+
 /// Run the poll loop until the task is dropped.
 ///
 /// The loop **always** runs. With `--raft` off the peer set is empty, so a
@@ -81,6 +90,7 @@ pub fn spawn_poller(
     shared: SharedSnapshot,
     deps: PollerDeps,
     cfg: PollerConfig,
+    events: tokio::sync::broadcast::Sender<ClusterEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(
         async move {
@@ -124,6 +134,18 @@ pub fn spawn_poller(
                         leader = ?snapshot.leader_id,
                         "cluster observability is degraded"
                     );
+                }
+                // Deltas against the previous snapshot, published before the
+                // swap so a subscriber cannot observe the new state without
+                // the event that explains it.
+                {
+                    let previous = shared.read().await;
+                    for event in diff(&previous, &snapshot) {
+                        // `send` fails only when nobody is subscribed, which is
+                        // the normal case for a cluster with no operator
+                        // watching. Not worth logging.
+                        let _ = events.send(event);
+                    }
                 }
                 *shared.write().await = snapshot;
             }
@@ -211,6 +233,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             cas_refreshes: AtomicUsize::new(0),
         });
+        let (events, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let handle = spawn_poller(
             shared.clone(),
             PollerDeps {
@@ -223,6 +246,7 @@ mod tests {
                 peer_timeout: Duration::from_millis(10),
                 cas_interval: Duration::from_millis(20),
             },
+            events,
         );
 
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -248,6 +272,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             cas_refreshes: AtomicUsize::new(0),
         });
+        let (events, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let handle = spawn_poller(
             shared,
             PollerDeps {
@@ -261,6 +286,7 @@ mod tests {
                 cas_interval: Duration::from_millis(200),
                 peer_timeout: Duration::from_millis(10),
             },
+            events,
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
