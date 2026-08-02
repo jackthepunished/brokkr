@@ -42,6 +42,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Stream combinators for the SDK observability test.
+futures.workspace = true
 # `wat` so scheduling-policy fixtures can be inline WebAssembly text.
 brokkr-policy = { workspace = true, features = ["wat"] }
 tokio = { workspace = true, features = ["full", "test-util"] }

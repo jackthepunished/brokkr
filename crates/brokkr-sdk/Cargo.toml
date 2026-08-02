@@ -22,5 +22,6 @@ hex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+futures.workspace = true
 tonic.workspace = true
 tracing.workspace = true

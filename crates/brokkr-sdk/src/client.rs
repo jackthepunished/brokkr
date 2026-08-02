@@ -65,6 +65,13 @@ pub enum ClientError {
     /// Transport-level error connecting to the server.
     #[error("transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
+    /// The server answered with a non-OK gRPC status.
+    ///
+    /// Distinct from [`Self::Transport`]: a transport error means we could not
+    /// reach the server, whereas this means it answered and refused. An
+    /// operator debugging a console needs to tell those apart.
+    #[error("rpc failed: {0}")]
+    Rpc(#[from] tonic::Status),
 }
 
 /// Client connection to a Brokkr control plane.

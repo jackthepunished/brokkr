@@ -242,6 +242,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`brokkr_sdk::ObservabilityClient`** — a typed read client for the operator
+  listener: `get_cluster`, `list_workers`, `list_jobs`, `get_job`,
+  `get_policy`, `get_cas_stats`, and a `watch_events` stream whose first item
+  is always a full snapshot. `ClientError` gained an `Rpc` variant so a server
+  refusal is distinguishable from being unable to reach the server at all —
+  an operator debugging a console needs to tell those apart.
 - **`WatchEvents`** — a server-streaming delta feed over the observability
   snapshot. Every stream opens with a full `Snapshot`, and a subscriber that
   falls behind the bounded buffer gets a fresh `Snapshot` rather than being
