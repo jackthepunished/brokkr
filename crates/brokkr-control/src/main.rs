@@ -7,9 +7,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
+use brokkr_control::cluster::{
+    spawn_poller, ClusterSnapshot, GrpcPeerProbe, PeerAddr, PeerDirectory, PollerConfig,
+    PollerDeps, SharedSnapshot,
+};
 use brokkr_control::policy_reload::spawn_policy_reloader;
 use brokkr_control::registry::WorkerRegistry;
-use brokkr_control::services::{ObservabilityDeps, ObservabilityService, PeerObservabilityService};
+use brokkr_control::services::{
+    LocalState, ObservabilityDeps, ObservabilityService, PeerObservabilityService,
+};
 use brokkr_control::wasm_strategy::WasmStrategy;
 use brokkr_control::{
     auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
@@ -255,6 +261,30 @@ struct Args {
     /// decision; the same bind reached by accident is an incident.
     #[arg(long)]
     observe_allow_insecure_bind: bool,
+
+    /// How often the observability snapshot is refreshed (ADR 0012).
+    ///
+    /// Governs both the local read and peer fan-out. Running without `--raft`
+    /// already gives a peer-traffic-free deployment, so there is no "disabled"
+    /// mode here and `0` is rejected — a snapshot that never refreshes is a
+    /// bug, not a configuration.
+    #[arg(long, default_value_t = 2)]
+    observe_poll_interval_secs: u64,
+
+    /// Per-peer deadline for an observability poll, in milliseconds.
+    ///
+    /// Validated strictly below the poll interval, so one hung node cannot
+    /// stall a round.
+    #[arg(long, default_value_t = 750)]
+    observe_peer_timeout_ms: u64,
+
+    /// How often this node re-measures its own CAS size, in seconds.
+    ///
+    /// Deliberately slower than the peer poll: `RedbCas` answers by scanning
+    /// the blob table under a throughput permit, so measuring it every poll
+    /// would be O(n) each time and could take a permit real traffic needs.
+    #[arg(long, default_value_t = 30)]
+    observe_cas_interval_secs: u64,
 }
 
 /// Build the scheduling strategy from the policy flags (ADR 0014).
@@ -314,6 +344,78 @@ type RaftPeerServerParts = (
     Option<ServerTlsConfig>,
     SocketAddr,
 );
+
+/// [`PeerDirectory`] over the statically configured `--raft-peer` list.
+///
+/// The peer set is read from configuration rather than from live Raft
+/// membership. That is the right source *today*: `--raft-peer` is how a
+/// cluster is defined, and a node removed by a joint-consensus change would
+/// still be worth showing as unreachable rather than silently vanishing from
+/// the console. If dynamic membership becomes the norm, this is the one place
+/// to change.
+#[derive(Debug, Clone)]
+struct StaticPeers {
+    peers: Vec<PeerAddr>,
+}
+
+impl StaticPeers {
+    /// `raft_peers` are the `--raft-peer` entries. Their address is the peer
+    /// plane's, which is exactly where `PeerObservability` listens — the two
+    /// share a listener, so there is no second address to configure.
+    fn new(raft_peers: &[RaftPeer]) -> Self {
+        Self {
+            peers: raft_peers
+                .iter()
+                .map(|p| PeerAddr {
+                    node_id: p.id.clone(),
+                    advertise_addr: p.addr.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerDirectory for StaticPeers {
+    async fn peers(&self) -> Vec<PeerAddr> {
+        self.peers.clone()
+    }
+}
+
+/// Reject an observability poll cadence that cannot work.
+///
+/// Two failures, both silent if not caught here:
+///
+/// * A **zero interval** would publish one snapshot at startup and never
+///   again, serving permanently stale state while looking healthy. There is no
+///   sensible "never refresh"; a deployment that wants no peer traffic runs
+///   without `--raft`, and the loop then costs one local read per interval.
+/// * A **deadline at or above the interval** silently serialises the loop:
+///   each round waits on the previous round's stragglers, and the snapshot
+///   ages with nothing reporting a problem.
+///
+/// Pure over its two inputs so both are testable without a timer.
+fn validate_observe_timing(poll_interval_secs: u64, peer_timeout_ms: u64) -> Result<(), String> {
+    if poll_interval_secs == 0 {
+        return Err(
+            "--observe-poll-interval-secs must be greater than 0; a snapshot that never \
+             refreshes would serve permanently stale state while looking healthy. For a \
+             deployment with no peer traffic, run without --raft — the refresh loop then \
+             costs one local read per interval and no network."
+                .to_string(),
+        );
+    }
+    let interval_ms = poll_interval_secs.saturating_mul(1000);
+    if peer_timeout_ms >= interval_ms {
+        return Err(format!(
+            "--observe-peer-timeout-ms ({peer_timeout_ms}) must be below \
+             --observe-poll-interval-secs ({poll_interval_secs} = {interval_ms}ms); a deadline \
+             that outlasts the interval serialises the poll loop, so each round waits on the \
+             previous round's stragglers and the snapshot ages silently."
+        ));
+    }
+    Ok(())
+}
 
 /// Refuse an unauthenticated observability listener on a routable address.
 ///
@@ -1128,11 +1230,33 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Aggregation poller (ADR 0012). The loop always runs; with `--raft` off
+    // the peer set is empty, so a round is one local read and no network.
+    validate_observe_timing(
+        args.observe_poll_interval_secs,
+        args.observe_peer_timeout_ms,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let snapshot: SharedSnapshot = Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default()));
+    spawn_poller(
+        snapshot.clone(),
+        PollerDeps {
+            local: Arc::new(LocalState::new(observe_deps)),
+            peers: Arc::new(StaticPeers::new(&raft_peers)),
+            probe: Arc::new(GrpcPeerProbe),
+        },
+        PollerConfig {
+            interval: Duration::from_secs(args.observe_poll_interval_secs),
+            peer_timeout: Duration::from_millis(args.observe_peer_timeout_ms),
+            cas_interval: Duration::from_secs(args.observe_cas_interval_secs),
+        },
+    );
+
     let observe_addr = args.observe_listen;
     let observe_handle = tokio::spawn(async move {
         observe_server
             .add_service(ObservabilityServiceServer::new(ObservabilityService::new(
-                observe_deps,
+                snapshot,
             )))
             .serve_with_incoming(TcpListenerStream::new(observe_listener))
             .await
@@ -1206,6 +1330,24 @@ async fn main() -> Result<()> {
     clippy::disallowed_methods
 )]
 mod tests {
+    #[test]
+    fn a_peer_deadline_at_or_above_the_interval_is_rejected() {
+        assert!(validate_observe_timing(2, 750).is_ok());
+        assert!(validate_observe_timing(2, 2000).is_err());
+        assert!(validate_observe_timing(2, 2001).is_err());
+    }
+
+    /// A zero interval is a configuration mistake, not a way to disable the
+    /// feature: it would serve a snapshot captured once at startup forever.
+    #[test]
+    fn a_zero_poll_interval_is_rejected_and_says_what_to_do_instead() {
+        let err = validate_observe_timing(0, 750).unwrap_err();
+        assert!(
+            err.contains("--raft"),
+            "the error must name the peer-traffic-free alternative; got: {err}"
+        );
+    }
+
     /// Loopback is the intended posture and needs nothing further: reach it
     /// over SSH.
     #[test]

@@ -99,7 +99,10 @@ pub async fn boot_cluster() -> (String, tempfile::TempDir) {
 /// its callers do not need a second endpoint, and a rival boot pattern in a
 /// new file would be worse than one extra function here.
 pub async fn boot_with_observability() -> (String, String, tempfile::TempDir) {
-    use brokkr_control::services::{ObservabilityDeps, ObservabilityService};
+    use brokkr_control::cluster::{
+        spawn_poller, ClusterSnapshot, GrpcPeerProbe, PollerConfig, PollerDeps, SharedSnapshot,
+    };
+    use brokkr_control::services::{LocalState, ObservabilityDeps, ObservabilityService};
     use brokkr_control::WorkerRegistry;
     use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityServiceServer;
 
@@ -144,16 +147,49 @@ pub async fn boot_with_observability() -> (String, String, tempfile::TempDir) {
         policy: None,
         raft: None,
     };
+
+    // The service reads a snapshot, so the fixture runs a real poller — with
+    // no peers, so a round is one local read. Using the production path here
+    // rather than hand-writing a snapshot means these tests would catch a
+    // poller that stopped refreshing.
+    let snapshot: SharedSnapshot = Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default()));
+    spawn_poller(
+        snapshot.clone(),
+        PollerDeps {
+            local: Arc::new(LocalState::new(deps)),
+            peers: Arc::new(NoPeers),
+            probe: Arc::new(GrpcPeerProbe),
+        },
+        PollerConfig {
+            interval: Duration::from_millis(50),
+            peer_timeout: Duration::from_millis(25),
+            cas_interval: Duration::from_millis(50),
+        },
+    );
+
     tokio::spawn(async move {
         Server::builder()
             .add_service(ObservabilityServiceServer::new(ObservabilityService::new(
-                deps,
+                snapshot,
             )))
             .serve_with_incoming(TcpListenerStream::new(observe_listener))
             .await
             .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Long enough for the first poll to land, so a caller does not race an
+    // empty snapshot.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     (client_endpoint, observe_endpoint, dir)
+}
+
+/// A [`PeerDirectory`] with no peers, for single-node fixtures.
+#[derive(Debug)]
+struct NoPeers;
+
+#[async_trait::async_trait]
+impl brokkr_control::cluster::PeerDirectory for NoPeers {
+    async fn peers(&self) -> Vec<brokkr_control::cluster::PeerAddr> {
+        Vec::new()
+    }
 }

@@ -21,6 +21,7 @@ use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityService 
 use brokkr_raft::RaftHandle;
 use tonic::{Request, Response, Status};
 
+use crate::cluster::SharedSnapshot;
 use crate::scheduler::Scheduler;
 use crate::views::{
     cas_stats_view, node_view_from_status, policy_view, worker_views, CasStatsView, NodeView,
@@ -53,24 +54,26 @@ pub struct ObservabilityDeps {
     pub raft: Option<Arc<RaftHandle>>,
 }
 
-/// The gRPC surface over [`ObservabilityDeps`].
+/// The gRPC surface over a [`ClusterSnapshot`](crate::cluster::ClusterSnapshot).
+///
+/// Reads only; the poller is the sole writer. Serving from the snapshot rather
+/// than projecting per request is what keeps peer traffic independent of how
+/// many operators are watching.
 pub struct ObservabilityService {
-    deps: ObservabilityDeps,
+    snapshot: SharedSnapshot,
 }
 
 impl std::fmt::Debug for ObservabilityService {
-    // `ObservabilityDeps` is not `Debug` (see its docs); report the identity.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObservabilityService")
-            .field("node_id", &self.deps.node_id)
             .finish_non_exhaustive()
     }
 }
 
 impl ObservabilityService {
-    /// Wrap the handles this service reads from.
-    pub fn new(deps: ObservabilityDeps) -> Self {
-        Self { deps }
+    /// Serve reads from `snapshot`.
+    pub fn new(snapshot: SharedSnapshot) -> Self {
+        Self { snapshot }
     }
 }
 
@@ -176,24 +179,22 @@ impl ObservabilityRpc for ObservabilityService {
         &self,
         _request: Request<bv1::GetClusterRequest>,
     ) -> Result<Response<bv1::GetClusterReply>, Status> {
-        let node = local_node(&self.deps).await;
-        let leader_id = if node.role == crate::views::RaftRole::Leader {
-            node.node_id.clone()
-        } else {
-            String::new()
-        };
-        // Derived, never hardcoded. `local_node` reports this node unreachable
-        // when its own Raft status cannot be read, and a view that then claimed
-        // to be healthy would be lying about the one thing it is for.
-        let healthy = node.reachable;
+        let snap = self.snapshot.read().await;
         Ok(Response::new(bv1::GetClusterReply {
             cluster: Some(bv1::ClusterInfo {
-                nodes: vec![node_to_proto(&node)],
-                leader_id,
-                quorum_healthy: healthy,
-                degraded: !healthy,
-                // Local-only: there is no poll, so there is no snapshot time.
-                as_of_unix_secs: 0,
+                nodes: snap.nodes.iter().map(node_to_proto).collect(),
+                leader_id: snap.leader_id.clone().unwrap_or_default(),
+                // Quorum is healthy when a leader was elected and every known
+                // node answered. Derived, never hardcoded: a view that claimed
+                // health while a node was silent would be lying about the one
+                // thing it exists for.
+                quorum_healthy: !snap.degraded,
+                degraded: snap.degraded,
+                as_of_unix_secs: snap
+                    .as_of
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
             }),
         }))
     }
@@ -203,12 +204,9 @@ impl ObservabilityRpc for ObservabilityService {
         &self,
         _request: Request<bv1::ListWorkersRequest>,
     ) -> Result<Response<bv1::ListWorkersReply>, Status> {
+        let snap = self.snapshot.read().await;
         Ok(Response::new(bv1::ListWorkersReply {
-            workers: local_workers(&self.deps)
-                .await
-                .iter()
-                .map(worker_to_proto)
-                .collect(),
+            workers: snap.workers.iter().map(worker_to_proto).collect(),
         }))
     }
 
@@ -217,8 +215,9 @@ impl ObservabilityRpc for ObservabilityService {
         &self,
         _request: Request<bv1::GetPolicyRequest>,
     ) -> Result<Response<bv1::GetPolicyReply>, Status> {
+        let snap = self.snapshot.read().await;
         Ok(Response::new(bv1::GetPolicyReply {
-            policies: vec![policy_to_proto(&local_policy(&self.deps))],
+            policies: snap.policies.iter().map(policy_to_proto).collect(),
         }))
     }
 
@@ -227,8 +226,61 @@ impl ObservabilityRpc for ObservabilityService {
         &self,
         _request: Request<bv1::GetCasStatsRequest>,
     ) -> Result<Response<bv1::GetCasStatsReply>, Status> {
+        let snap = self.snapshot.read().await;
         Ok(Response::new(bv1::GetCasStatsReply {
-            stores: vec![cas_to_proto(&local_cas(&self.deps).await)],
+            stores: snap.cas.iter().map(cas_to_proto).collect(),
         }))
+    }
+}
+
+/// [`LocalStateSource`](crate::cluster::LocalStateSource) over the handles this
+/// node already holds.
+///
+/// Caches the last CAS measurement so rounds where `refresh_cas` is false cost
+/// nothing: `RedbCas` answers by scanning under a throughput permit, and the
+/// poller must not take one every tick.
+pub struct LocalState {
+    deps: ObservabilityDeps,
+    last_cas: tokio::sync::Mutex<Option<CasStatsView>>,
+}
+
+impl std::fmt::Debug for LocalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalState")
+            .field("node_id", &self.deps.node_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalState {
+    /// Build a source over `deps`.
+    pub fn new(deps: ObservabilityDeps) -> Self {
+        Self {
+            deps,
+            last_cas: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::cluster::LocalStateSource for LocalState {
+    async fn local_state(&self, refresh_cas: bool) -> crate::cluster::NodeState {
+        let mut cached = self.last_cas.lock().await;
+        // Measure when asked, or when we have never measured — otherwise the
+        // first snapshot would report an empty CAS for a whole cas_interval.
+        if refresh_cas || cached.is_none() {
+            *cached = Some(local_cas(&self.deps).await);
+        }
+        let cas = cached
+            .clone()
+            .unwrap_or_else(|| cas_stats_view(brokkr_cas::CasStats::default(), &self.deps.node_id));
+        drop(cached);
+
+        crate::cluster::NodeState {
+            node: local_node(&self.deps).await,
+            workers: local_workers(&self.deps).await,
+            policy: local_policy(&self.deps),
+            cas,
+        }
     }
 }

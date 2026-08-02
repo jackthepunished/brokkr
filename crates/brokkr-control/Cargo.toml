@@ -24,6 +24,9 @@ brokkr-policy.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+# Concurrent peer probing in the observability poller (ADR 0012). Already in the
+# tree via brokkr-cas, so this is a new edge rather than a new crate.
+futures.workspace = true
 clap.workspace = true
 jsonwebtoken.workspace = true
 prost.workspace = true

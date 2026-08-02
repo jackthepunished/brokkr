@@ -242,6 +242,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **Cluster-wide observability aggregation.** Each node polls its Raft peers
+  (`--observe-poll-interval-secs`, default 2) into a `ClusterSnapshot` that
+  every handler serves from, so peer traffic is independent of how many
+  operators are watching. An unreachable peer marks the snapshot `degraded` and
+  keeps the node visible rather than failing the call — an observability API is
+  most needed exactly when something is broken. CAS and policy state are
+  reported per node and never combined; leadership is reconciled by **term**
+  rather than by counting claimants, so a partitioned ex-leader at an old term
+  cannot make a healthy cluster look ambiguous. CAS is re-measured on a slower
+  cadence (`--observe-cas-interval-secs`, default 30) because `RedbCas` answers
+  by scanning under a throughput permit.
+- `RaftRole::Standalone` — a node with no consensus configured, distinct from
+  `Unknown` (mid-election). Without the distinction every single-node
+  deployment would report itself permanently degraded.
 - **`brokkr.v1.PeerObservability`** on the Raft peer plane — one RPC,
   `GetLocalState`, returning this node's observability state for peer
   aggregation. It lives there because peers are already mutually authenticated
