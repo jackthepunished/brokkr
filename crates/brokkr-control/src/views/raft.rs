@@ -15,6 +15,14 @@ pub enum RaftRole {
     /// exactly what an operator needs to see during an incident, and folding
     /// it into `Follower` would hide it.
     Unknown,
+    /// This node is not running Raft at all (`--raft` off).
+    ///
+    /// Distinct from [`Self::Unknown`] for the same reason `Unknown` is
+    /// distinct from `Follower`: "there is no consensus configured" and "the
+    /// consensus has no leader right now" are different facts. Collapsing them
+    /// would make every single-node deployment report itself degraded forever,
+    /// sending operators to chase a problem that does not exist.
+    Standalone,
 }
 
 impl RaftRole {
@@ -24,6 +32,7 @@ impl RaftRole {
             Self::Leader => "leader",
             Self::Follower => "follower",
             Self::Unknown => "unknown",
+            Self::Standalone => "standalone",
         }
     }
 }
@@ -77,15 +86,16 @@ pub fn node_view_from_status(
 
 /// This node, on a deployment with no Raft configured.
 ///
-/// Role is [`RaftRole::Unknown`] rather than `Leader`: nothing elected it, and
-/// claiming leadership would be a lie that a later multi-node view could
-/// contradict. It is `reachable` because it is answering right now — that is
-/// what distinguishes it from [`unreachable_node_view`].
+/// Role is [`RaftRole::Standalone`]: nothing elected it, so claiming
+/// leadership would be a lie a later multi-node view could contradict — but it
+/// is also not mid-election, which is what `Unknown` means. It is `reachable`
+/// because it is answering right now, which is what distinguishes it from
+/// [`unreachable_node_view`].
 pub fn standalone_node_view(node_id: &str, advertise_addr: &str) -> NodeView {
     NodeView {
         node_id: node_id.to_string(),
         advertise_addr: advertise_addr.to_string(),
-        role: RaftRole::Unknown,
+        role: RaftRole::Standalone,
         term: 0,
         commit_index: 0,
         last_applied: 0,
@@ -163,12 +173,14 @@ mod tests {
     /// An unreachable node still appears, with its identity and zeroed state.
     /// Dropping it would make "a node I know about is not answering"
     /// indistinguishable from "that node does not exist".
-    /// A standalone node is reachable but claims no role: nothing elected it.
+    /// A standalone node is reachable and explicitly not running consensus.
+    /// That is distinct from `Unknown`, which means an election is in flight.
     #[test]
-    fn a_standalone_node_is_reachable_with_no_claimed_role() {
+    fn a_standalone_node_is_reachable_and_not_mid_election() {
         let v = standalone_node_view("solo", "127.0.0.1:7878");
         assert!(v.reachable);
-        assert_eq!(v.role, RaftRole::Unknown);
+        assert_eq!(v.role, RaftRole::Standalone);
+        assert_ne!(v.role, RaftRole::Unknown, "not an election, no consensus");
         assert_eq!(v.term, 0);
     }
 
@@ -190,5 +202,6 @@ mod tests {
         assert_eq!(RaftRole::Leader.as_str(), "leader");
         assert_eq!(RaftRole::Follower.as_str(), "follower");
         assert_eq!(RaftRole::Unknown.as_str(), "unknown");
+        assert_eq!(RaftRole::Standalone.as_str(), "standalone");
     }
 }

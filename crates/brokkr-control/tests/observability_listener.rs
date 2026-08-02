@@ -33,8 +33,10 @@ async fn observability_answers_on_the_operator_listener() {
     assert!(info.nodes[0].reachable);
     assert!(!info.degraded, "a reachable local node is not degraded");
     assert!(info.quorum_healthy);
-    // No Raft configured: the node claims no role, because nothing elected it.
-    assert_eq!(info.nodes[0].role, "unknown");
+    // No Raft configured. "standalone" rather than "unknown": nothing elected
+    // it, but it is also not mid-election, and conflating the two would make
+    // every single-node deployment report itself degraded forever.
+    assert_eq!(info.nodes[0].role, "standalone");
     assert_eq!(info.leader_id, "");
 }
 

@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 
 pub mod auth;
+pub mod cluster;
 pub mod fairqueue;
 pub mod lease;
 pub mod locality;
