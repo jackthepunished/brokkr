@@ -16,11 +16,16 @@
 //! three different local truths as one cluster fact.
 
 mod cas;
+mod job;
+/// Completed jobs retained per node by default.
+pub const DEFAULT_JOB_HISTORY: usize = 256;
+
 mod policy;
 mod raft;
 mod worker;
 
 pub use cas::{cas_stats_view, CasStatsView};
+pub use job::{JobHistory, JobState, JobSummary};
 pub use policy::{policy_view, PolicyView, REASONS};
 pub use raft::{
     node_view_from_status, standalone_node_view, unreachable_node_view, NodeView, RaftRole,

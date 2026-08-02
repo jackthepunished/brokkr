@@ -21,8 +21,8 @@ use brokkr_proto::brokkr_v1::peer_observability_server::PeerObservability as Pee
 use tonic::{Request, Response, Status};
 
 use super::observability::{
-    cas_to_proto, local_cas, local_node, local_policy, local_workers, node_to_proto,
-    policy_to_proto, worker_to_proto, ObservabilityDeps,
+    cas_to_proto, job_to_proto, local_cas, local_jobs, local_node, local_policy, local_workers,
+    node_to_proto, policy_to_proto, worker_to_proto, ObservabilityDeps,
 };
 
 /// Serves one node's own observability state to its Raft peers.
@@ -66,6 +66,11 @@ impl PeerObservabilityRpc for PeerObservabilityService {
                 .collect(),
             policy: Some(policy_to_proto(&local_policy(&self.deps))),
             cas: Some(cas_to_proto(&local_cas(&self.deps).await)),
+            jobs: local_jobs(&self.deps)
+                .await
+                .iter()
+                .map(job_to_proto)
+                .collect(),
         }))
     }
 }

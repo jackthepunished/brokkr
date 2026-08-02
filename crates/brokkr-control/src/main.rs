@@ -285,6 +285,13 @@ struct Args {
     /// would be O(n) each time and could take a permit real traffic needs.
     #[arg(long, default_value_t = 30)]
     observe_cas_interval_secs: u64,
+
+    /// Completed jobs retained per node for the observability history.
+    ///
+    /// In-memory and bounded on purpose — durable job history is a
+    /// scheduler-storage decision ADR 0012 explicitly defers.
+    #[arg(long, default_value_t = brokkr_control::views::DEFAULT_JOB_HISTORY)]
+    observe_job_history: usize,
 }
 
 /// Build the scheduling strategy from the policy flags (ADR 0014).
@@ -1051,6 +1058,12 @@ async fn main() -> Result<()> {
     };
     // Cloned before the listener tasks move their copies; the observability
     // service reads per-worker in-flight counts from it.
+    // Stamped onto every job-history record so an aggregated view can say
+    // which control plane scheduled a job.
+    scheduler.set_node_id(args.node_id.clone());
+    scheduler
+        .set_job_history_capacity(args.observe_job_history)
+        .await;
     let scheduler_for_observability = scheduler.clone();
 
     let client_tls_cfg = args.tls_config(false)?;

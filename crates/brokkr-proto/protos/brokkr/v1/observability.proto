@@ -58,6 +58,25 @@ message CasInfo {
   string owning_node = 3;
 }
 
+// One completed job. Always carries the node that scheduled it: the history
+// ring is per node, so this is never a cluster-wide fact.
+message JobInfo {
+  string job_id = 1;
+  string tenant = 2;
+  string action_digest = 3;
+  // "queued" | "running" | "succeeded" | "failed"
+  string state = 4;
+  string worker_id = 5;
+  int32 exit_code = 6;
+  // proto3 cannot distinguish an unset int32 from 0, and 0 is a meaningful
+  // exit code, so presence is carried explicitly.
+  bool has_exit_code = 7;
+  string owning_node = 8;
+  // Wall-clock completion time. The key ListJobs orders by, and the only field
+  // that can order records originating on different nodes.
+  uint64 completed_at_unix_ms = 9;
+}
+
 message ClusterInfo {
   repeated NodeInfo nodes = 1;
   string leader_id = 2;
@@ -85,9 +104,24 @@ message GetPolicyReply { repeated PolicyInfo policies = 1; }
 message GetCasStatsRequest {}
 message GetCasStatsReply { repeated CasInfo stores = 1; }
 
+message ListJobsRequest {
+  // Empty means no filter. An unrecognised value is treated as no filter
+  // rather than an error, so a newer client cannot be rejected for asking
+  // about a state this server does not know.
+  string state_filter = 1;
+  // Zero means the server default.
+  uint32 limit = 2;
+}
+message ListJobsReply { repeated JobInfo jobs = 1; }
+
+message GetJobRequest { string job_id = 1; }
+message GetJobReply { JobInfo job = 1; }
+
 service ObservabilityService {
   rpc GetCluster(GetClusterRequest) returns (GetClusterReply);
   rpc ListWorkers(ListWorkersRequest) returns (ListWorkersReply);
   rpc GetPolicy(GetPolicyRequest) returns (GetPolicyReply);
   rpc GetCasStats(GetCasStatsRequest) returns (GetCasStatsReply);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsReply);
+  rpc GetJob(GetJobRequest) returns (GetJobReply);
 }

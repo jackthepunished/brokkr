@@ -24,8 +24,8 @@ use tonic::{Request, Response, Status};
 use crate::cluster::SharedSnapshot;
 use crate::scheduler::Scheduler;
 use crate::views::{
-    cas_stats_view, node_view_from_status, policy_view, worker_views, CasStatsView, NodeView,
-    PolicyView, WorkerView,
+    cas_stats_view, node_view_from_status, policy_view, worker_views, CasStatsView, JobState,
+    JobSummary, NodeView, PolicyView, WorkerView,
 };
 use crate::wasm_strategy::WasmStrategy;
 use crate::worker_service::SharedWorkerRegistry;
@@ -114,6 +114,13 @@ pub(crate) fn local_policy(deps: &ObservabilityDeps) -> PolicyView {
     policy_view(deps.policy.as_deref(), &deps.node_id)
 }
 
+/// This node's recently completed jobs.
+pub(crate) async fn local_jobs(deps: &ObservabilityDeps) -> Vec<JobSummary> {
+    deps.scheduler
+        .recent_jobs(None, crate::views::DEFAULT_JOB_HISTORY)
+        .await
+}
+
 /// This node's CAS size.
 pub(crate) async fn local_cas(deps: &ObservabilityDeps) -> CasStatsView {
     match deps.cas.stats().await {
@@ -161,6 +168,22 @@ pub(crate) fn policy_to_proto(v: &PolicyView) -> bv1::PolicyInfo {
         declined: v.declined,
         failures_by_reason: v.failures_by_reason.clone().into_iter().collect(),
         owning_node: v.owning_node.clone(),
+    }
+}
+
+pub(crate) fn job_to_proto(v: &JobSummary) -> bv1::JobInfo {
+    bv1::JobInfo {
+        job_id: v.job_id.clone(),
+        tenant: v.tenant.clone(),
+        action_digest: v.action_digest.clone(),
+        state: v.state.as_str().to_string(),
+        worker_id: v.worker_id.clone().unwrap_or_default(),
+        exit_code: v.exit_code.unwrap_or(0),
+        // proto3 cannot distinguish an unset int32 from 0, and 0 is a
+        // meaningful exit code, so presence is carried explicitly.
+        has_exit_code: v.exit_code.is_some(),
+        owning_node: v.owning_node.clone(),
+        completed_at_unix_ms: v.completed_at_unix_ms,
     }
 }
 
@@ -219,6 +242,56 @@ impl ObservabilityRpc for ObservabilityService {
         Ok(Response::new(bv1::GetPolicyReply {
             policies: snap.policies.iter().map(policy_to_proto).collect(),
         }))
+    }
+
+    #[tracing::instrument(name = "observability::list_jobs", level = "debug", skip_all)]
+    async fn list_jobs(
+        &self,
+        request: Request<bv1::ListJobsRequest>,
+    ) -> Result<Response<bv1::ListJobsReply>, Status> {
+        let req = request.into_inner();
+        // An unrecognised filter is "no filter", not an error: a client from a
+        // newer release asking about a state we do not know should get
+        // everything rather than a rejection.
+        let filter = JobState::from_str_opt(&req.state_filter);
+        let limit = if req.limit == 0 {
+            crate::views::DEFAULT_JOB_HISTORY
+        } else {
+            req.limit as usize
+        };
+        let snap = self.snapshot.read().await;
+        // The snapshot is already sorted newest-first across every node, so
+        // the limit is applied to the merged order rather than per node.
+        Ok(Response::new(bv1::ListJobsReply {
+            jobs: snap
+                .jobs
+                .iter()
+                .filter(|j| filter.is_none_or(|f| j.state == f))
+                .take(limit)
+                .map(job_to_proto)
+                .collect(),
+        }))
+    }
+
+    #[tracing::instrument(name = "observability::get_job", level = "debug", skip_all)]
+    async fn get_job(
+        &self,
+        request: Request<bv1::GetJobRequest>,
+    ) -> Result<Response<bv1::GetJobReply>, Status> {
+        let job_id = request.into_inner().job_id;
+        let snap = self.snapshot.read().await;
+        let found = snap.jobs.iter().find(|j| j.job_id == job_id);
+        match found {
+            Some(j) => Ok(Response::new(bv1::GetJobReply {
+                job: Some(job_to_proto(j)),
+            })),
+            // NotFound rather than an empty reply: "I do not have that job" and
+            // "that job had no data" are different answers, and the ring is
+            // bounded so a genuinely old job legitimately falls out.
+            None => Err(Status::not_found(format!(
+                "job {job_id} is not in any node's recent-job history"
+            ))),
+        }
     }
 
     #[tracing::instrument(name = "observability::get_cas_stats", level = "debug", skip_all)]
@@ -280,6 +353,7 @@ impl crate::cluster::LocalStateSource for LocalState {
             node: local_node(&self.deps).await,
             workers: local_workers(&self.deps).await,
             policy: local_policy(&self.deps),
+            jobs: local_jobs(&self.deps).await,
             cas,
         }
     }

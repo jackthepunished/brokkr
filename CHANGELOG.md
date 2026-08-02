@@ -242,6 +242,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **Job history and `ListJobs` / `GetJob`.** A bounded in-memory ring of the
+  last `--observe-job-history` (default 256) completed jobs per node,
+  populated in `Scheduler::report()` alongside the locality record so it costs
+  no extra lookups on the dispatch path. Durable history stays deferred per
+  ADR 0012. Across nodes, jobs are **unioned then sorted by completion time**
+  and only then limited — limiting per node first would let a burst on one node
+  evict another node's genuinely newer jobs. `JobInfo` carries
+  `has_exit_code` because proto3 cannot distinguish an unset `int32` from `0`,
+  and `0` is a meaningful exit code.
 - **Cluster-wide observability aggregation.** Each node polls its Raft peers
   (`--observe-poll-interval-secs`, default 2) into a `ClusterSnapshot` that
   every handler serves from, so peer traffic is independent of how many
