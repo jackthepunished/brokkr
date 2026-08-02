@@ -31,7 +31,8 @@ async fn observability_answers_on_the_operator_listener() {
     assert_eq!(info.nodes.len(), 1, "a single node reports exactly itself");
     assert_eq!(info.nodes[0].node_id, "test-node");
     assert!(info.nodes[0].reachable);
-    assert!(!info.degraded);
+    assert!(!info.degraded, "a reachable local node is not degraded");
+    assert!(info.quorum_healthy);
     // No Raft configured: the node claims no role, because nothing elected it.
     assert_eq!(info.nodes[0].role, "unknown");
     assert_eq!(info.leader_id, "");

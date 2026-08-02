@@ -173,6 +173,7 @@ fn cas_to_proto(v: &CasStatsView) -> bv1::CasInfo {
 
 #[tonic::async_trait]
 impl ObservabilityRpc for ObservabilityService {
+    #[tracing::instrument(name = "observability::get_cluster", level = "debug", skip_all)]
     async fn get_cluster(
         &self,
         _request: Request<bv1::GetClusterRequest>,
@@ -183,18 +184,23 @@ impl ObservabilityRpc for ObservabilityService {
         } else {
             String::new()
         };
+        // Derived, never hardcoded. `local_node` reports this node unreachable
+        // when its own Raft status cannot be read, and a view that then claimed
+        // to be healthy would be lying about the one thing it is for.
+        let healthy = node.reachable;
         Ok(Response::new(bv1::GetClusterReply {
             cluster: Some(bv1::ClusterInfo {
                 nodes: vec![node_to_proto(&node)],
                 leader_id,
-                quorum_healthy: true,
-                degraded: false,
+                quorum_healthy: healthy,
+                degraded: !healthy,
                 // Local-only: there is no poll, so there is no snapshot time.
                 as_of_unix_secs: 0,
             }),
         }))
     }
 
+    #[tracing::instrument(name = "observability::list_workers", level = "debug", skip_all)]
     async fn list_workers(
         &self,
         _request: Request<bv1::ListWorkersRequest>,
@@ -209,6 +215,7 @@ impl ObservabilityRpc for ObservabilityService {
         }))
     }
 
+    #[tracing::instrument(name = "observability::get_policy", level = "debug", skip_all)]
     async fn get_policy(
         &self,
         _request: Request<bv1::GetPolicyRequest>,
@@ -218,6 +225,7 @@ impl ObservabilityRpc for ObservabilityService {
         }))
     }
 
+    #[tracing::instrument(name = "observability::get_cas_stats", level = "debug", skip_all)]
     async fn get_cas_stats(
         &self,
         _request: Request<bv1::GetCasStatsRequest>,
