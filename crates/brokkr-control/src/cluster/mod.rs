@@ -167,6 +167,7 @@ mod tests {
                     last_seen_secs: 0,
                 },
                 workers: Vec::new(),
+                jobs: Vec::new(),
                 policy: PolicyView {
                     loaded: false,
                     quarantined: false,

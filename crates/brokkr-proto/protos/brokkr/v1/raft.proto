@@ -170,6 +170,7 @@ message GetLocalStateReply {
   repeated WorkerInfo workers = 2;
   PolicyInfo policy = 3;
   CasInfo cas = 4;
+  repeated JobInfo jobs = 5;
 }
 
 service PeerObservability {

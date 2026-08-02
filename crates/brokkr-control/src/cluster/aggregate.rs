@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use crate::views::{
-    unreachable_node_view, CasStatsView, NodeView, PolicyView, RaftRole, WorkerView,
+    unreachable_node_view, CasStatsView, JobSummary, NodeView, PolicyView, RaftRole, WorkerView,
 };
 
 /// One node's complete observability state — this node's own, or a peer's.
@@ -38,6 +38,8 @@ pub struct NodeState {
     pub policy: PolicyView,
     /// This node's CAS size.
     pub cas: CasStatsView,
+    /// Recently completed jobs from this node's history ring.
+    pub jobs: Vec<JobSummary>,
 }
 
 /// The result of asking one peer for its state.
@@ -68,6 +70,12 @@ pub struct ClusterSnapshot {
     pub policies: Vec<PolicyView>,
     /// One CAS view per answering node, sorted by owner. Never summed.
     pub cas: Vec<CasStatsView>,
+    /// Recently completed jobs across every answering node, newest first.
+    ///
+    /// Ordered by completion time rather than by id, because that is what
+    /// "recent" means and it is the only field that can order records
+    /// originating on different nodes.
+    pub jobs: Vec<JobSummary>,
     /// The node claiming leadership at the highest term, if exactly one does.
     pub leader_id: Option<String>,
     /// True when any known node was silent, or leadership is ambiguous.
@@ -89,6 +97,7 @@ pub fn merge(local: NodeState, peers: Vec<PeerOutcome>, as_of: SystemTime) -> Cl
     let mut workers = local.workers;
     let mut policies = vec![local.policy];
     let mut cas = vec![local.cas];
+    let mut jobs = local.jobs;
     let mut any_silent = false;
 
     for outcome in peers {
@@ -98,6 +107,7 @@ pub fn merge(local: NodeState, peers: Vec<PeerOutcome>, as_of: SystemTime) -> Cl
                 workers.extend(state.workers);
                 policies.push(state.policy);
                 cas.push(state.cas);
+                jobs.extend(state.jobs);
             }
             PeerOutcome::Unreachable {
                 node_id,
@@ -113,6 +123,18 @@ pub fn merge(local: NodeState, peers: Vec<PeerOutcome>, as_of: SystemTime) -> Cl
     workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
     policies.sort_by(|a, b| a.owning_node.cmp(&b.owning_node));
     cas.sort_by(|a, b| a.owning_node.cmp(&b.owning_node));
+    // Jobs sort by completion time, not by id: "recent" is a time question,
+    // and each node keeps its own ring, so this is the only field that can
+    // order records from different machines. Union first and limit later —
+    // limiting per node before the union would let a burst on one node evict
+    // another node's genuinely newer jobs from the result.
+    jobs.sort_by(|a, b| {
+        b.completed_at_unix_ms
+            .cmp(&a.completed_at_unix_ms)
+            // Millisecond resolution makes ties likely, and an unstable
+            // tie-break would reorder the list between identical calls.
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
 
     let leader_id = elect(&nodes);
     // A cluster with no consensus configured is not degraded — there is
@@ -128,6 +150,7 @@ pub fn merge(local: NodeState, peers: Vec<PeerOutcome>, as_of: SystemTime) -> Cl
         workers,
         policies,
         cas,
+        jobs,
         degraded: any_silent || (!standalone && leader_id.is_none()),
         leader_id,
         as_of: Some(as_of),
@@ -231,13 +254,63 @@ mod tests {
         }
     }
 
+    fn job(id: &str, owner: &str, completed_at_unix_ms: u64) -> crate::views::JobSummary {
+        crate::views::JobSummary {
+            job_id: id.to_string(),
+            tenant: "t".to_string(),
+            action_digest: "a".repeat(64),
+            state: crate::views::JobState::Succeeded,
+            worker_id: Some("w".to_string()),
+            exit_code: Some(0),
+            completed_at_unix_ms,
+            owning_node: owner.to_string(),
+        }
+    }
+
     fn state(id: &str, role: RaftRole, workers: &[&str]) -> NodeState {
         NodeState {
             node: node(id, role),
             workers: workers.iter().map(|w| worker(w, id)).collect(),
             policy: policy(id, false),
             cas: cas(id),
+            jobs: Vec::new(),
         }
+    }
+
+    /// Jobs from every node merge into one globally-ordered list. Sorting per
+    /// node and concatenating would interleave wrongly; limiting per node
+    /// first would drop genuinely-recent jobs.
+    #[test]
+    fn jobs_from_all_nodes_are_ordered_by_completion_time_not_by_node() {
+        let mut n1 = state("node-1", RaftRole::Leader, &[]);
+        n1.jobs = vec![
+            job("j-old", "node-1", 1_000),
+            job("j-newest", "node-1", 9_000),
+        ];
+        let mut n2 = state("node-2", RaftRole::Follower, &[]);
+        n2.jobs = vec![job("j-middle", "node-2", 5_000)];
+
+        let snap = merge(n1, vec![PeerOutcome::Answered(n2)], at());
+        let ids: Vec<&str> = snap.jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["j-newest", "j-middle", "j-old"]);
+        // Each keeps the node that ran it.
+        assert_eq!(snap.jobs[1].owning_node, "node-2");
+    }
+
+    /// Equal timestamps are likely at millisecond resolution, so the tie-break
+    /// must be deterministic or the list reorders between identical calls.
+    #[test]
+    fn jobs_with_equal_timestamps_tie_break_deterministically() {
+        let mut n1 = state("node-1", RaftRole::Leader, &[]);
+        n1.jobs = vec![job("j-zulu", "node-1", 5_000)];
+        let mut n2 = state("node-2", RaftRole::Follower, &[]);
+        n2.jobs = vec![job("j-alpha", "node-2", 5_000)];
+
+        let forward = merge(n1.clone(), vec![PeerOutcome::Answered(n2.clone())], at());
+        let reverse = merge(n2, vec![PeerOutcome::Answered(n1)], at());
+        let ids: Vec<&str> = forward.jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["j-alpha", "j-zulu"]);
+        assert_eq!(forward.jobs, reverse.jobs);
     }
 
     /// The whole point of fan-out: workers from every node appear exactly

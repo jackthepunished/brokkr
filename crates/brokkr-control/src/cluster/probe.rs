@@ -106,6 +106,7 @@ mod tests {
                 last_seen_secs: 0,
             },
             workers: Vec::new(),
+            jobs: Vec::new(),
             policy: PolicyView {
                 loaded: false,
                 quarantined: false,
@@ -283,7 +284,9 @@ impl PeerProbe for GrpcPeerProbe {
 fn node_state_from_proto(
     reply: brokkr_proto::brokkr_v1::GetLocalStateReply,
 ) -> Result<NodeState, ProbeError> {
-    use crate::views::{CasStatsView, NodeView, PolicyView, RaftRole, WorkerView};
+    use crate::views::{
+        CasStatsView, JobState, JobSummary, NodeView, PolicyView, RaftRole, WorkerView,
+    };
 
     let missing = |what: &str| ProbeError::Malformed(format!("reply has no {what}"));
     let node = reply.node.ok_or_else(|| missing("node"))?;
@@ -335,5 +338,23 @@ fn node_state_from_proto(
             bytes: cas.bytes,
             owning_node: cas.owning_node,
         },
+        jobs: reply
+            .jobs
+            .into_iter()
+            .map(|j| JobSummary {
+                job_id: j.job_id,
+                tenant: j.tenant,
+                action_digest: j.action_digest,
+                // An unrecognised state from a newer peer reads as Failed
+                // rather than dropping the job: a job we cannot classify is
+                // still a job that happened, and hiding it would be worse than
+                // showing it with an imprecise label.
+                state: JobState::from_str_opt(&j.state).unwrap_or(JobState::Failed),
+                worker_id: Some(j.worker_id).filter(|w| !w.is_empty()),
+                exit_code: j.has_exit_code.then_some(j.exit_code),
+                completed_at_unix_ms: j.completed_at_unix_ms,
+                owning_node: j.owning_node,
+            })
+            .collect(),
     })
 }

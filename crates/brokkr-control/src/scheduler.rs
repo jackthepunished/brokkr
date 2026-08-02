@@ -27,6 +27,7 @@ use crate::lease::LeaseTable;
 use crate::locality::LocalityIndex;
 use crate::matching::eligible_workers;
 use crate::scheduling::{ConnectedWorkers, DecisionContext, JobFacts, SimpleFifo, Strategy};
+use crate::views::{JobHistory, JobState, JobSummary};
 use crate::worker_service::SharedWorkerRegistry;
 
 /// Maximum dispatch attempts for a job before it is failed, to bound requeue
@@ -128,6 +129,9 @@ struct Inner {
     /// `ConnectedWorkers` because it deliberately outlives a worker's
     /// connection: a reconnecting worker still has its inputs on disk.
     locality: LocalityIndex,
+    /// Bounded ring of recently completed jobs (ADR 0012). Per node, like the
+    /// locality index — a completed job is a fact about the node that ran it.
+    job_history: JobHistory,
     /// Per-tenant count of in-flight jobs (queued + leased), for the
     /// max-concurrent quota (ADR 0010). A job is counted from admission in
     /// `execute` until that call returns (success / timeout / failure).
@@ -213,6 +217,10 @@ pub struct Scheduler {
     /// is how that shows up as a number instead of a mystery, so it is part of
     /// the feature rather than instrumentation bolted on after.
     uncached_results_not_leader: AtomicU64,
+    /// This node's id, stamped onto every job-history record so an aggregated
+    /// view can say which control plane scheduled it (ADR 0012). Defaults to
+    /// `"local"`; `main.rs` sets it from `--node-id`.
+    node_id: std::sync::RwLock<String>,
 }
 
 impl Scheduler {
@@ -328,6 +336,7 @@ impl Scheduler {
         strategy: Arc<dyn Strategy>,
         max_concurrent_per_tenant: Option<usize>,
     ) -> Arc<Self> {
+        let job_history_capacity = crate::views::DEFAULT_JOB_HISTORY;
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 connected: ConnectedWorkers::new(),
@@ -335,6 +344,7 @@ impl Scheduler {
                 leases: LeaseTable::new(),
                 tenant_inflight: HashMap::new(),
                 locality: LocalityIndex::default(),
+                job_history: JobHistory::new(job_history_capacity),
             }),
             strategy,
             max_concurrent_per_tenant,
@@ -345,6 +355,7 @@ impl Scheduler {
             lease_duration: DEFAULT_LEASE_DURATION,
             worker_registry,
             uncached_results_not_leader: AtomicU64::new(0),
+            node_id: std::sync::RwLock::new("local".to_string()),
         })
     }
 
@@ -356,6 +367,45 @@ impl Scheduler {
     /// the symptom of a routing problem, not a storage one.
     pub fn uncached_results_not_leader(&self) -> u64 {
         self.uncached_results_not_leader.load(Ordering::Relaxed)
+    }
+
+    /// Set this node's id, stamped onto job-history records (ADR 0012).
+    ///
+    /// Called once at startup from `--node-id`. A `RwLock` rather than a
+    /// constructor parameter so the six existing constructors keep their
+    /// signatures — a seventh argument on all of them, for a field only the
+    /// binary sets, would be worse than this.
+    pub fn set_node_id(&self, node_id: impl Into<String>) {
+        match self.node_id.write() {
+            Ok(mut guard) => *guard = node_id.into(),
+            Err(_) => tracing::warn!("scheduler node_id lock poisoned; keeping the previous value"),
+        }
+    }
+
+    /// Resize the completed-job history ring (ADR 0012).
+    ///
+    /// Called once at startup from `--observe-job-history`. Resizing discards
+    /// nothing in practice because it happens before any job runs; if it ever
+    /// shrinks a populated ring, the oldest entries go first, which is the
+    /// same rule the ring already applies.
+    pub async fn set_job_history_capacity(&self, capacity: usize) {
+        self.inner.lock().await.job_history = JobHistory::new(capacity);
+    }
+
+    /// This node's id.
+    fn node_id(&self) -> String {
+        self.node_id
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "local".to_string())
+    }
+
+    /// The most recent completed jobs on this node, newest first (ADR 0012).
+    ///
+    /// `limit` is a caller-side cap; the ring's own capacity always bounds the
+    /// result, so `usize::MAX` means "everything retained".
+    pub async fn recent_jobs(&self, state: Option<JobState>, limit: usize) -> Vec<JobSummary> {
+        self.inner.lock().await.job_history.filtered(state, limit)
     }
 
     /// Per-worker in-flight counts for every connected worker (ADR 0012).
@@ -923,6 +973,7 @@ impl Scheduler {
     pub async fn report(self: &Arc<Self>, result: bv1::JobResult) -> Result<()> {
         let job_id = JobId::new(result.job_id.clone())
             .map_err(|e| anyhow!("invalid job_id in result: {}", e))?;
+        let node_id = self.node_id();
         let known = {
             let mut inner = self.inner.lock().await;
             // Read the holder before completing, because `complete` removes
@@ -937,6 +988,31 @@ impl Scheduler {
                 inner
                     .locality
                     .record(&w, &pj.action_digest, pj.input_root_digest.as_ref());
+                // Recorded here rather than in a separate pass: the worker and
+                // the PendingJob are both already in hand, so this costs no
+                // extra lookups on the dispatch path.
+                let exit_code = result.result.as_ref().map(|r| r.exit_code);
+                inner.job_history.record(JobSummary {
+                    job_id: pj.job_id.as_str().to_string(),
+                    tenant: pj.tenant.as_str().to_string(),
+                    action_digest: pj.action_digest.hash().to_string(),
+                    state: match exit_code {
+                        Some(0) => JobState::Succeeded,
+                        // No result at all means the worker reported a hard
+                        // failure; a non-zero code means the action failed.
+                        // Both are Failed from an operator's point of view.
+                        _ => JobState::Failed,
+                    },
+                    worker_id: Some(w.as_str().to_string()),
+                    exit_code,
+                    completed_at_unix_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        // A clock before the epoch costs this job its sort
+                        // position, not the report.
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    owning_node: node_id,
+                });
             }
             completed.is_some()
         };
@@ -1860,6 +1936,111 @@ mod tests {
             1,
             "history must outlive the connection — a reconnecting worker still \
              has its inputs materialized"
+        );
+    }
+
+    /// A reported job lands in the history with the right state, and the exit
+    /// code decides that state — a non-zero code is a failure an operator
+    /// needs to find, not a success with a footnote.
+    #[tokio::test]
+    async fn a_reported_job_is_recorded_with_its_outcome() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        scheduler.set_node_id("node-7");
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        assert!(scheduler.recent_jobs(None, 10).await.is_empty());
+
+        // A failing action.
+        let exec: tokio::task::JoinHandle<Result<ExecutionOutcome, ExecutionError>> = {
+            let (s, d) = (scheduler.clone(), action_digest.clone());
+            tokio::spawn(async move { s.execute(d, true, TenantId::default()).await })
+        };
+        let job = recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .unwrap();
+        scheduler
+            .report(bv1::JobResult {
+                job_id: job.job_id.clone(),
+                result: Some(rapi::ActionResult {
+                    exit_code: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        exec.await.unwrap().unwrap();
+
+        let recent = scheduler.recent_jobs(None, 10).await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].state, JobState::Failed, "exit 3 is a failure");
+        assert_eq!(recent[0].exit_code, Some(3));
+        assert_eq!(recent[0].worker_id.as_deref(), Some("w-a"));
+        assert_eq!(recent[0].owning_node, "node-7");
+        assert!(
+            recent[0].completed_at_unix_ms > 0,
+            "the merge key must be populated, or aggregation cannot order this"
+        );
+
+        // And the filter selects on it.
+        assert_eq!(
+            scheduler
+                .recent_jobs(Some(JobState::Failed), 10)
+                .await
+                .len(),
+            1
+        );
+        assert!(scheduler
+            .recent_jobs(Some(JobState::Succeeded), 10)
+            .await
+            .is_empty());
+    }
+
+    /// A lease that merely expires is not a completed job. Recording it would
+    /// put a job in the history that no worker ever reported on, with an
+    /// outcome we invented.
+    #[tokio::test]
+    async fn an_expired_lease_is_not_recorded_as_a_completed_job() {
+        use crate::registry::WorkerRegistry;
+
+        let cas = Arc::new(brokkr_cas::InMemoryCas::new());
+        let action_digest = stage_action(cas.as_ref(), Some(os_platform("linux"))).await;
+        let ac = Arc::new(MockActionCache { force_error: false });
+        let registry = Arc::new(Mutex::new(WorkerRegistry::default()));
+        let scheduler = Scheduler::with_registry_and_timeout(
+            cas,
+            ac,
+            Duration::from_secs(10),
+            registry.clone(),
+        );
+        let mut rx = register_and_connect(&scheduler, &registry, "w-a", &[("os", "linux")]).await;
+
+        let exec: tokio::task::JoinHandle<Result<ExecutionOutcome, ExecutionError>> = {
+            let (s, d) = (scheduler.clone(), action_digest.clone());
+            tokio::spawn(async move { s.execute(d, true, TenantId::default()).await })
+        };
+        assert!(recv_within(&mut rx, Duration::from_millis(500))
+            .await
+            .is_some());
+        scheduler
+            .reap_expired_at(Instant::now() + Duration::from_secs(3600))
+            .await;
+        exec.abort();
+
+        assert!(
+            scheduler.recent_jobs(None, 10).await.is_empty(),
+            "an expired lease is not a completed job"
         );
     }
 

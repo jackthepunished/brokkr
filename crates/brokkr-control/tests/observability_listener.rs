@@ -11,7 +11,8 @@
 
 use brokkr_proto::brokkr_v1::observability_service_client::ObservabilityServiceClient;
 use brokkr_proto::brokkr_v1::{
-    GetCasStatsRequest, GetClusterRequest, GetPolicyRequest, ListWorkersRequest,
+    GetCasStatsRequest, GetClusterRequest, GetJobRequest, GetPolicyRequest, ListJobsRequest,
+    ListWorkersRequest,
 };
 
 mod common;
@@ -104,4 +105,56 @@ async fn observability_is_not_reachable_on_the_tenant_listener() {
         tonic::Code::Unimplemented,
         "expected the tenant listener to not implement this service; got {status:?}"
     );
+}
+
+/// `ListJobs` answers, and an unknown state filter is treated as no filter
+/// rather than an error — a newer client asking about a state this server does
+/// not know should get everything rather than a rejection.
+#[tokio::test]
+async fn list_jobs_answers_and_tolerates_an_unknown_filter() {
+    let (_client, observe, _dir) = common::boot_with_observability().await;
+    let mut c = ObservabilityServiceClient::connect(observe).await.unwrap();
+
+    let all = c
+        .list_jobs(ListJobsRequest {
+            state_filter: String::new(),
+            limit: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .jobs;
+    assert!(all.is_empty(), "no job has run in this fixture");
+
+    // Not a rejection.
+    let unknown = c
+        .list_jobs(ListJobsRequest {
+            state_filter: "evaporated".to_string(),
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .jobs;
+    assert!(unknown.is_empty());
+}
+
+/// A job that is not in any node's ring is `NotFound`, not an empty reply.
+/// "I do not have that job" and "that job had no data" are different answers,
+/// and the ring is bounded so a genuinely old job legitimately falls out.
+#[tokio::test]
+async fn get_job_reports_not_found_rather_than_an_empty_reply() {
+    let (_client, observe, _dir) = common::boot_with_observability().await;
+    let mut c = ObservabilityServiceClient::connect(observe).await.unwrap();
+
+    let status = match c
+        .get_job(GetJobRequest {
+            job_id: "no-such-job".to_string(),
+        })
+        .await
+    {
+        Ok(reply) => panic!("expected NotFound, got a reply: {reply:?}"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::NotFound);
 }
