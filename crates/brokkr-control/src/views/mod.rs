@@ -22,5 +22,7 @@ mod worker;
 
 pub use cas::{cas_stats_view, CasStatsView};
 pub use policy::{policy_view, PolicyView, REASONS};
-pub use raft::{node_view_from_status, unreachable_node_view, NodeView, RaftRole};
+pub use raft::{
+    node_view_from_status, standalone_node_view, unreachable_node_view, NodeView, RaftRole,
+};
 pub use worker::{worker_views, WorkerView};

@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "brokkr/v1/membership.proto",
         "brokkr/v1/raft.proto",
         "brokkr/v1/policy.proto",
+        "brokkr/v1/observability.proto",
     ];
 
     let proto_paths: Vec<PathBuf> = protos.iter().map(|p| proto_root.join(p)).collect();

@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
 use brokkr_control::policy_reload::spawn_policy_reloader;
 use brokkr_control::registry::WorkerRegistry;
+use brokkr_control::services::{ObservabilityDeps, ObservabilityService};
 use brokkr_control::wasm_strategy::WasmStrategy;
 use brokkr_control::{
     auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
@@ -16,6 +17,7 @@ use brokkr_control::{
     Scheduler, SharedWorkerRegistry, WorkerServiceImpl,
 };
 use brokkr_policy::{PolicyEngine, PolicyLimits};
+use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityServiceServer;
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
     action_cache_server::ActionCacheServer, capabilities_server::CapabilitiesServer,
@@ -221,6 +223,37 @@ struct Args {
     /// `0` disables reloading.
     #[arg(long, default_value_t = brokkr_control::policy_reload::DEFAULT_RELOAD_INTERVAL.as_secs())]
     policy_reload_interval_secs: u64,
+
+    /// Bind address for the operator observability listener (ADR 0012).
+    ///
+    /// Deliberately **not** the tenant-facing `--listen` port. ADR 0011's auth
+    /// resolves a token to a tenant and has no scope concept, so a tenant
+    /// reaching this service could enumerate every worker and every other
+    /// tenant's jobs. Defaults to loopback; a non-loopback bind requires
+    /// operator mTLS or an explicit opt-out.
+    #[arg(long, default_value = "127.0.0.1:7880")]
+    observe_listen: SocketAddr,
+
+    /// Server certificate for the operator listener. All three of
+    /// `--observe-tls-cert`, `--observe-tls-key` and `--observe-tls-ca` must
+    /// be given together; the CA is what authorizes callers.
+    #[arg(long, requires_all = ["observe_tls_key", "observe_tls_ca"])]
+    observe_tls_cert: Option<PathBuf>,
+
+    /// Private key for [`Args::observe_tls_cert`].
+    #[arg(long, requires_all = ["observe_tls_cert", "observe_tls_ca"])]
+    observe_tls_key: Option<PathBuf>,
+
+    /// CA that verifies operator client certificates.
+    #[arg(long, requires_all = ["observe_tls_cert", "observe_tls_key"])]
+    observe_tls_ca: Option<PathBuf>,
+
+    /// Permit a non-loopback `--observe-listen` with no operator mTLS.
+    ///
+    /// For an already-isolated network. A flag someone had to type is a
+    /// decision; the same bind reached by accident is an incident.
+    #[arg(long)]
+    observe_allow_insecure_bind: bool,
 }
 
 /// Build the scheduling strategy from the policy flags (ADR 0014).
@@ -263,6 +296,34 @@ fn build_policy_strategy(
         "WASM scheduling policy loaded"
     );
     Ok(Some(Arc::new(strategy)))
+}
+
+/// Refuse an unauthenticated observability listener on a routable address.
+///
+/// ADR 0012's argument is that *the listener is the boundary* — but a listener
+/// bound to `0.0.0.0` with no authentication is not a boundary, it is an
+/// unauthenticated read of the whole cluster offered to the network. Loopback
+/// needs nothing further; anything else needs mTLS or an explicit override.
+///
+/// Pure over its three inputs so every combination is testable without binding
+/// a socket. Same posture issue #139 established for the other planes: a
+/// misconfiguration is a startup error, never a runtime surprise.
+fn validate_observe_bind(
+    listen: SocketAddr,
+    mtls_configured: bool,
+    allow_insecure: bool,
+) -> Result<(), String> {
+    if listen.ip().is_loopback() || mtls_configured || allow_insecure {
+        return Ok(());
+    }
+    Err(format!(
+        "--observe-listen ({listen}) is not a loopback address and no operator \
+         mTLS is configured, which would serve unauthenticated cluster state to \
+         the network. Either pass --observe-tls-cert / --observe-tls-key / \
+         --observe-tls-ca, or bind loopback and reach it over SSH. If the \
+         network is already isolated, --observe-allow-insecure-bind says so \
+         deliberately."
+    ))
 }
 
 /// The Raft peer plane's transport security, resolved from the flags (I9d).
@@ -408,6 +469,32 @@ impl Args {
             (false, false) => base,
         };
         Ok(Some(cfg))
+    }
+
+    /// TLS for the operator observability listener (ADR 0012).
+    ///
+    /// Independent of the client and worker planes: an operator console and a
+    /// tenant are different audiences, and reusing the client CA here would
+    /// mean any tenant certificate authorized cluster-wide reads.
+    fn observe_tls_config(&self) -> Result<Option<ServerTlsConfig>> {
+        let (Some(cert), Some(key), Some(ca)) = (
+            self.observe_tls_cert.as_ref(),
+            self.observe_tls_key.as_ref(),
+            self.observe_tls_ca.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let cert_pem = std::fs::read(cert)
+            .with_context(|| format!("reading --observe-tls-cert {}", cert.display()))?;
+        let key_pem = std::fs::read(key)
+            .with_context(|| format!("reading --observe-tls-key {}", key.display()))?;
+        let ca_pem = std::fs::read(ca)
+            .with_context(|| format!("reading --observe-tls-ca {}", ca.display()))?;
+        Ok(Some(
+            ServerTlsConfig::new()
+                .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+                .client_ca_root(tonic::transport::Certificate::from_pem(ca_pem)),
+        ))
     }
 
     /// Build the client [`Authenticator`] from the `--auth-jwt-*` arguments.
@@ -621,6 +708,11 @@ async fn main() -> Result<()> {
         args.raft_tls_key.as_ref(),
         args.raft_tls_ca.as_ref(),
     )?;
+    // Captured out of the Raft branch so the observability service can report
+    // this node's role, term and commit index (ADR 0012). `None` with `--raft`
+    // off, in which case the node reports itself as a single member of no
+    // claimed role.
+    let mut raft_handle_for_observability: Option<Arc<brokkr_raft::RaftHandle>> = None;
     let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
         // I8c/I9: Raft-replicated metadata. With no peers this is a
         // single-voter cluster; with `--raft-peer`s it is a real HA cluster
@@ -766,6 +858,7 @@ async fn main() -> Result<()> {
                 "METADATA VIA RAFT (HA cluster, I9) — experimental"
             );
         }
+        raft_handle_for_observability = Some(Arc::new(handle.clone()));
         let raft_kv = Arc::new(brokkr_control::RaftKv::new(handle.clone(), shared));
 
         // Publish this node's client-plane address whenever we hold
@@ -852,6 +945,9 @@ async fn main() -> Result<()> {
             worker_registry.clone(),
         ),
     };
+    // Cloned before the listener tasks move their copies; the observability
+    // service reads per-worker in-flight counts from it.
+    let scheduler_for_observability = scheduler.clone();
 
     let client_tls_cfg = args.tls_config(false)?;
     let worker_tls_cfg = args.tls_config(true)?;
@@ -1003,12 +1099,69 @@ async fn main() -> Result<()> {
             .with_context(|| format!("worker listener ({worker_addr}) exited"))
     });
 
+    // Operator observability listener (ADR 0012). Its own bind address, never
+    // the tenant-facing one: ADR 0011's auth resolves a token to a tenant and
+    // has no scope concept, so a tenant reaching this service could enumerate
+    // every worker and every other tenant's jobs.
+    let observe_mtls = args.observe_tls_cert.is_some();
+    validate_observe_bind(
+        args.observe_listen,
+        observe_mtls,
+        args.observe_allow_insecure_bind,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    let observe_listener = TcpListener::bind(args.observe_listen)
+        .await
+        .with_context(|| format!("binding observability listener on {}", args.observe_listen))?;
+    let mut observe_server = Server::builder();
+    if let Some(cfg) = args.observe_tls_config()? {
+        observe_server = observe_server.tls_config(cfg)?;
+    }
+    if observe_mtls {
+        tracing::info!(
+            addr = %args.observe_listen,
+            "operator observability listener bound (read-only, mTLS)"
+        );
+    } else if args.observe_listen.ip().is_loopback() {
+        tracing::info!(
+            addr = %args.observe_listen,
+            "operator observability listener bound (read-only, loopback only)"
+        );
+    } else {
+        tracing::warn!(
+            addr = %args.observe_listen,
+            "OPERATOR OBSERVABILITY LISTENER IS UNAUTHENTICATED ON A ROUTABLE \
+             ADDRESS — permitted only because --observe-allow-insecure-bind was given"
+        );
+    }
+    let observe_deps = ObservabilityDeps {
+        node_id: args.node_id.clone(),
+        advertise_addr: advertise_addr.clone(),
+        registry: worker_registry.clone(),
+        scheduler: scheduler_for_observability,
+        cas: cas.clone(),
+        policy: policy_strategy.clone(),
+        raft: raft_handle_for_observability.clone(),
+    };
+    let observe_addr = args.observe_listen;
+    let observe_handle = tokio::spawn(async move {
+        observe_server
+            .add_service(ObservabilityServiceServer::new(ObservabilityService::new(
+                observe_deps,
+            )))
+            .serve_with_incoming(TcpListenerStream::new(observe_listener))
+            .await
+            .with_context(|| format!("observability listener ({observe_addr}) exited"))
+    });
+
     // Whichever listener exits first aborts the process. A half-running
     // control plane (client up, worker down, or vice versa) is not a
     // useful state to leave behind.
     tokio::select! {
         r = client_handle => r.with_context(|| "client listener task panicked")??,
         r = worker_handle => r.with_context(|| "worker listener task panicked")??,
+        r = observe_handle => r.with_context(|| "observability listener task panicked")??,
     }
     Ok(())
 }
@@ -1021,6 +1174,45 @@ async fn main() -> Result<()> {
     clippy::disallowed_methods
 )]
 mod tests {
+    /// Loopback is the intended posture and needs nothing further: reach it
+    /// over SSH.
+    #[test]
+    fn a_loopback_observability_bind_needs_no_further_authorization() {
+        let v4: SocketAddr = "127.0.0.1:7880".parse().unwrap();
+        assert!(validate_observe_bind(v4, false, false).is_ok());
+        let v6: SocketAddr = "[::1]:7880".parse().unwrap();
+        assert!(validate_observe_bind(v6, false, false).is_ok());
+    }
+
+    /// A routable bind with no authentication would serve the whole cluster's
+    /// state to the network. The error must name both remedies, because an
+    /// operator hitting this at deploy time needs to know what to do, not just
+    /// that they are wrong.
+    #[test]
+    fn a_routable_observability_bind_without_mtls_is_rejected() {
+        let wildcard: SocketAddr = "0.0.0.0:7880".parse().unwrap();
+        let err = validate_observe_bind(wildcard, false, false).unwrap_err();
+        assert!(
+            err.contains("--observe-tls-cert"),
+            "must name the remedy: {err}"
+        );
+        assert!(
+            err.contains("--observe-allow-insecure-bind"),
+            "must name the override: {err}"
+        );
+
+        // A specific routable address is no better than the wildcard.
+        let specific: SocketAddr = "10.0.0.5:7880".parse().unwrap();
+        assert!(validate_observe_bind(specific, false, false).is_err());
+    }
+
+    #[test]
+    fn a_routable_bind_is_allowed_with_mtls_or_an_explicit_override() {
+        let addr: SocketAddr = "0.0.0.0:7880".parse().unwrap();
+        assert!(validate_observe_bind(addr, true, false).is_ok());
+        assert!(validate_observe_bind(addr, false, true).is_ok());
+    }
+
     use super::*;
 
     /// Parses `Args` from flags, prepending a real HMAC secret file so JWT

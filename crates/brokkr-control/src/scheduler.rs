@@ -358,6 +358,21 @@ impl Scheduler {
         self.uncached_results_not_leader.load(Ordering::Relaxed)
     }
 
+    /// Per-worker in-flight counts for every connected worker (ADR 0012).
+    ///
+    /// Taken as a snapshot rather than exposing the registry, so the read-model
+    /// never holds the dispatch mutex while it projects — `views::worker_views`
+    /// takes the counts as a closure for exactly this reason.
+    pub async fn inflight_snapshot(&self) -> HashMap<WorkerId, usize> {
+        use crate::scheduling::LoadView as _;
+        let inner = self.inner.lock().await;
+        inner
+            .connected
+            .connected_ids()
+            .map(|id| (id.clone(), inner.connected.inflight(id)))
+            .collect()
+    }
+
     /// How many of `worker`'s recent completions used `input_root` (ADR 0014).
     ///
     /// The locality index lives under the dispatch mutex, so this is the only

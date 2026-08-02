@@ -14,12 +14,14 @@ pub mod action_cache;
 pub mod capabilities;
 pub mod cas;
 pub mod execution;
+pub mod observability;
 
 // Re-export so `crate::services::*` continues to work.
 pub use action_cache::ActionCacheService;
 pub use capabilities::CapabilitiesService;
 pub use cas::{BatchLimits, CasService};
 pub use execution::ExecutionService;
+pub use observability::{ObservabilityDeps, ObservabilityService};
 
 // Shared helpers used across service implementations.
 pub(crate) fn proto_to_digest(d: &rapi::Digest) -> Result<Digest, Status> {
