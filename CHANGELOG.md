@@ -242,6 +242,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`brokkr.v1.PeerObservability`** on the Raft peer plane — one RPC,
+  `GetLocalState`, returning this node's observability state for peer
+  aggregation. It lives there because peers are already mutually authenticated
+  by mTLS with addresses already published in the cluster configuration: no new
+  credential, and nothing added to the tenant-facing surface. It contains no
+  fan-out path, which is what makes the no-recursion guarantee structural
+  rather than a flag a refactor could forget. It shares the existing
+  `--raft-listen` listener rather than adding a port.
 - **`brokkr.v1.ObservabilityService`** on a dedicated operator listener
   (`--observe-listen`, default `127.0.0.1:7880`) — read-only `GetCluster`,
   `ListWorkers`, `GetPolicy`, `GetCasStats`. Deliberately not on the

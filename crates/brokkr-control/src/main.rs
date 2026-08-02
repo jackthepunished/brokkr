@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
 use brokkr_control::policy_reload::spawn_policy_reloader;
 use brokkr_control::registry::WorkerRegistry;
-use brokkr_control::services::{ObservabilityDeps, ObservabilityService};
+use brokkr_control::services::{ObservabilityDeps, ObservabilityService, PeerObservabilityService};
 use brokkr_control::wasm_strategy::WasmStrategy;
 use brokkr_control::{
     auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
@@ -18,6 +18,7 @@ use brokkr_control::{
 };
 use brokkr_policy::{PolicyEngine, PolicyLimits};
 use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityServiceServer;
+use brokkr_proto::brokkr_v1::peer_observability_server::PeerObservabilityServer;
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
     action_cache_server::ActionCacheServer, capabilities_server::CapabilitiesServer,
@@ -297,6 +298,22 @@ fn build_policy_strategy(
     );
     Ok(Some(Arc::new(strategy)))
 }
+
+/// The Raft peer-plane server, built inside the Raft branch but spawned later.
+///
+/// `PeerObservability` (ADR 0012) shares this listener, and its dependencies —
+/// the scheduler in particular — do not exist until after the Raft branch has
+/// produced the action cache. So the pieces are captured here and the listener
+/// is spawned once both services can be mounted on it. Splitting them across
+/// two ports would mean a second address to configure and firewall for no
+/// reason.
+type RaftPeerServerParts = (
+    brokkr_proto::brokkr_v1::raft_service_server::RaftServiceServer<
+        brokkr_raft::RaftServiceAdapter<brokkr_raft::RaftHandle>,
+    >,
+    Option<ServerTlsConfig>,
+    SocketAddr,
+);
 
 /// Refuse an unauthenticated observability listener on a routable address.
 ///
@@ -713,6 +730,7 @@ async fn main() -> Result<()> {
     // off, in which case the node reports itself as a single member of no
     // claimed role.
     let mut raft_handle_for_observability: Option<Arc<brokkr_raft::RaftHandle>> = None;
+    let mut raft_peer_parts: Option<RaftPeerServerParts> = None;
     let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
         // I8c/I9: Raft-replicated metadata. With no peers this is a
         // single-voter cluster; with `--raft-peer`s it is a real HA cluster
@@ -817,25 +835,9 @@ async fn main() -> Result<()> {
                     )
                 }
             };
-            tokio::spawn(async move {
-                let mut builder = Server::builder();
-                if let Some(tls) = peer_tls {
-                    match builder.tls_config(tls) {
-                        Ok(b) => builder = b,
-                        Err(e) => {
-                            tracing::error!(error = %e, "raft peer TLS configuration rejected");
-                            return;
-                        }
-                    }
-                }
-                if let Err(e) = builder
-                    .add_service(adapter.into_server())
-                    .serve(raft_addr)
-                    .await
-                {
-                    tracing::error!(error = %e, "raft peer listener exited");
-                }
-            });
+            // Captured rather than spawned here: `PeerObservability` shares
+            // this listener and its dependencies do not exist yet.
+            raft_peer_parts = Some((adapter.into_server(), peer_tls, raft_addr));
             match &raft_tls {
                 RaftPlaneTls::Enabled { .. } => tracing::info!(
                     raft_addr = %raft_addr, node_id = %args.node_id,
@@ -1144,6 +1146,35 @@ async fn main() -> Result<()> {
         policy: policy_strategy.clone(),
         raft: raft_handle_for_observability.clone(),
     };
+    // Raft peer plane, deferred from the Raft branch so `PeerObservability`
+    // can share the listener (ADR 0012). Spawned before the operator listener
+    // so a peer that comes up first has something to talk to.
+    if let Some((raft_server, peer_tls, raft_addr)) = raft_peer_parts {
+        let peer_deps = observe_deps.clone();
+        tokio::spawn(async move {
+            let mut builder = Server::builder();
+            if let Some(tls) = peer_tls {
+                match builder.tls_config(tls) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft peer TLS configuration rejected");
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = builder
+                .add_service(raft_server)
+                .add_service(PeerObservabilityServer::new(PeerObservabilityService::new(
+                    peer_deps,
+                )))
+                .serve(raft_addr)
+                .await
+            {
+                tracing::error!(error = %e, "raft peer listener exited");
+            }
+        });
+    }
+
     let observe_addr = args.observe_listen;
     let observe_handle = tokio::spawn(async move {
         observe_server
