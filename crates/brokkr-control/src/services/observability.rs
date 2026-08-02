@@ -115,10 +115,14 @@ pub(crate) fn local_policy(deps: &ObservabilityDeps) -> PolicyView {
 }
 
 /// This node's recently completed jobs.
+///
+/// Unbounded on purpose: the ring's own capacity — set from
+/// `--observe-job-history` — is the only limit that should apply here. Passing
+/// `DEFAULT_JOB_HISTORY` would silently cap an operator who configured a
+/// larger ring at the default, so raising the flag would appear to do nothing.
+/// The caller's `limit` is applied later, to the merged cross-node order.
 pub(crate) async fn local_jobs(deps: &ObservabilityDeps) -> Vec<JobSummary> {
-    deps.scheduler
-        .recent_jobs(None, crate::views::DEFAULT_JOB_HISTORY)
-        .await
+    deps.scheduler.recent_jobs(None, usize::MAX).await
 }
 
 /// This node's CAS size.

@@ -401,6 +401,9 @@ impl Scheduler {
     }
 
     /// The most recent completed jobs on this node, newest first (ADR 0012).
+    ///
+    /// `limit` is a caller-side cap; the ring's own capacity always bounds the
+    /// result, so `usize::MAX` means "everything retained".
     pub async fn recent_jobs(&self, state: Option<JobState>, limit: usize) -> Vec<JobSummary> {
         self.inner.lock().await.job_history.filtered(state, limit)
     }

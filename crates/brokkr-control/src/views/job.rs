@@ -42,6 +42,22 @@ impl JobState {
 }
 
 /// One job, as an operator sees it.
+///
+/// Ids are plain `String`s rather than the project's newtypes, consistently
+/// with every other view DTO ([`WorkerView`](super::WorkerView),
+/// [`NodeView`](super::NodeView), [`PolicyView`](super::PolicyView)). The
+/// newtype rule guards *domain* values against being constructed out of
+/// invariant; a view is a read-only projection shaped for the wire, is never
+/// used to construct a domain object, and maps one-to-one onto its proto
+/// message. Typing these would add conversions in both directions and make
+/// this DTO inconsistent with its siblings, for no invariant actually
+/// protected.
+///
+/// `action_digest` carries the hash only, not the size. That is enough to
+/// identify and grep for an action, which is what an operator console is for.
+/// It is deliberately *not* enough to fetch the action from CAS — a read-only
+/// observability surface is not a CAS client, and adding `size_bytes` is a
+/// small additive change if a consumer ever needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSummary {
     /// Server-assigned job id.
@@ -176,6 +192,19 @@ mod tests {
         let recent = h.recent(10);
         let ids: Vec<&str> = recent.iter().map(|j| j.job_id.as_str()).collect();
         assert_eq!(ids, vec!["j5", "j4", "j3"]);
+    }
+
+    /// `usize::MAX` means "everything retained", so a caller that does not want
+    /// to impose its own cap gets the whole configured ring rather than a
+    /// silently-defaulted slice.
+    #[test]
+    fn an_unbounded_limit_returns_the_whole_ring() {
+        let mut h = JobHistory::new(300);
+        for i in 0..300 {
+            h.record(summary(&format!("j{i}")));
+        }
+        assert_eq!(h.recent(usize::MAX).len(), 300);
+        assert_eq!(h.filtered(None, usize::MAX).len(), 300);
     }
 
     #[test]
