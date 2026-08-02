@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
 use brokkr_control::policy_reload::spawn_policy_reloader;
 use brokkr_control::registry::WorkerRegistry;
-use brokkr_control::services::{ObservabilityDeps, ObservabilityService};
+use brokkr_control::services::{ObservabilityDeps, ObservabilityService, PeerObservabilityService};
 use brokkr_control::wasm_strategy::WasmStrategy;
 use brokkr_control::{
     auth_interceptor, spawn_eviction_task, spawn_lease_reaper, ActionCacheService, Authenticator,
@@ -18,6 +18,7 @@ use brokkr_control::{
 };
 use brokkr_policy::{PolicyEngine, PolicyLimits};
 use brokkr_proto::brokkr_v1::observability_service_server::ObservabilityServiceServer;
+use brokkr_proto::brokkr_v1::peer_observability_server::PeerObservabilityServer;
 use brokkr_proto::brokkr_v1::worker_service_server::WorkerServiceServer;
 use brokkr_proto::reapi_v2::{
     action_cache_server::ActionCacheServer, capabilities_server::CapabilitiesServer,
@@ -297,6 +298,22 @@ fn build_policy_strategy(
     );
     Ok(Some(Arc::new(strategy)))
 }
+
+/// The Raft peer-plane server, built inside the Raft branch but spawned later.
+///
+/// `PeerObservability` (ADR 0012) shares this listener, and its dependencies —
+/// the scheduler in particular — do not exist until after the Raft branch has
+/// produced the action cache. So the pieces are captured here and the listener
+/// is spawned once both services can be mounted on it. Splitting them across
+/// two ports would mean a second address to configure and firewall for no
+/// reason.
+type RaftPeerServerParts = (
+    brokkr_proto::brokkr_v1::raft_service_server::RaftServiceServer<
+        brokkr_raft::RaftServiceAdapter<brokkr_raft::RaftHandle>,
+    >,
+    Option<ServerTlsConfig>,
+    SocketAddr,
+);
 
 /// Refuse an unauthenticated observability listener on a routable address.
 ///
@@ -713,6 +730,7 @@ async fn main() -> Result<()> {
     // off, in which case the node reports itself as a single member of no
     // claimed role.
     let mut raft_handle_for_observability: Option<Arc<brokkr_raft::RaftHandle>> = None;
+    let mut raft_peer_parts: Option<RaftPeerServerParts> = None;
     let action_cache: Arc<dyn brokkr_cas::ActionCache> = if args.raft {
         // I8c/I9: Raft-replicated metadata. With no peers this is a
         // single-voter cluster; with `--raft-peer`s it is a real HA cluster
@@ -817,25 +835,9 @@ async fn main() -> Result<()> {
                     )
                 }
             };
-            tokio::spawn(async move {
-                let mut builder = Server::builder();
-                if let Some(tls) = peer_tls {
-                    match builder.tls_config(tls) {
-                        Ok(b) => builder = b,
-                        Err(e) => {
-                            tracing::error!(error = %e, "raft peer TLS configuration rejected");
-                            return;
-                        }
-                    }
-                }
-                if let Err(e) = builder
-                    .add_service(adapter.into_server())
-                    .serve(raft_addr)
-                    .await
-                {
-                    tracing::error!(error = %e, "raft peer listener exited");
-                }
-            });
+            // Captured rather than spawned here: `PeerObservability` shares
+            // this listener and its dependencies do not exist yet.
+            raft_peer_parts = Some((adapter.into_server(), peer_tls, raft_addr));
             match &raft_tls {
                 RaftPlaneTls::Enabled { .. } => tracing::info!(
                     raft_addr = %raft_addr, node_id = %args.node_id,
@@ -1052,53 +1054,6 @@ async fn main() -> Result<()> {
             .with_context(|| format!("client listener ({client_addr}) exited"))
     });
 
-    if single_port {
-        // Worker port == client port; no second listener. The client_handle
-        // owns the lifetime.
-        client_handle
-            .await
-            .with_context(|| "client listener task panicked")??;
-        return Ok(());
-    }
-
-    // Split-port mode: bind a second listener dedicated to `WorkerService`
-    // AND `ContentAddressableStorage` (so workers can upload stdout/stderr
-    // without a JWT bearer — they authenticate at the TLS layer via the
-    // mTLS client cert they presented on this port; ADR 0011, issue #139).
-    // The worker port requires a client cert when `--tls-client-ca` is set
-    // (tonic 0.12 enforces this implicitly: `client_auth_optional` defaults
-    // to `false` after `client_ca_root`). It carries no JWT interceptor —
-    // the worker is authenticated at the transport layer.
-    //
-    // ActionCache / Capabilities / Execution stay on the JWT-gated client
-    // port: they are client-only services and a worker has no business
-    // reading them.
-    let worker_listener = tokio::net::TcpListener::bind(worker_listen_addr)
-        .await
-        .with_context(|| format!("binding worker listener on {worker_listen_addr}"))?;
-    let mut worker_server = Server::builder();
-    if let Some(cfg) = worker_tls_cfg {
-        worker_server = worker_server.tls_config(cfg)?;
-    }
-    let cas_for_worker = cas.clone();
-    let worker_addr = worker_listen_addr;
-    let worker_handle = tokio::spawn(async move {
-        worker_server
-            .add_service(WorkerServiceServer::new(worker_service))
-            // CAS on the worker port is unauthenticated by interceptor
-            // (mTLS already established the worker's identity at the
-            // transport layer). Sharing the same `RedbCas` instance with
-            // the client port means both paths see the same content —
-            // the client uploads inputs here, the worker uploads
-            // stdout/stderr here, both reads see the union.
-            .add_service(ContentAddressableStorageServer::new(CasService::new(
-                cas_for_worker,
-            )))
-            .serve_with_incoming(TcpListenerStream::new(worker_listener))
-            .await
-            .with_context(|| format!("worker listener ({worker_addr}) exited"))
-    });
-
     // Operator observability listener (ADR 0012). Its own bind address, never
     // the tenant-facing one: ADR 0011's auth resolves a token to a tenant and
     // has no scope concept, so a tenant reaching this service could enumerate
@@ -1144,6 +1099,35 @@ async fn main() -> Result<()> {
         policy: policy_strategy.clone(),
         raft: raft_handle_for_observability.clone(),
     };
+    // Raft peer plane, deferred from the Raft branch so `PeerObservability`
+    // can share the listener (ADR 0012). Spawned before the operator listener
+    // so a peer that comes up first has something to talk to.
+    if let Some((raft_server, peer_tls, raft_addr)) = raft_peer_parts {
+        let peer_deps = observe_deps.clone();
+        tokio::spawn(async move {
+            let mut builder = Server::builder();
+            if let Some(tls) = peer_tls {
+                match builder.tls_config(tls) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft peer TLS configuration rejected");
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = builder
+                .add_service(raft_server)
+                .add_service(PeerObservabilityServer::new(PeerObservabilityService::new(
+                    peer_deps,
+                )))
+                .serve(raft_addr)
+                .await
+            {
+                tracing::error!(error = %e, "raft peer listener exited");
+            }
+        });
+    }
+
     let observe_addr = args.observe_listen;
     let observe_handle = tokio::spawn(async move {
         observe_server
@@ -1153,6 +1137,54 @@ async fn main() -> Result<()> {
             .serve_with_incoming(TcpListenerStream::new(observe_listener))
             .await
             .with_context(|| format!("observability listener ({observe_addr}) exited"))
+    });
+
+    if single_port {
+        // Worker port == client port; no second listener. The client and
+        // observability listeners own the lifetime between them.
+        tokio::select! {
+            r = client_handle => r.with_context(|| "client listener task panicked")??,
+            r = observe_handle => r.with_context(|| "observability listener task panicked")??,
+        }
+        return Ok(());
+    }
+
+    // Split-port mode: bind a second listener dedicated to `WorkerService`
+    // AND `ContentAddressableStorage` (so workers can upload stdout/stderr
+    // without a JWT bearer — they authenticate at the TLS layer via the
+    // mTLS client cert they presented on this port; ADR 0011, issue #139).
+    // The worker port requires a client cert when `--tls-client-ca` is set
+    // (tonic 0.12 enforces this implicitly: `client_auth_optional` defaults
+    // to `false` after `client_ca_root`). It carries no JWT interceptor —
+    // the worker is authenticated at the transport layer.
+    //
+    // ActionCache / Capabilities / Execution stay on the JWT-gated client
+    // port: they are client-only services and a worker has no business
+    // reading them.
+    let worker_listener = tokio::net::TcpListener::bind(worker_listen_addr)
+        .await
+        .with_context(|| format!("binding worker listener on {worker_listen_addr}"))?;
+    let mut worker_server = Server::builder();
+    if let Some(cfg) = worker_tls_cfg {
+        worker_server = worker_server.tls_config(cfg)?;
+    }
+    let cas_for_worker = cas.clone();
+    let worker_addr = worker_listen_addr;
+    let worker_handle = tokio::spawn(async move {
+        worker_server
+            .add_service(WorkerServiceServer::new(worker_service))
+            // CAS on the worker port is unauthenticated by interceptor
+            // (mTLS already established the worker's identity at the
+            // transport layer). Sharing the same `RedbCas` instance with
+            // the client port means both paths see the same content —
+            // the client uploads inputs here, the worker uploads
+            // stdout/stderr here, both reads see the union.
+            .add_service(ContentAddressableStorageServer::new(CasService::new(
+                cas_for_worker,
+            )))
+            .serve_with_incoming(TcpListenerStream::new(worker_listener))
+            .await
+            .with_context(|| format!("worker listener ({worker_addr}) exited"))
     });
 
     // Whichever listener exits first aborts the process. A half-running

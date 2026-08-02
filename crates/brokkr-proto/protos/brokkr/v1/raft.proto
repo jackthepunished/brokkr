@@ -9,6 +9,9 @@ syntax = "proto3";
 
 package brokkr.v1;
 
+// NodeInfo / WorkerInfo / PolicyInfo / CasInfo for PeerObservability below.
+import "brokkr/v1/observability.proto";
+
 // A single entry in the replicated log.
 //
 // `command` is opaque to Raft — the state machine interprets it. Stored on disk
@@ -147,4 +150,28 @@ service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
   rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotReply);
+}
+
+// Node-local observability, for peer aggregation (ADR 0012).
+//
+// Lives on the Raft peer plane because peers there are already mutually
+// authenticated by mTLS and their addresses are already published in the
+// cluster configuration — no new credential, and nothing on the tenant-facing
+// surface.
+//
+// This service returns THIS NODE'S state and nothing else. It contains no
+// fan-out path, which is the structural guarantee that aggregation cannot
+// recurse: a flag can be forgotten or spoofed, a service with no recursion
+// path cannot be made to recurse.
+message GetLocalStateRequest {}
+
+message GetLocalStateReply {
+  NodeInfo node = 1;
+  repeated WorkerInfo workers = 2;
+  PolicyInfo policy = 3;
+  CasInfo cas = 4;
+}
+
+service PeerObservability {
+  rpc GetLocalState(GetLocalStateRequest) returns (GetLocalStateReply);
 }

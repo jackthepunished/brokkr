@@ -34,6 +34,7 @@ use crate::worker_service::SharedWorkerRegistry;
 /// Not `Debug`: it holds trait objects over the CAS and the policy engine,
 /// neither of which requires `Debug`, and adding that bound to both for a log
 /// line would be the tail wagging the dog.
+#[derive(Clone)]
 pub struct ObservabilityDeps {
     /// This node's Raft id, or a stable local name when Raft is off.
     pub node_id: String,
@@ -71,63 +72,60 @@ impl ObservabilityService {
     pub fn new(deps: ObservabilityDeps) -> Self {
         Self { deps }
     }
+}
 
-    /// This node's own [`NodeView`].
-    async fn local_node(&self) -> NodeView {
-        let Some(raft) = self.deps.raft.as_ref() else {
-            // No Raft: a single member, no leadership to report. Role is
-            // `Unknown` rather than `Leader` because there is no consensus
-            // that elected it, and claiming otherwise would be a lie a
-            // three-node view could later contradict.
-            return crate::views::standalone_node_view(
-                &self.deps.node_id,
-                &self.deps.advertise_addr,
-            );
-        };
-        match raft.status().await {
-            Ok(status) => {
-                node_view_from_status(&self.deps.node_id, &self.deps.advertise_addr, &status)
-            }
-            Err(e) => {
-                // A node that cannot read its own Raft state is degraded, not
-                // absent. Report it unreachable rather than failing the call.
-                tracing::warn!(error = %e, "could not read local Raft status");
-                crate::views::unreachable_node_view(&self.deps.node_id, &self.deps.advertise_addr)
-            }
-        }
-    }
-
-    /// This node's workers.
-    async fn local_workers(&self) -> Vec<WorkerView> {
-        let inflight = self.deps.scheduler.inflight_snapshot().await;
-        let reg = self.deps.registry.lock().await;
-        worker_views(&reg, std::time::Instant::now(), &self.deps.node_id, &|id| {
-            inflight.get(id).copied().unwrap_or(0)
-        })
-    }
-
-    /// This node's policy state.
-    fn local_policy(&self) -> PolicyView {
-        policy_view(self.deps.policy.as_deref(), &self.deps.node_id)
-    }
-
-    /// This node's CAS size.
-    async fn local_cas(&self) -> CasStatsView {
-        match self.deps.cas.stats().await {
-            Ok(stats) => cas_stats_view(stats, &self.deps.node_id),
-            Err(e) => {
-                // A CAS that cannot be measured reports zero rather than
-                // failing the whole call — the rest of the view is still
-                // useful, and an observability API is most needed when
-                // something is already wrong.
-                tracing::warn!(error = %e, "could not read local CAS stats");
-                cas_stats_view(brokkr_cas::CasStats::default(), &self.deps.node_id)
-            }
+/// This node's own [`NodeView`].
+///
+/// A free function over the deps rather than a method, because
+/// `PeerObservability` projects exactly the same local state and duplicating
+/// it would let the two drift.
+pub(crate) async fn local_node(deps: &ObservabilityDeps) -> NodeView {
+    let Some(raft) = deps.raft.as_ref() else {
+        // No Raft: a single member, no leadership to report. Role is `Unknown`
+        // rather than `Leader` because nothing elected it, and claiming
+        // otherwise would be a lie a later multi-node view could contradict.
+        return crate::views::standalone_node_view(&deps.node_id, &deps.advertise_addr);
+    };
+    match raft.status().await {
+        Ok(status) => node_view_from_status(&deps.node_id, &deps.advertise_addr, &status),
+        Err(e) => {
+            // A node that cannot read its own Raft state is degraded, not
+            // absent. Report it unreachable rather than failing the call.
+            tracing::warn!(error = %e, "could not read local Raft status");
+            crate::views::unreachable_node_view(&deps.node_id, &deps.advertise_addr)
         }
     }
 }
 
-fn node_to_proto(v: &NodeView) -> bv1::NodeInfo {
+/// This node's workers.
+pub(crate) async fn local_workers(deps: &ObservabilityDeps) -> Vec<WorkerView> {
+    let inflight = deps.scheduler.inflight_snapshot().await;
+    let reg = deps.registry.lock().await;
+    worker_views(&reg, std::time::Instant::now(), &deps.node_id, &|id| {
+        inflight.get(id).copied().unwrap_or(0)
+    })
+}
+
+/// This node's policy state.
+pub(crate) fn local_policy(deps: &ObservabilityDeps) -> PolicyView {
+    policy_view(deps.policy.as_deref(), &deps.node_id)
+}
+
+/// This node's CAS size.
+pub(crate) async fn local_cas(deps: &ObservabilityDeps) -> CasStatsView {
+    match deps.cas.stats().await {
+        Ok(stats) => cas_stats_view(stats, &deps.node_id),
+        Err(e) => {
+            // A CAS that cannot be measured reports zero rather than failing
+            // the whole call — the rest of the view is still useful, and an
+            // observability API is most needed when something is already wrong.
+            tracing::warn!(error = %e, "could not read local CAS stats");
+            cas_stats_view(brokkr_cas::CasStats::default(), &deps.node_id)
+        }
+    }
+}
+
+pub(crate) fn node_to_proto(v: &NodeView) -> bv1::NodeInfo {
     bv1::NodeInfo {
         node_id: v.node_id.clone(),
         advertise_addr: v.advertise_addr.clone(),
@@ -140,7 +138,7 @@ fn node_to_proto(v: &NodeView) -> bv1::NodeInfo {
     }
 }
 
-fn worker_to_proto(v: &WorkerView) -> bv1::WorkerInfo {
+pub(crate) fn worker_to_proto(v: &WorkerView) -> bv1::WorkerInfo {
     bv1::WorkerInfo {
         worker_id: v.worker_id.clone(),
         hostname: v.hostname.clone(),
@@ -152,7 +150,7 @@ fn worker_to_proto(v: &WorkerView) -> bv1::WorkerInfo {
     }
 }
 
-fn policy_to_proto(v: &PolicyView) -> bv1::PolicyInfo {
+pub(crate) fn policy_to_proto(v: &PolicyView) -> bv1::PolicyInfo {
     bv1::PolicyInfo {
         loaded: v.loaded,
         quarantined: v.quarantined,
@@ -163,7 +161,7 @@ fn policy_to_proto(v: &PolicyView) -> bv1::PolicyInfo {
     }
 }
 
-fn cas_to_proto(v: &CasStatsView) -> bv1::CasInfo {
+pub(crate) fn cas_to_proto(v: &CasStatsView) -> bv1::CasInfo {
     bv1::CasInfo {
         objects: v.objects,
         bytes: v.bytes,
@@ -178,7 +176,7 @@ impl ObservabilityRpc for ObservabilityService {
         &self,
         _request: Request<bv1::GetClusterRequest>,
     ) -> Result<Response<bv1::GetClusterReply>, Status> {
-        let node = self.local_node().await;
+        let node = local_node(&self.deps).await;
         let leader_id = if node.role == crate::views::RaftRole::Leader {
             node.node_id.clone()
         } else {
@@ -206,8 +204,7 @@ impl ObservabilityRpc for ObservabilityService {
         _request: Request<bv1::ListWorkersRequest>,
     ) -> Result<Response<bv1::ListWorkersReply>, Status> {
         Ok(Response::new(bv1::ListWorkersReply {
-            workers: self
-                .local_workers()
+            workers: local_workers(&self.deps)
                 .await
                 .iter()
                 .map(worker_to_proto)
@@ -221,7 +218,7 @@ impl ObservabilityRpc for ObservabilityService {
         _request: Request<bv1::GetPolicyRequest>,
     ) -> Result<Response<bv1::GetPolicyReply>, Status> {
         Ok(Response::new(bv1::GetPolicyReply {
-            policies: vec![policy_to_proto(&self.local_policy())],
+            policies: vec![policy_to_proto(&local_policy(&self.deps))],
         }))
     }
 
@@ -231,7 +228,7 @@ impl ObservabilityRpc for ObservabilityService {
         _request: Request<bv1::GetCasStatsRequest>,
     ) -> Result<Response<bv1::GetCasStatsReply>, Status> {
         Ok(Response::new(bv1::GetCasStatsReply {
-            stores: vec![cas_to_proto(&self.local_cas().await)],
+            stores: vec![cas_to_proto(&local_cas(&self.deps).await)],
         }))
     }
 }
