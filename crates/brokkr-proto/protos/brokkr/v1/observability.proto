@@ -117,6 +117,49 @@ message ListJobsReply { repeated JobInfo jobs = 1; }
 message GetJobRequest { string job_id = 1; }
 message GetJobReply { JobInfo job = 1; }
 
+// A full replacement of the subscriber's world.
+//
+// Sent on subscribe, on reconnect, and whenever a subscriber falls behind.
+// Carrying the whole state rather than a cursor means a client needs no
+// reconciliation logic and cannot silently miss deltas — falling behind is
+// acceptable, not knowing you fell behind is not.
+message SnapshotEvent {
+  ClusterInfo cluster = 1;
+  repeated WorkerInfo workers = 2;
+  repeated JobInfo jobs = 3;
+  repeated PolicyInfo policies = 4;
+  repeated CasInfo stores = 5;
+}
+
+message NodeEvent { string node_id = 1; }
+message WorkerEvent {
+  string worker_id = 1;
+  string owning_node = 2;
+}
+message PolicyEvent { string owning_node = 1; }
+// Either side may be empty: losing the leader entirely is a leadership change,
+// and is the case an operator most needs pushed at them.
+message LeaderEvent {
+  string from = 1;
+  string to = 2;
+}
+
+message ClusterEvent {
+  oneof event {
+    SnapshotEvent snapshot = 1;
+    NodeEvent node_unreachable = 2;
+    NodeEvent node_recovered = 3;
+    WorkerEvent worker_added = 4;
+    WorkerEvent worker_removed = 5;
+    WorkerEvent worker_stale = 6;
+    PolicyEvent policy_quarantined = 7;
+    PolicyEvent policy_recovered = 8;
+    LeaderEvent leader_changed = 9;
+  }
+}
+
+message WatchEventsRequest {}
+
 service ObservabilityService {
   rpc GetCluster(GetClusterRequest) returns (GetClusterReply);
   rpc ListWorkers(ListWorkersRequest) returns (ListWorkersReply);
@@ -124,4 +167,8 @@ service ObservabilityService {
   rpc GetCasStats(GetCasStatsRequest) returns (GetCasStatsReply);
   rpc ListJobs(ListJobsRequest) returns (ListJobsReply);
   rpc GetJob(GetJobRequest) returns (GetJobReply);
+  // Server-streaming deltas. The first message is always a SnapshotEvent, so a
+  // client that has just connected or reconnected needs no reconciliation
+  // logic.
+  rpc WatchEvents(WatchEventsRequest) returns (stream ClusterEvent);
 }

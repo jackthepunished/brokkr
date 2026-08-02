@@ -242,6 +242,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum has `Timeout(Duration)` and `Other(anyhow::Error)` variants.
 
 ### Added
+- **`WatchEvents`** — a server-streaming delta feed over the observability
+  snapshot. Every stream opens with a full `Snapshot`, and a subscriber that
+  falls behind the bounded buffer gets a fresh `Snapshot` rather than being
+  dropped or silently skipping deltas: falling behind is acceptable, *not
+  knowing* you fell behind is not. A client therefore needs no reconciliation
+  logic and no cursor. Identical snapshots produce no events at all, so a 2s
+  poller does not re-emit the world every tick.
 - **Job history and `ListJobs` / `GetJob`.** A bounded in-memory ring of the
   last `--observe-job-history` (default 256) completed jobs per node,
   populated in `Scheduler::report()` alongside the locality record so it costs

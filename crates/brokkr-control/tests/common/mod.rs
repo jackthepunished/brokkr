@@ -153,6 +153,7 @@ pub async fn boot_with_observability() -> (String, String, tempfile::TempDir) {
     // rather than hand-writing a snapshot means these tests would catch a
     // poller that stopped refreshing.
     let snapshot: SharedSnapshot = Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default()));
+    let (events, _initial_rx) = tokio::sync::broadcast::channel(256);
     spawn_poller(
         snapshot.clone(),
         PollerDeps {
@@ -165,12 +166,13 @@ pub async fn boot_with_observability() -> (String, String, tempfile::TempDir) {
             peer_timeout: Duration::from_millis(25),
             cas_interval: Duration::from_millis(50),
         },
+        events.clone(),
     );
 
     tokio::spawn(async move {
         Server::builder()
             .add_service(ObservabilityServiceServer::new(ObservabilityService::new(
-                snapshot,
+                snapshot, events,
             )))
             .serve_with_incoming(TcpListenerStream::new(observe_listener))
             .await

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use brokkr_cas::RedbCas;
 use brokkr_control::cluster::{
     spawn_poller, ClusterSnapshot, GrpcPeerProbe, PeerAddr, PeerDirectory, PollerConfig,
-    PollerDeps, SharedSnapshot,
+    PollerDeps, SharedSnapshot, EVENT_CHANNEL_CAPACITY,
 };
 use brokkr_control::policy_reload::spawn_policy_reloader;
 use brokkr_control::registry::WorkerRegistry;
@@ -1251,6 +1251,7 @@ async fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     let snapshot: SharedSnapshot = Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default()));
+    let (events, _initial_rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     spawn_poller(
         snapshot.clone(),
         PollerDeps {
@@ -1263,13 +1264,14 @@ async fn main() -> Result<()> {
             peer_timeout: Duration::from_millis(args.observe_peer_timeout_ms),
             cas_interval: Duration::from_secs(args.observe_cas_interval_secs),
         },
+        events.clone(),
     );
 
     let observe_addr = args.observe_listen;
     let observe_handle = tokio::spawn(async move {
         observe_server
             .add_service(ObservabilityServiceServer::new(ObservabilityService::new(
-                snapshot,
+                snapshot, events,
             )))
             .serve_with_incoming(TcpListenerStream::new(observe_listener))
             .await
