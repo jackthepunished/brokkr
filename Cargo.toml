@@ -90,7 +90,7 @@ proptest = "1"
 tempfile = "3"
 
 # Linux primitives (sandbox)
-nix = { version = "0.29", default-features = false, features = ["fs", "hostname", "mount", "process", "sched", "signal", "user"] }
+nix = { version = "0.30", default-features = false, features = ["fs", "hostname", "mount", "process", "sched", "signal", "user"] }
 
 # FUSE input materialisation (M6b, worker only, Linux only at runtime)
 fuser = "0.17"
